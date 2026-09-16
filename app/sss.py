@@ -32,24 +32,12 @@ from urllib.parse import urlencode
 try:
     from .api_client import (ApiError, SssApiClient, SssTransportError,
                              auth_error_message, is_auth_expired_payload)
-    from .automation import (
-        BrowserNotFoundError,
-        LocatorError,
-        _emit,
-        _launch_browser,
-    )
-    from .locators import SSS_LOCATORS, load_sss_locators
+    from .automation import _emit
     from .sss_import import ImportRefused, prepare_day_orders
 except ImportError:  # pragma: no cover - allows ``python app/sss.py``
     from api_client import (ApiError, SssApiClient, SssTransportError,
                             auth_error_message, is_auth_expired_payload)
-    from automation import (
-        BrowserNotFoundError,
-        LocatorError,
-        _emit,
-        _launch_browser,
-    )
-    from locators import SSS_LOCATORS, load_sss_locators
+    from automation import _emit
     from sss_import import ImportRefused, prepare_day_orders
 
 DEFAULT_SHEETS = ("午餐", "晚餐")
@@ -255,11 +243,6 @@ def expected_delivery_date(now: _dt.datetime | None = None) -> _dt.date:
     「识别日期」必须与它一致，否则拒绝下单（见 ``sss_import.check_target_day``）。
     """
     return _dt.date.fromisoformat(compute_delivery_time(False, now)[:10])
-
-
-def _resolve(locators: dict[str, Any] | None, name: str) -> dict[str, Any]:
-    """Return a step dict, falling back to the built-in 闪时送 default."""
-    return (locators or {}).get(name) or SSS_LOCATORS.get(name) or {}
 
 
 def _substitute_tokens(step: dict[str, Any], **tokens: str) -> dict[str, Any]:
@@ -1769,7 +1752,6 @@ def run_sss_job(config: Any, stop_event: Any,
                 progress_callback: Callable[[str], Any] | None = None,
                 password: str | None = None,
                 decision_callback: Callable[[str, str], str] | None = None,
-                locators: dict[str, Any] | None = None,
                 captcha_callback: Callable[[bytes], str] | None = None,
                 store_cache_callback: Callable[[str, int], None] | None = None) -> dict[str, Any]:
     """按配置的名单来源读取当天订单，并通过接口批量创建预约单。
@@ -1842,7 +1824,6 @@ def run_sss_job(config: Any, stop_event: Any,
     common_address = str(getattr(config, "sss_common_address", "") or "")
     use_fixed_address = bool(getattr(config, "sss_use_fixed_address", False))
     goods_name = str(getattr(config, "sss_product_name", "") or "轻食")
-    api_mode = bool(getattr(config, "api_mode", True))
     try:
         max_workers = int(getattr(config, "sss_max_workers", 4))
     except (TypeError, ValueError):
@@ -1852,7 +1833,6 @@ def run_sss_job(config: Any, stop_event: Any,
     idempotency_field = str(getattr(config, "sss_idempotency_field", "") or _CLIENT_IDEMPOTENCY_FIELD).strip()
 
     # 干跑短路：组装报文即返回，不取验证码、不登录、不查门店地址。
-    timeout_ms = int(getattr(config, "element_timeout_ms", 8000))
     try:
         read_timeout_s = float(getattr(config, "sss_read_timeout_s", 20.0))
     except (TypeError, ValueError):
@@ -1875,277 +1855,155 @@ def run_sss_job(config: Any, stop_event: Any,
             batch_id=batch_id, idempotency_field=idempotency_field, now=now)
         return _result(_run_dry_run(tasks, progress_callback))
 
-    if locators is None:
-        locators = load_sss_locators()
     account = str(getattr(config, "sss_account", "") or "")
     if not account:
         raise ValueError("尚未填写闪时送账号")
 
-    if api_mode:
-        job_start = time.perf_counter()
-        _emit(progress_callback, "正在获取闪时送验证码…")
-        client = SssApiClient(url, account, password or "", timeout=(5.0, read_timeout_s),
-                              pool_size=max_workers)
-        try:
-            captcha = client.fetch_captcha()
+    job_start = time.perf_counter()
+    _emit(progress_callback, "正在获取闪时送验证码…")
+    client = SssApiClient(url, account, password or "", timeout=(5.0, read_timeout_s),
+                          pool_size=max_workers)
+    try:
+        captcha = client.fetch_captcha()
+        if captcha_callback is None:
+            raise RuntimeError("纯接口模式需要验证码输入回调，当前界面未提供 captcha 弹窗")
+        code = captcha_callback(captcha)
+        _emit(progress_callback, "正在登录闪时送…")
+        client.login(code)
+
+        def relogin() -> None:
+            _emit(progress_callback, "登录态过期，重新获取验证码并登录…")
+            img = client.fetch_captcha()
             if captcha_callback is None:
-                raise RuntimeError("纯接口模式需要验证码输入回调，当前界面未提供 captcha 弹窗")
-            code = captcha_callback(captcha)
-            _emit(progress_callback, "正在登录闪时送…")
-            client.login(code)
+                raise RuntimeError("纯接口模式需要验证码输入回调")
+            client.login(captcha_callback(img))
+            _emit(progress_callback, "重新登录成功")
 
-            def relogin() -> None:
-                _emit(progress_callback, "登录态过期，重新获取验证码并登录…")
-                img = client.fetch_captcha()
-                if captcha_callback is None:
-                    raise RuntimeError("纯接口模式需要验证码输入回调")
-                client.login(captcha_callback(img))
-                _emit(progress_callback, "重新登录成功")
-
-            def prepare_session_data() -> tuple[int, dict[str, Any], tuple[float | None, float | None]]:
-                _emit(progress_callback, "登录成功，读取门店与常用地址…")
-                prep_start = time.perf_counter()
-                # 接口模式也串行：requests.Session 不保证线程安全，门店/地址两个
-                # GET 并发共用同一 Session 会出现偶发失败。
-                store_id, address = _prepare_store_and_address(
-                    client.get_json, config, store_name, common_address,
-                    use_fixed_address, progress_callback, parallel=False,
-                    store_cache_callback=store_cache_callback)
-                _emit(progress_callback,
-                      f"门店与地址准备耗时 {(time.perf_counter() - prep_start):.1f} 秒")
-                balance = query_balance(client.get_json)
-                return store_id, address, balance
-
-            store_id, address, (balance_total, balance_frozen) = _with_auth_relogin(
-                prepare_session_data, relogin, progress_callback, "读取门店/地址/余额")
-            _emit(progress_callback, _format_balance(balance_total, balance_frozen))
-
-            tasks = _collect_tasks(
-                orders_by_sheet, store_id, address, goods_name,
-                account=account, batch_id=batch_id, idempotency_field=idempotency_field,
-                now=now)
-            if idempotency_field:
-                _emit(progress_callback, f"已启用客户端幂等字段「{idempotency_field}」")
-            else:
-                _emit(progress_callback, "平台接口未探测到客户端幂等字段：采用“至少一次提交 + 对账确认”语义，不承诺 exactly-once")
-            try:
-                unit_price = float(getattr(config, "sss_unit_price", 0) or 0)
-            except (TypeError, ValueError):
-                unit_price = 0
-            if unit_price > 0:
-                estimate = round(unit_price * len(tasks), 2)
-                _emit(progress_callback,
-                      f"本批 {len(tasks)} 单预计送完结算约 {estimate} 元"
-                      + (f"，当前可用 {balance_total}"
-                         if balance_total is not None else "，当前余额未知"))
-
-            balance_status, estimate = _balance_precheck(
-                tasks, balance_total, unit_price, progress_callback)
-            if balance_status != "ok":
-                return _result({
-                    "status": balance_status,
-                    "processed": len(tasks), "created": 0, "submitted": 0,
-                    "previewed": 0, "stopped": True, "partial": False,
-                    "reconciled": False, "uncertain": balance_status == "balance_unknown",
-                    "estimate": estimate,
-                    "semantics": "pre-submit-balance-guard",
-                })
-
-            if bool(getattr(config, "sss_preflight", False)):
-                preflight_status, preflight = _preflight_tasks(
-                    tasks, client.get_json, progress_callback)
-                return _result({
-                    "status": preflight_status,
-                    "processed": len(tasks),
-                    "created": len(preflight.confirmed) if preflight else 0,
-                    "submitted": 0, "previewed": 0, "stopped": preflight_status != "preflight_ok",
-                    "partial": False,
-                    "reconciled": preflight is not None,
-                    "uncertain": preflight is None,
-                    "balance_total": balance_total,
-                    "estimate": estimate,
-                    "semantics": "preflight-only",
-                })
-
+        def prepare_session_data() -> tuple[int, dict[str, Any], tuple[float | None, float | None]]:
+            _emit(progress_callback, "登录成功，读取门店与常用地址…")
+            prep_start = time.perf_counter()
+            # 接口模式也串行：requests.Session 不保证线程安全，门店/地址两个
+            # GET 并发共用同一 Session 会出现偶发失败。
+            store_id, address = _prepare_store_and_address(
+                client.get_json, config, store_name, common_address,
+                use_fixed_address, progress_callback, parallel=False,
+                store_cache_callback=store_cache_callback)
             _emit(progress_callback,
-                  f"开始下单：共 {len(tasks)} 单，并发 {max_workers} 路，读取超时 {read_timeout_s:g}s")
-            submit_start = time.perf_counter()
-            final, reconciled = _run_reconciled_submission(
-                tasks,
-                lambda: _make_api_submitter(client),
-                client.get_json,
-                stop_event,
-                progress_callback,
-                decision_callback,
-                max_workers,
-                relogin=relogin,
-            )
-            created = len(final.confirmed) if final is not None else 0
-            processed = len(tasks)
+                  f"门店与地址准备耗时 {(time.perf_counter() - prep_start):.1f} 秒")
+            balance = query_balance(client.get_json)
+            return store_id, address, balance
+
+        store_id, address, (balance_total, balance_frozen) = _with_auth_relogin(
+            prepare_session_data, relogin, progress_callback, "读取门店/地址/余额")
+        _emit(progress_callback, _format_balance(balance_total, balance_frozen))
+
+        tasks = _collect_tasks(
+            orders_by_sheet, store_id, address, goods_name,
+            account=account, batch_id=batch_id, idempotency_field=idempotency_field,
+            now=now)
+        if idempotency_field:
+            _emit(progress_callback, f"已启用客户端幂等字段「{idempotency_field}」")
+        else:
+            _emit(progress_callback, "平台接口未探测到客户端幂等字段：采用“至少一次提交 + 对账确认”语义，不承诺 exactly-once")
+        try:
+            unit_price = float(getattr(config, "sss_unit_price", 0) or 0)
+        except (TypeError, ValueError):
+            unit_price = 0
+        if unit_price > 0:
+            estimate = round(unit_price * len(tasks), 2)
             _emit(progress_callback,
-                  f"下单与对账耗时 {(time.perf_counter() - submit_start):.1f} 秒，"
-                  f"确认 {created}/{processed}")
+                  f"本批 {len(tasks)} 单预计送完结算约 {estimate} 元"
+                  + (f"，当前可用 {balance_total}"
+                     if balance_total is not None else "，当前余额未知"))
+
+        balance_status, estimate = _balance_precheck(
+            tasks, balance_total, unit_price, progress_callback)
+        if balance_status != "ok":
+            return _result({
+                "status": balance_status,
+                "processed": len(tasks), "created": 0, "submitted": 0,
+                "previewed": 0, "stopped": True, "partial": False,
+                "reconciled": False, "uncertain": balance_status == "balance_unknown",
+                "estimate": estimate,
+                "semantics": "pre-submit-balance-guard",
+            })
+
+        if bool(getattr(config, "sss_preflight", False)):
+            preflight_status, preflight = _preflight_tasks(
+                tasks, client.get_json, progress_callback)
+            return _result({
+                "status": preflight_status,
+                "processed": len(tasks),
+                "created": len(preflight.confirmed) if preflight else 0,
+                "submitted": 0, "previewed": 0, "stopped": preflight_status != "preflight_ok",
+                "partial": False,
+                "reconciled": preflight is not None,
+                "uncertain": preflight is None,
+                "balance_total": balance_total,
+                "estimate": estimate,
+                "semantics": "preflight-only",
+            })
+
+        _emit(progress_callback,
+              f"开始下单：共 {len(tasks)} 单，并发 {max_workers} 路，读取超时 {read_timeout_s:g}s")
+        submit_start = time.perf_counter()
+        final, reconciled = _run_reconciled_submission(
+            tasks,
+            lambda: _make_api_submitter(client),
+            client.get_json,
+            stop_event,
+            progress_callback,
+            decision_callback,
+            max_workers,
+            relogin=relogin,
+        )
+        created = len(final.confirmed) if final is not None else 0
+        processed = len(tasks)
+        _emit(progress_callback,
+              f"下单与对账耗时 {(time.perf_counter() - submit_start):.1f} 秒，"
+              f"确认 {created}/{processed}")
+        try:
+            end_total, end_frozen = query_balance(client.get_json)
+        except _AuthExpired:
+            _emit(progress_callback, "余额查询时登录态失效，正在重新登录…")
+            relogin()
             try:
                 end_total, end_frozen = query_balance(client.get_json)
-            except _AuthExpired:
-                _emit(progress_callback, "余额查询时登录态失效，正在重新登录…")
-                relogin()
-                try:
-                    end_total, end_frozen = query_balance(client.get_json)
-                except _AuthExpired as exc:
-                    _emit(progress_callback, f"重新登录后余额查询仍失败：{exc}", "WARN")
-                    end_total, end_frozen = None, None
-            _emit(progress_callback, "结束" + _format_balance(end_total, end_frozen))
-            stopped = bool(stop_event.is_set())
-            partial = bool(reconciled and final is not None and final.missing and not stopped)
-            if stopped:
-                _emit(progress_callback,
-                      f"闪时送任务已停止：{'已完成站内对账' if reconciled else '站内对账失败'}，"
-                      f"确认 {created}/{processed}")
-            elif partial:
-                _emit(progress_callback,
-                      f"闪时送任务部分完成：确认 {created}/{processed}，"
-                      f"{processed - created} 单未完成")
-            else:
-                _emit(progress_callback,
-                      f"闪时送下单完成：确认 {created}/{processed}，"
-                      f"总耗时 {(time.perf_counter() - job_start):.1f} 秒")
-            result: dict[str, Any] = {
-                "processed": processed,
-                "created": created,
-                "stopped": stopped,
-                "partial": partial,
-                "reconciled": reconciled,
-                "uncertain": not reconciled,
-                "semantics": ("idempotency-key+reconciliation"
-                              if idempotency_field else "at-least-once+reconciliation"),
-            }
-            if balance_total is not None:
-                result["balance_total"] = balance_total
-            if end_total is not None:
-                result["balance_end"] = end_total
-            return _result(result)
-        finally:
-            client.close()
-
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise RuntimeError("缺少 Playwright，请先安装 requirements.txt") from exc
-
-    with sync_playwright() as playwright:
-        browser = _launch_browser(
-            playwright,
-            bool(getattr(config, "headless", False)),
-        )
-        page = browser.new_page()
-        try:
-            job_start = time.perf_counter()
-            _emit(progress_callback, "正在打开闪时送…")
-            page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
-            _ensure_logged_in(page, account, password, stop_event, progress_callback)
-            _minimize_window(browser, progress_callback)
-
-            def relogin_browser() -> None:
-                _emit(progress_callback, "登录态过期，重新登录…")
-                page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
-                _ensure_logged_in(page, account, password, stop_event,
-                                  progress_callback)
-                _minimize_window(browser, progress_callback)
-
-            def fetch_json(path: str) -> dict[str, Any]:
-                _, payload = _sss_api(page, "GET", path)
-                if is_auth_expired_payload(payload):
-                    raise _AuthExpired(auth_error_message(payload))
-                return payload
-
-            def prepare_browser_session_data() -> tuple[int, dict[str, Any]]:
-                _emit(progress_callback, "读取门店与常用地址…")
-                prep_start = time.perf_counter()
-                store_id, address = _prepare_store_and_address(
-                    fetch_json, config, store_name, common_address,
-                    use_fixed_address, progress_callback, parallel=False,
-                    store_cache_callback=store_cache_callback)
-                _emit(progress_callback,
-                      f"门店与地址准备耗时 {(time.perf_counter() - prep_start):.1f} 秒")
-                return store_id, address
-
-            def prepare_browser_session_data_with_balance() -> tuple[
-                    int, dict[str, Any], tuple[float | None, float | None]]:
-                store_id, address = prepare_browser_session_data()
-                return store_id, address, query_balance(fetch_json)
-
-            store_id, address, (balance_total, balance_frozen) = _with_auth_relogin(
-                prepare_browser_session_data_with_balance, relogin_browser,
-                progress_callback, "读取门店/地址")
-
-            tasks = _collect_tasks(
-                orders_by_sheet, store_id, address, goods_name,
-                account=account, batch_id=batch_id, idempotency_field=idempotency_field,
-                now=now)
-            if idempotency_field:
-                _emit(progress_callback, f"已启用客户端幂等字段「{idempotency_field}」")
-            else:
-                _emit(progress_callback, "平台接口未探测到客户端幂等字段：采用“至少一次提交 + 对账确认”语义，不承诺 exactly-once")
-            try:
-                unit_price = float(getattr(config, "sss_unit_price", 0) or 0)
-            except (TypeError, ValueError):
-                unit_price = 0
-            balance_status, estimate = _balance_precheck(
-                tasks, balance_total, unit_price, progress_callback)
-            if balance_status != "ok":
-                return _result({
-                    "status": balance_status,
-                    "processed": len(tasks), "created": 0, "submitted": 0,
-                    "previewed": 0, "stopped": True, "partial": False,
-                    "reconciled": False, "uncertain": balance_status == "balance_unknown",
-                    "estimate": estimate,
-                    "semantics": "pre-submit-balance-guard",
-                })
-            if bool(getattr(config, "sss_preflight", False)):
-                preflight_status, preflight = _preflight_tasks(
-                    tasks, fetch_json, progress_callback)
-                return _result({
-                    "status": preflight_status,
-                    "processed": len(tasks),
-                    "created": len(preflight.confirmed) if preflight else 0,
-                    "submitted": 0, "previewed": 0, "stopped": preflight_status != "preflight_ok",
-                    "partial": False,
-                    "reconciled": preflight is not None,
-                    "uncertain": preflight is None,
-                    "balance_total": balance_total,
-                    "estimate": estimate,
-                    "semantics": "preflight-only",
-                })
+            except _AuthExpired as exc:
+                _emit(progress_callback, f"重新登录后余额查询仍失败：{exc}", "WARN")
+                end_total, end_frozen = None, None
+        _emit(progress_callback, "结束" + _format_balance(end_total, end_frozen))
+        stopped = bool(stop_event.is_set())
+        partial = bool(reconciled and final is not None and final.missing and not stopped)
+        if stopped:
             _emit(progress_callback,
-                  f"开始下单：共 {len(tasks)} 单，浏览器模式固定串行")
-            submit_start = time.perf_counter()
-
-            def submit_browser(payload: dict[str, Any]) -> dict[str, Any]:
-                http, resp = _submit_order(page, payload)
-                if http == 401 or is_auth_expired_payload(resp):
-                    raise _AuthExpired(auth_error_message(resp, fallback="浏览器会话登录态失效"))
-                return resp
-
-            final, reconciled = _run_reconciled_submission(
-                tasks,
-                lambda: (submit_browser, lambda: None),
-                fetch_json,
-                stop_event,
-                progress_callback,
-                decision_callback,
-                max_workers=1,
-                relogin=relogin_browser,
-            )
-            created = len(final.confirmed) if final is not None else 0
-            processed = len(tasks)
-            stopped = bool(stop_event.is_set())
-            partial = bool(reconciled and final is not None and final.missing and not stopped)
-            _emit(progress_callback,
-                  f"下单与对账耗时 {(time.perf_counter() - submit_start):.1f} 秒，"
+                  f"闪时送任务已停止：{'已完成站内对账' if reconciled else '站内对账失败'}，"
                   f"确认 {created}/{processed}")
-        finally:
-            browser.close()
+        elif partial:
+            _emit(progress_callback,
+                  f"闪时送任务部分完成：确认 {created}/{processed}，"
+                  f"{processed - created} 单未完成")
+        else:
+            _emit(progress_callback,
+                  f"闪时送下单完成：确认 {created}/{processed}，"
+                  f"总耗时 {(time.perf_counter() - job_start):.1f} 秒")
+        result: dict[str, Any] = {
+            "processed": processed,
+            "created": created,
+            "stopped": stopped,
+            "partial": partial,
+            "reconciled": reconciled,
+            "uncertain": not reconciled,
+            "semantics": ("idempotency-key+reconciliation"
+                          if idempotency_field else "at-least-once+reconciliation"),
+        }
+        if balance_total is not None:
+            result["balance_total"] = balance_total
+        if end_total is not None:
+            result["balance_end"] = end_total
+        return _result(result)
+    finally:
+        client.close()
 
     if stopped:
         _emit(progress_callback,
@@ -2172,5 +2030,4 @@ def _submit_order(page: Any, payload: dict[str, Any]) -> tuple[int, dict[str, An
 
 
 __all__ = ["run_sss_job", "load_sss_orders", "compute_delivery_time",
-           "expected_delivery_date", "build_order_payload", "SSS_LOCATORS",
-           "ImportRefused", "BrowserNotFoundError", "LocatorError"]
+           "expected_delivery_date", "build_order_payload", "ImportRefused"]

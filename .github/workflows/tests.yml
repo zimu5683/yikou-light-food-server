@@ -62,7 +62,6 @@ jobs:
         run: python scripts/check_workspace_hygiene.py
       - name: Workspace hygiene (working tree, including untracked files)
         run: python scripts/check_workspace_hygiene.py --working-tree
-      - name: Version consistency
-        run: python scripts/check_version_consistency.py
-      - name: Signing tools compile
-        run: python -m py_compile scripts/sign_latest_manifest.py scripts/generate_update_signing_key.py
+      # 说明：原「版本一致性」与「签名工具编译」两步已移除 ——
+      # 它们校验的是桌面发布流水线（latest.json 清单、Ed25519 签名、PyInstaller 产物），
+      # 本项目已改为网页版专用，那条流水线连同相关脚本一起删掉了。

@@ -6,7 +6,6 @@ import datetime as dt
 import pytest
 
 from app import sss
-from app.locators import SSS_LOCATORS, load_sss_locators, sss_user_locators_path
 
 
 def test_compute_delivery_time_lunch_before_16():
@@ -132,26 +131,6 @@ def test_substitute_tokens_replaces_placeholders_in_candidates():
     out = sss._substitute_tokens(step, label="嗯哼")
     assert out["candidates"][0]["text"] == "嗯哼"
     assert out["candidates"][1]["has_text"] == "嗯哼"
-
-
-def test_sss_locators_are_separate_from_default_table(monkeypatch, tmp_path):
-    from app import locators as locators_mod
-
-    monkeypatch.setattr(locators_mod, "user_data_dir", lambda: tmp_path)
-    assert sss_user_locators_path() == tmp_path / "sss_locators.json"
-    table = load_sss_locators()
-    assert table["创建订单"]["candidates"]
-    assert table["地址选项"]["candidates"][0]["has_text"] == "{label}"
-    # 默认表（管理后台）与闪时送表互不污染。
-    assert "门店地址" not in table
-    assert "创建订单" not in locators_mod.DEFAULT_LOCATORS
-
-
-def test_sss_locators_include_required_steps():
-    for step in ("创建订单", "预约单选项", "一口轻食选项", "送达时间输入",
-                 "顾客姓名", "顾客电话", "门牌号", "最终确定"):
-        assert step in SSS_LOCATORS
-        assert SSS_LOCATORS[step]["candidates"]
 
 
 def test_build_order_payload_matches_captured_schema():

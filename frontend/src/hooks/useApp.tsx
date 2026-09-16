@@ -243,10 +243,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
     [],
   )
 
-  const checkBrowser = useCallback(() => {
-    api().check_browser().catch(() => {})
-  }, [])
-
   const clearPassword = useCallback(async (mode: 'order' | 'sss') => {
     await api().clear_password(mode).catch(() => {})
     toast.success(mode === 'sss' ? '已清除本机保存的闪时送密码' : '已清除本机保存的密码')
@@ -314,7 +310,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
       stopTask,
       chooseExcel,
       newTemplate,
-      checkBrowser,
       clearPassword,
       checkUpdates,
       installUpdate,
@@ -328,7 +323,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }),
     [ready, mocked, transport, authError, version, status, frozen, config, passwords, logs,
       decision, updateProgress, mode, captcha, addressInput, startOrder, startSss, stopTask,
-      chooseExcel, newTemplate, checkBrowser, clearPassword, checkUpdates, installUpdate,
+      chooseExcel, newTemplate, clearPassword, checkUpdates, installUpdate,
       openExternal, requestClose, setSplitRatio, clearLogs, resolveDecision, resolveCaptcha,
       resolveAddressInput],
   )

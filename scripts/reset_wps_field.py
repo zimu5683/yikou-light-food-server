@@ -11,14 +11,16 @@
 用法：
     python scripts/reset_wps_field.py            # 只预览（默认）
     python scripts/reset_wps_field.py --apply    # 真正执行
-    python scripts/reset_wps_field.py --apply --rebuild   # 顺带重新打包
+
+注意：本项目已改为网页版专用，不再打包成可执行文件，因此原先的 ``--rebuild``
+（调用 PyInstaller 重新打包）已移除。改完 ``app/config.py`` 后重启服务即可生效：
+``sv restart yikou-light-food``。
 """
 from __future__ import annotations
 
 import argparse
 import datetime
 import json
-import os
 import re
 import subprocess
 import sys
@@ -51,7 +53,6 @@ def call(cli: KdocsCli, *args: str) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description="把试验田重置回基线存档")
     parser.add_argument("--apply", action="store_true", help="真正执行（默认只预览）")
-    parser.add_argument("--rebuild", action="store_true", help="执行后重新打包")
     parser.add_argument("--sheets", help="只重置指定子表，逗号分隔（默认全部）")
     args = parser.parse_args()
 
@@ -124,17 +125,8 @@ def main() -> int:
                                 encoding="utf-8")
             print(f"已清除用户配置里过期的 wps_tables（原文件备份为 {backup.name}）")
 
-    if args.rebuild:
-        print("重新打包中（约 1 分钟）…")
-        subprocess.run(
-            [sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm",
-             "yikou-light-food.spec"],
-            cwd=ROOT, check=True,
-            env={**os.environ, "PLAYWRIGHT_BROWSERS_PATH": "0"},
-            stdout=subprocess.DEVNULL)
-        print("打包完成：dist/yikou-light-food（记得替换到运行目录）")
-    else:
-        print("提示：打包版程序需要重新构建（或加 --rebuild）才会用上新试验田。")
+    print("提示：新的试验田 ID 已写入 app/config.py，重启服务后生效：")
+    print("      sv restart yikou-light-food")
     return 0
 
 

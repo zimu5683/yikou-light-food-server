@@ -1,7 +1,6 @@
 """Application entry point."""
 from __future__ import annotations
 
-import ctypes
 import os
 import sys
 
@@ -10,65 +9,16 @@ if __package__ in (None, ""):
     __package__ = "app"
 
 
-def _enable_high_dpi_awareness() -> str:
-    """Enable per-monitor DPI awareness before a window is created (Windows)."""
-    if os.name != "nt":
-        return "unsupported"
-    try:
-        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == -4.
-        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
-            return "per-monitor-v2"
-    except (AttributeError, OSError, TypeError):
-        pass
-    try:
-        # PROCESS_PER_MONITOR_DPI_AWARE == 2.
-        if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:
-            return "per-monitor"
-    except (AttributeError, OSError, TypeError):
-        pass
-    try:
-        if ctypes.windll.user32.SetProcessDPIAware():
-            return "system"
-    except (AttributeError, OSError, TypeError):
-        pass
-    return "unavailable"
-
-
 def main() -> None:
-    """命令行入口：``--apply-update`` / ``--check-browser`` / ``--version`` / ``--self-check`` / ``--wps-check`` / ``--sss-import-check`` / ``--web`` 等子命令，无参数时启动 pywebview 窗口。"""
-    if "--apply-update" in sys.argv:
-        index = sys.argv.index("--apply-update")
-        if len(sys.argv) < index + 3:
-            raise SystemExit(2)
-        from .updater import UpdateError, apply_pending_update
-        try:
-            apply_pending_update(sys.argv[index + 1], sys.argv[index + 2])
-        except UpdateError as exc:
-            # The updater copy has no console; show a native error dialog so a
-            # replacement failure is no longer silent.
-            try:
-                ctypes.windll.user32.MessageBoxW(None, str(exc), "一口轻食更新失败", 0x10)
-            except Exception:
-                pass
-            raise SystemExit(1)
-        return
-    if "--check-browser" in sys.argv or "--install-browser" in sys.argv:
-        # 内置浏览器自检：打印 Chromium 路径与版本，缺失时以非零码退出。
-        from .automation import (
-            BrowserNotFoundError,
-            browser_description,
-            browser_version_warning,
-            ensure_browser,
-        )
-        try:
-            path = ensure_browser()
-        except BrowserNotFoundError as exc:
-            print(exc, file=sys.stderr)
-            raise SystemExit(1) from None
-        print(f"{browser_description()} {path}")
-        if warning := browser_version_warning():
-            print(f"警告：{warning}")
-        return
+    """命令行入口（网页版专用）。
+
+    无参数时启动网页服务；也可用 ``--web`` 显式指定。其它子命令：
+    ``--version`` / ``--self-check`` / ``--wps-check`` / ``--sss-import-check``。
+
+    原 ``--check-browser``（自检内置 Chromium）已移除：浏览器自动化模式不再支持，
+    本项目只走纯接口模式。
+
+    """
     if "--version" in sys.argv:
         from . import __version__
         print(f"yikou-light-food {__version__}")
@@ -78,10 +28,9 @@ def main() -> None:
         import app.automation  # noqa: F401
         import app.bridge  # noqa: F401
         import app.excel_templates  # noqa: F401
+        import app.release_check  # noqa: F401
         import app.sss  # noqa: F401
         import app.sss_import  # noqa: F401
-        import app.updater  # noqa: F401
-        import app.webview_app  # noqa: F401
         import app.wps_cloud  # noqa: F401
         from cryptography.hazmat.primitives.asymmetric.ed25519 import (  # noqa: F401
             Ed25519PublicKey,
@@ -161,15 +110,12 @@ def main() -> None:
             if meal.order_count > 5:
                 print(f"    …其余 {meal.order_count - 5} 人已省略")
         return
-    if "--web" in sys.argv:
-        # 网页版：把 js_api 桥接层暴露成 HTTP 服务，让其它设备用浏览器远程操作
-        # （手机/无桌面环境跑任务时使用）。见 app/web_server.py。
-        from .web_server import main as web_main
+    # 默认（以及显式 --web）都启动网页服务。
+    # 本项目已改为网页版专用：桌面原生窗口（pywebview）那套已经移除，
+    # 见 app/web_server.py。--web 仍保留，兼容既有的启动脚本与 runit 服务配置。
+    from .web_server import main as web_main
 
-        raise SystemExit(web_main())
-    _enable_high_dpi_awareness()
-    from .webview_app import run as webview_run
-    webview_run()
+    raise SystemExit(web_main())
 
 
 if __name__ == "__main__":

@@ -57,7 +57,6 @@ export interface AppStateBundle {
   stopTask: () => Promise<void>
   chooseExcel: (mode: 'order' | 'sss') => Promise<{ path: string; error: string }>
   newTemplate: (mode: 'order' | 'sss') => Promise<{ path: string; error: string }>
-  checkBrowser: () => void
   clearPassword: (mode: 'order' | 'sss') => Promise<void>
   checkUpdates: (manual: boolean) => void
   installUpdate: () => Promise<boolean>

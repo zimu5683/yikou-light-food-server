@@ -9,10 +9,8 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
-import os
 import re
 import shutil
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -23,9 +21,7 @@ try:
     from .processing import (
         clear_campus_sub_sheets,
         get_address_base_sheet_name,
-        get_donghu_address_segment,
         get_yijin_address_from_product_note,
-        parse_receiver_info,
         sort_campus_sub_sheets,
     )
 except ImportError:  # pragma: no cover - allows ``python app/automation.py``
@@ -33,22 +29,16 @@ except ImportError:  # pragma: no cover - allows ``python app/automation.py``
     from processing import (
         clear_campus_sub_sheets,
         get_address_base_sheet_name,
-        get_donghu_address_segment,
         get_yijin_address_from_product_note,
-        parse_receiver_info,
         sort_campus_sub_sheets,
     )
 
 try:
     from .api_client import AdminApiClient
-    from .config import user_data_dir
-    from .locators import DEFAULT_LOCATORS, load_locators
     from .address_aliases import aliases_path, load_aliases, write_pending
     from .delivery_point import DEFAULT_ALIASES, normalize_delivery_point
 except ImportError:  # pragma: no cover - allows ``python app/automation.py``
     from api_client import AdminApiClient
-    from config import user_data_dir
-    from locators import DEFAULT_LOCATORS, load_locators
     from address_aliases import aliases_path, load_aliases, write_pending
     from delivery_point import DEFAULT_ALIASES, normalize_delivery_point
 
@@ -128,31 +118,6 @@ def parse_order_created_date(value: object) -> _dt.date | None:
     return None
 
 
-class BrowserNotFoundError(RuntimeError):
-    """Raised when the Chromium payload shipped with the program is missing.
-
-    The application no longer probes for a system Edge/Chrome: automation
-    always drives the Chromium copy distributed next to the executable, so a
-    missing payload means the installation itself is incomplete.
-    """
-
-    def __init__(self, browser_dir: Path | None = None) -> None:
-        self.browser_dir = str(browser_dir or bundled_browser_dir())
-        super().__init__(
-            f"内置浏览器缺失或已损坏（{self.browser_dir}）。"
-            f"请重新下载完整安装包，并确认 {BROWSER_DIR_NAME}/ 目录与程序放在同一层。"
-        )
-
-
-class LocatorError(RuntimeError):
-    """Raised when a UI step matches none of its locator candidates.
-
-    A screenshot, an HTML snapshot and the current URL are saved to the user
-    log directory before this error is raised, so the site change can be
-    fixed by editing the locator configuration instead of the code.
-    """
-
-
 class OrderSearchNotFound(LookupError):
     """Raised when every order-list page was searched without a match."""
 
@@ -176,238 +141,9 @@ _BROWSER_EXECUTABLE_GLOBS = (
 )
 
 
-def bundled_browser_dir() -> Path:
-    """返回内置浏览器根目录（不保证存在）。
-
-    解析顺序：``YIKOU_BROWSER_DIR`` 覆盖 → 打包版可执行文件同级的 ``browser/``
-    （macOS 优先 ``.app/Contents/Resources/browser``）→ 源码运行时的仓库根目录
-    ``browser/``，其次是 ``scripts/fetch_browser.py`` 的默认暂存位置
-    ``vendor/browser/``。
-    """
-    override = os.environ.get(BROWSER_DIR_ENV, "").strip()
-    if override:
-        return Path(override).expanduser()
-    if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).resolve().parent
-        candidates = ([exe_dir.parent / "Resources" / BROWSER_DIR_NAME] if sys.platform == "darwin" else [])
-        candidates.append(exe_dir / BROWSER_DIR_NAME)
-        return next((path for path in candidates if path.is_dir()), candidates[0])
-    project = Path(__file__).resolve().parent.parent
-    candidates = [project / BROWSER_DIR_NAME, project / "vendor" / BROWSER_DIR_NAME]
-    return next((path for path in candidates if path.is_dir()), candidates[0])
-
-
-def find_bundled_browser() -> Path | None:
-    """在内置目录里定位 Chromium 可执行文件；缺失时返回 ``None``。"""
-    root = bundled_browser_dir()
-    if not root.is_dir():
-        return None
-    for name in _BROWSER_EXECUTABLE_NAMES:
-        direct = root / name
-        if direct.is_file():
-            return direct
-    for pattern in _BROWSER_EXECUTABLE_GLOBS:
-        for path in sorted(root.glob(pattern)):
-            if path.is_file():
-                return path
-    return None
-
-
-def browser_manifest() -> dict[str, Any]:
-    """读取构建期内置浏览器时写入的版本标记；没有标记时返回空字典。"""
-    try:
-        payload = json.loads((bundled_browser_dir() / BROWSER_MANIFEST_NAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def browser_description() -> str:
-    """给日志用的一行内置浏览器描述，例如 ``Chromium 151.0.7922.34``。"""
-    manifest = browser_manifest()
-    version = str(manifest.get("browser_version") or "").strip()
-    return f"Chromium {version}" if version else "内置 Chromium"
-
-
-def playwright_version() -> str:
-    """返回当前依赖的 Playwright 版本；无法确定时返回空字符串。
-
-    打包版里 ``importlib.metadata`` 未必能读到 dist-info，因此再退回读取
-    Playwright 驱动自带的 ``package.json``。
-    """
-    try:
-        from importlib.metadata import version
-        if found := version("playwright"):
-            return found
-    except Exception:
-        pass
-    try:
-        import playwright
-        manifest = Path(playwright.__file__).parent / "driver" / "package" / "package.json"
-        return str(json.loads(manifest.read_text(encoding="utf-8")).get("version") or "")
-    except Exception:
-        return ""
-
-
-def browser_version_warning() -> str | None:
-    """内置浏览器与当前 Playwright 版本不一致时返回提示文本。
-
-    版本错配通常仍能启动，但协议差异可能让自动化在个别站点上失败，因此只
-    提示、不阻断，由用户决定是否重新下载完整安装包。
-    """
-    packaged = str(browser_manifest().get("playwright") or "").strip()
-    current = playwright_version()
-    if packaged and current and packaged != current:
-        return (f"内置浏览器由 Playwright {packaged} 打包，当前程序依赖 Playwright "
-                f"{current}，建议重新下载完整安装包。")
-    return None
-
-
 def _emit(callback: Callable[[str], Any] | None, message: str) -> None:
     if callback:
         callback(message)
-
-
-def _base_url(config: Any) -> str:
-    """Return the SPA base URL (scheme://host/path plus ``#`` for hash routing)."""
-    url = str(getattr(config, "target_url", getattr(config, "url", "")) or "").strip()
-    if not url:
-        return ""
-    if "#" in url:
-        return url.split("#")[0].rstrip("/") + "/#"
-    from urllib.parse import urlsplit
-    parts = urlsplit(url)
-    path = parts.path.rsplit("/", 1)[0].rstrip("/")
-    return f"{parts.scheme}://{parts.netloc}{path}/"
-
-
-def _build_locator(page: Any, candidate: dict[str, Any]) -> Any:
-    """Build a Playwright locator for one candidate entry.
-
-    The kind is detected from the keys present: ``css``, ``role`` (with
-    optional ``name``/``name_re``), ``placeholder``, ``text`` or ``text_re``,
-    and ``xpath`` (a full XPath expression such as ``//input``).
-    ``has_text``/``has_text_re`` further filter the matched set.
-    """
-    if "css" in candidate:
-        locator = page.locator(candidate["css"])
-    elif "role" in candidate:
-        kwargs: dict[str, Any] = {}
-        if candidate.get("name_re"):
-            kwargs["name"] = re.compile(candidate["name_re"])
-        elif "name" in candidate:
-            kwargs["name"] = candidate["name"]
-        locator = page.get_by_role(candidate["role"], **kwargs)
-    elif "placeholder" in candidate:
-        locator = page.get_by_placeholder(candidate["placeholder"])
-    elif "text" in candidate:
-        locator = page.get_by_text(candidate["text"])
-    elif "text_re" in candidate:
-        locator = page.get_by_text(re.compile(candidate["text_re"]))
-    elif "xpath" in candidate:
-        locator = page.locator(candidate["xpath"])
-    else:
-        raise ValueError(f"无法识别的定位器候选: {candidate!r}")
-    if candidate.get("has_text_re"):
-        locator = locator.filter(has_text=re.compile(candidate["has_text_re"]))
-    elif candidate.get("has_text"):
-        locator = locator.filter(has_text=candidate["has_text"])
-    return locator
-
-
-def _find_by_candidates(page: Any, step: dict[str, Any], timeout: int) -> tuple[Any, int]:
-    """Return ``(locator, candidate_index)`` for the first candidate that matches."""
-    for index, candidate in enumerate(step.get("candidates", [])):
-        try:
-            locator = _build_locator(page, candidate)
-            if locator.count() == 0:
-                continue
-            narrowed = locator.nth(int(candidate["index"])) if "index" in candidate else locator.first
-            narrowed.wait_for(state="visible", timeout=min(max(timeout, 1), 3000))
-            return narrowed, index
-        except Exception:
-            continue
-    return None, -1
-
-
-def _save_failure_snapshot(page: Any, step_name: str) -> Path:
-    """Save screenshot, HTML and URL evidence for a failed UI step."""
-    log_dir = user_data_dir() / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    safe = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", step_name)
-    for extension, writer in (
-        (".png", lambda path: page.screenshot(path=str(path), full_page=True)),
-        (".html", lambda path: path.write_text(page.content(), encoding="utf-8")),
-        (".txt", lambda path: path.write_text(page.url, encoding="utf-8")),
-    ):
-        try:
-            writer(log_dir / f"{stamp}_{safe}{extension}")
-        except Exception:
-            pass
-    return log_dir
-
-
-def _locator_failure(page: Any, step_name: str) -> LocatorError:
-    log_dir = _save_failure_snapshot(page, step_name)
-    return LocatorError(
-        f"页面定位失败：{step_name}。已保存页面截图、HTML 与当前网址到 {log_dir}，"
-        f"可据此修改定位器配置（locators.json）后重试，无需更新程序。"
-    )
-
-
-def _locator_step(locators: dict[str, Any] | None, name: str) -> dict[str, Any]:
-    """Return a step, falling back to the built-in default when missing."""
-    return (locators or {}).get(name) or DEFAULT_LOCATORS.get(name) or {}
-
-
-def _label_step(locators: dict[str, Any] | None, label: str) -> dict[str, Any]:
-    user = ((locators or {}).get("labels") or {}).get(label)
-    if user:
-        return user
-    default = (DEFAULT_LOCATORS.get("labels") or {}).get(label)
-    return default or {"candidates": [{"text": label}]}
-
-
-def _navigate(page: Any, step_name: str, locators: dict[str, Any] | None, base_url: str,
-              timeout: int, callback: Callable[[str], Any] | None) -> None:
-    """Open a page: direct URL first, then the ordered locator chain."""
-    step = _locator_step(locators, step_name)
-    wait_url = step.get("wait_url")
-    if step.get("goto"):
-        original_url = page.url
-        url = str(step["goto"]).replace("{base}", base_url)
-        try:
-            page.goto(url, timeout=timeout, wait_until="domcontentloaded")
-            if wait_url:
-                page.wait_for_url(wait_url, timeout=min(max(timeout, 1), 5000))
-            _emit(callback, f"{step_name}：URL 直达成功")
-            if step.get("confirm") == "table":
-                _wait_for_order_table(page, timeout)
-            return
-        except Exception:
-            try:
-                if page.url != original_url:
-                    page.goto(original_url, timeout=timeout, wait_until="domcontentloaded")
-            except Exception:
-                pass
-    element, index = _find_by_candidates(page, step, timeout)
-    if element is None:
-        raise _locator_failure(page, step_name)
-    try:
-        if step.get("action") == "dblclick":
-            element.dblclick(timeout=timeout)
-        else:
-            element.click(timeout=timeout)
-        if step.get("wait_networkidle"):
-            page.wait_for_load_state("networkidle", timeout=timeout)
-        if wait_url:
-            page.wait_for_url(wait_url, timeout=timeout)
-        if step.get("confirm") == "table":
-            _wait_for_order_table(page, timeout)
-    except Exception:
-        raise _locator_failure(page, step_name) from None
-    _emit(callback, f"{step_name}：第 {index + 1} 个定位候选命中")
 
 
 def parse_meal_rows(rows: Iterable[dict[str, str]], meal_type: str) -> list[MealInfo]:
@@ -433,88 +169,6 @@ def parse_meal_rows(rows: Iterable[dict[str, str]], meal_type: str) -> list[Meal
 
 
 MEAL_ROWS_JS = """rows => rows.map(r => ({product:(r.querySelector('td:nth-child(1)')||{}).innerText||'', qty:(r.querySelector('td:nth-child(3)')||{}).innerText||''}))"""
-
-
-def _meal_rows(page: Any, locators: dict[str, Any] | None) -> list[dict[str, str]]:
-    """Collect meal rows using the first table candidate that yields data."""
-    step = _locator_step(locators, "meal_table_row")
-    for candidate in step.get("candidates", []):
-        css = candidate.get("css")
-        if not css:
-            continue
-        try:
-            rows = page.eval_on_selector_all(css, MEAL_ROWS_JS)
-            if rows:
-                return rows or []
-        except Exception:
-            continue
-    return []
-
-
-def extract_meal_info(page: Any, meal_type: str, locators: dict[str, Any] | None = None) -> list[MealInfo]:
-    """从页面表格里读出指定餐别的 MealInfo 列表（取行 + 解析的组合入口）。"""
-    return parse_meal_rows(_meal_rows(page, locators), meal_type)
-
-
-def extract_product_note_text(page: Any, locators: dict[str, Any] | None = None) -> str:
-    """Collect free-form notes rendered below product names."""
-    step = _locator_step(locators, "meal_table_row")
-    products: list[str] = []
-    for candidate in step.get("candidates", []):
-        css = candidate.get("css")
-        if not css:
-            continue
-        try:
-            products = page.eval_on_selector_all(
-                css,
-                """rows => rows.map(r => (r.querySelector('td:nth-child(1)') || {}).innerText || '')""",
-            )
-            if products:
-                break
-        except Exception:
-            continue
-    lines: list[str] = []
-    for product in products or []:
-        parts = [line.strip() for line in str(product).splitlines() if line.strip()]
-        lines.extend(parts[1:])
-    return " ".join(lines)
-
-
-def ensure_browser() -> str:
-    """返回内置 Chromium 可执行文件路径，缺失时抛 :class:`BrowserNotFoundError`。
-
-    程序固定使用随包分发的 Chromium，既不探测系统 Edge/Chrome，也不在
-    运行时下载浏览器，因此这里没有回退分支。
-    """
-    root = bundled_browser_dir()
-    executable = find_bundled_browser()
-    if executable is None:
-        raise BrowserNotFoundError(root)
-    return str(executable)
-
-
-def _launch_browser(playwright: Any, headless: bool = False) -> Any:
-    """用内置 Chromium 启动浏览器，供订单抓取与闪时送下单共用。"""
-    return playwright.chromium.launch(
-        executable_path=ensure_browser(),
-        headless=headless,
-        args=["--window-size=1300,900"],
-    )
-
-
-def _label(page: Any, label: str, timeout: int, locators: dict[str, Any] | None = None) -> str:
-    """Read the value shown next to a detail label (e.g. 收货人 → 张三)."""
-    element, _ = _find_by_candidates(page, _label_step(locators, label), timeout)
-    if element is None:
-        return ""
-    try:
-        matched = element.inner_text().strip()
-        parent_text = element.locator("..").inner_text().strip()
-        if matched and matched in parent_text:
-            return parent_text.split(matched)[-1].lstrip("：:").strip()
-        return parent_text.split(label)[-1].lstrip("：:").strip()
-    except Exception:
-        return ""
 
 
 def _historical_sheet_name(target_date: _dt.date) -> str:
@@ -715,14 +369,6 @@ def _detail_api_json(page: Any, detail_url: str) -> dict[str, Any] | None:
     return payload["data"]
 
 
-def _order_from_api(page: Any, code: str, detail_url: str) -> OrderInfo | None:
-    """从详情接口 JSON 构造订单；接口不可用时返回 None。"""
-    data = _detail_api_json(page, detail_url)
-    if not data:
-        return None
-    return _order_from_api_data(code, data)
-
-
 def _order_from_api_data(code: str, data: dict[str, Any]) -> OrderInfo | None:
     """把 /channel/order/{id} 的 data 字段解析为订单；字段全空时返回 None。
 
@@ -766,36 +412,6 @@ def _order_from_api_data(code: str, data: dict[str, Any]) -> OrderInfo | None:
     if not (name or phone or address or candidate.lunch or candidate.dinner):
         return None
     return candidate
-
-
-def _api_get_json(page: Any, path: str) -> dict[str, Any]:
-    """在已登录会话内带鉴权 GET 站点接口，返回解析后的 JSON。
-
-    鉴权走 Bearer token（localStorage.layout_token）+ uniacid 头，与
-    _detail_api_json 相同；401 视为会话失效直接报错。
-    """
-    script = (
-        "async (path) => {"
-        "const r = await fetch(path, {credentials: 'include',"
-        "headers: {'authorization': `Bearer ${localStorage.layout_token}`,"
-        "'uniacid': localStorage.layout_uniacid || ''}});"
-        "return JSON.stringify({http: r.status, body: await r.text()});"
-        "}"
-    )
-    try:
-        envelope = json.loads(page.evaluate(script, path))
-    except Exception as exc:
-        raise RuntimeError(f"接口 {path} 请求失败：{exc}") from exc
-    try:
-        payload = json.loads(envelope.get("body") or "")
-    except ValueError as exc:
-        raise RuntimeError(f"接口 {path} 返回非 JSON（HTTP {envelope.get('http')}）") from exc
-    if envelope.get("http") == 401 or payload.get("code") == 401:
-        raise RuntimeError("登录会话已失效（接口 401），请重新运行程序")
-    code = payload.get("code")
-    if code not in (200, None):
-        raise RuntimeError(f"接口 {path} 返回异常：{payload.get('msg') or code}")
-    return payload
 
 
 def _api_list_waimai_orders(api_get: Callable[[str], dict[str, Any]],
@@ -992,78 +608,10 @@ def _prefetch_order_details(api_get: Callable[[str], dict[str, Any]],
     return {number: order for number, order in results if order is not None}
 
 
-def _read_order(page: Any, code: str, timeout: int, locators: dict[str, Any] | None,
-                callback: Callable[[str], Any] | None, detail_url: str = "") -> OrderInfo | None:
-    """读取详情页并构造 OrderInfo；返回 None 表示两次尝试都读到空数据。
-
-    站点 SPA 会在任意时刻自发重新引导回 #/home（channelLogin/loadMenus
-    重跑后 router 重置），读取途中随时可能被弹走。一旦发现读到的数据
-    全空、或读完时已不在详情路由，就用详情地址重新直达再读一遍。
-    detail_url 必须由调用方在详情验证通过后传入——不能用当前地址，
-    否则页面已被弹走时会“重读”到首页。
-    """
-    if not detail_url:
-        try:
-            url = page.url
-        except Exception:
-            url = ""
-        detail_url = url if _is_order_detail_url(url) else ""
-    for attempt in range(2):
-        if attempt:
-            if not detail_url:
-                return None
-            try:
-                if _is_order_detail_url(getattr(page, "url", "")):
-                    _emit(callback, f"{code} 详情数据为空，重新加载详情后重读")
-                else:
-                    _emit(callback, f"{code} 读取期间页面被弹走，重新直达详情重读")
-                page.goto(detail_url, timeout=timeout, wait_until="domcontentloaded")
-            except Exception as exc:
-                _emit(callback, f"{code} 重读详情失败：{exc}")
-                return None
-            try:
-                _wait_for_detail(page, timeout, callback)
-            except Exception:
-                pass
-        name, phone = _read_contact(page, timeout, locators)
-        raw_address = _read_address(page, timeout, locators)
-        address = raw_address
-        base = get_address_base_sheet_name(raw_address)
-        if base == "衣锦":
-            address = get_yijin_address_from_product_note(extract_product_note_text(page, locators))
-        candidate = OrderInfo(code, name, phone, address, base, delivery_address=raw_address)
-        for typ, attr in (("午餐", "lunch"), ("晚餐", "dinner")):
-            setattr(candidate, attr, extract_meal_info(page, typ, locators))
-        if (name or phone or address or candidate.lunch or candidate.dinner) \
-                and _is_order_detail_url(getattr(page, "url", "")):
-            try:
-                api_data = _detail_api_json(page, detail_url)
-            except Exception:
-                api_data = None
-            if api_data:
-                candidate.metadata.update({
-                    "order_id": re.search(r"[?&]id=(\d+)", detail_url or "").group(1)
-                    if re.search(r"[?&]id=(\d+)", detail_url or "") else "",
-                    "created_at": next((api_data.get(key) for key in
-                                         ("created_at", "createdAt", "create_time", "createTime", "order_time", "orderTime")
-                                         if api_data.get(key) not in (None, "")), None),
-                })
-            return candidate
-        # DOM 读空通常不是页面改版，而是站点前端缺陷：接口数据到了却不渲染，
-        # 或路由随机弹回首页。数据在 /channel/order/{id} 里，直接取 JSON。
-        if not attempt and detail_url:
-            api_candidate = _order_from_api(page, code, detail_url)
-            if api_candidate is not None:
-                _emit(callback, f"{code} 页面未渲染出详情数据，已改从详情接口读取")
-                return api_candidate
-    return None
-
-
 def run_job(config: Any, order_count: int | None, stop_event: Any, progress_callback: Callable[[str], Any] | None = None, password: str | None = None,
             order_decision_callback: Callable[[str, str], str] | None = None,
             save_decision_callback: Callable[[str], str] | None = None,
             pending_address_callback: Callable[[list[dict[str, Any]]], dict[str, str]] | None = None,
-            locators: dict[str, Any] | None = None,
             target_date: object = None) -> dict[str, Any]:
     """Process the newest W orders and append their meals to the workbook.
 
@@ -1085,13 +633,10 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
     today = _dt.date.today()
     if password is None:
         password = getattr(config, "password", "")
-    if locators is None:
-        locators = load_locators()
     # Validate aliases before backing up or touching the workbook.
     user_aliases = load_aliases()
     _emit(progress_callback,
           f"地址别名：{aliases_path()}（用户 {len(user_aliases)} 条，内置 {len(DEFAULT_ALIASES)} 条）")
-    api_mode = bool(getattr(config, "api_mode", True))
     backup_dir = excel_path.parent / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1104,12 +649,12 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
     refunded_numbers: list[int] = []
     applied_numbers: list[int] = []
     pending_orders: list[OrderInfo] = []
-    timeout = int(getattr(config, "element_timeout_ms", 8000))
+
     def process_orders(api_get: Callable[[str], dict[str, Any]]) -> None:
         nonlocal processed, found, refunded_numbers, applied_numbers, pending_orders
         list_start = time.perf_counter()
         rows = _api_list_waimai_orders(api_get, selected_date, progress_callback,
-                                        concurrent_pages=api_mode)
+                                        concurrent_pages=True)
         _emit(progress_callback,
               f"拉取订单列表耗时 {(time.perf_counter() - list_start):.1f} 秒")
 
@@ -1149,7 +694,8 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
         # 纯接口模式下并发预取订单详情；失败项仍走下方串行重试/决策流程。
         # 退款订单不预取也不写表，只对正常订单发起。
         prefetched: dict[int, OrderInfo] | None = None
-        if api_mode and len(normal_numbers) > 1:
+        # 纯接口模式：多页并发拉取（浏览器模式已移除）
+        if len(normal_numbers) > 1:
             detail_start = time.perf_counter()
             prefetched = _prefetch_order_details(api_get, rows_by_pick, normal_numbers, max_workers=5)
             _emit(progress_callback,
@@ -1297,55 +843,17 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
                   f"写入 Excel 耗时 {(time.perf_counter() - write_start):.1f} 秒")
 
     try:
-        if api_mode:
-            _emit(progress_callback, "正在通过接口登录管理后台…")
-            client = AdminApiClient(
-                str(getattr(config, "target_url", getattr(config, "url", ""))),
-                str(getattr(config, "phone_number", getattr(config, "phone", "")) or ""),
-                password or "",
-            )
-            client.login()
-            _emit(progress_callback, "登录成功，开始处理订单")
+        _emit(progress_callback, "正在通过接口登录管理后台…")
+        client = AdminApiClient(
+            str(getattr(config, "target_url", getattr(config, "url", ""))),
+            str(getattr(config, "phone_number", getattr(config, "phone", "")) or ""),
+            password or "",
+        )
+        client.login()
+        _emit(progress_callback, "登录成功，开始处理订单")
 
-            process_orders(client.get_json)
-        else:
-            try:
-                from playwright.sync_api import sync_playwright
-            except ImportError as exc:
-                raise RuntimeError("缺少 Playwright，请先安装 requirements.txt") from exc
+        process_orders(client.get_json)
 
-            with sync_playwright() as playwright:
-                browser = _launch_browser(playwright, bool(getattr(config, "headless", False)))
-                page = browser.new_page()
-                try:
-                    _emit(progress_callback, "正在登录...")
-                    page.goto(getattr(config, "target_url", getattr(config, "url", "")), timeout=timeout, wait_until="networkidle")
-
-                    account_input, _ = _find_by_candidates(page, _locator_step(locators, "login_account_input"), timeout)
-                    if account_input is None:
-                        raise _locator_failure(page, "账号输入框")
-                    account_input.fill(getattr(config, "phone_number", getattr(config, "phone", "")))
-
-                    password_input, _ = _find_by_candidates(page, _locator_step(locators, "login_password_input"), timeout)
-                    if password_input is None:
-                        raise _locator_failure(page, "密码输入框")
-                    password_input.fill(password or "")
-
-                    submit, _ = _find_by_candidates(page, _locator_step(locators, "login_submit"), timeout)
-                    if submit is None:
-                        raise _locator_failure(page, "登录按钮")
-                    submit.click(timeout=timeout)
-                    login_step = _locator_step(locators, "登录成功")
-                    page.wait_for_url(str(login_step.get("wait_url") or "**/workbench/store"), timeout=timeout)
-
-                    # 站点 SPA 在程序化操作节奏下会把页面弹回 #/home、把已渲染
-                    # 的表格随机清空（2026-09-05 实测：接口返回 6150 笔订单而
-                    # DOM 表格为 0 行），因此列表与详情一律直接走后端接口，
-                    # 界面只负责登录与产生会话 token。
-                    _emit(progress_callback, "登录成功，开始处理订单")
-                    process_orders(lambda path: _api_get_json(page, path))
-                finally:
-                    browser.close()
         report_items = _pending_report_items(pending_orders)
         report_path = write_pending(report_items, target_date=selected_date)
         _emit(progress_callback, f"待确认地址报告：{report_path}（{len(report_items)} 种写法）")
@@ -1427,294 +935,3 @@ def _format_order_summary(order: OrderInfo, meal_text: str | None = None) -> str
     ))
 
 
-def _wait_for_order_table(page: Any, timeout: int) -> None:
-    """Wait for the SPA to render at least one order row."""
-    page.wait_for_load_state("domcontentloaded", timeout=timeout)
-    page.locator(".el-table__body-wrapper tbody tr:visible, table tbody tr:visible").first.wait_for(
-        state="visible", timeout=timeout
-    )
-
-
-def _recover_order_table(page: Any, timeout: int, list_url: str = "") -> bool:
-    """Best-effort recovery after a detail-page or rendering failure.
-
-    注意：只在确认当前不在订单列表页时才后退/回跳，避免把正常的列表页
-    越退越远（历史退穿是 W8 之后 W7 找不到的主因）。
-    """
-    try:
-        _wait_for_order_table(page, min(timeout, 1200))
-        return True
-    except Exception:
-        pass
-    return _back_to_order_list(page, timeout, list_url, reason="恢复")
-
-
-def _is_order_detail_url(url: str) -> bool:
-    return "/order/detail" in (url or "")
-
-
-def _waimai_tab_active(page: Any) -> bool:
-    """外送订单 Tab 是否处于选中状态（只读检查，绝不点击）。"""
-    for build in (
-        lambda: page.get_by_role("tab", name=re.compile(r"外送订单")).first,
-        lambda: page.locator(".el-tabs__item", has_text=re.compile(r"外送订单")).first,
-    ):
-        try:
-            tab = build()
-        except Exception:
-            continue
-        try:
-            if tab.count() == 0:
-                continue
-            cls = (tab.get_attribute("class") or "").lower()
-            if "active" in cls or "selected" in cls or "current" in cls:
-                return True
-            if tab.get_attribute("aria-selected") == "true":
-                return True
-        except Exception:
-            continue
-        return False
-    return False
-
-
-def _ensure_waimai_tab(page: Any, locators: dict[str, Any] | None, base_url: str,
-                        timeout: int, callback: Callable[[str], Any] | None,
-                        list_url: str = "") -> None:
-    """Reset to the order-list route and explicitly select 外送订单."""
-    if list_url:
-        page.goto(list_url, timeout=timeout, wait_until="domcontentloaded")
-    _navigate(page, "外送订单", locators, base_url, timeout, callback)
-
-
-def _open_detail(page: Any, code: str, cell: Any, config: Any,
-                  callback: Callable[[str], Any] | None, timeout: int,
-                  list_url: str = "", occurrence: int = 0, start_page: int = 1) -> None:
-    """点击详情并验证地址真的进了 detail 路由；没点开就明错，绝不执行返回。
-
-    点击落在表格重渲染间隙时会丢失（地址不变、无新历史），此时若执行
-    返回就会一路退到 #/home。这就是“点了外送订单却跳首页”的机制。
-    若页面已被 SPA 弹回 #/home（Tab 不在列表页），先直达回列表再重找该行。
-    """
-    try:
-        before = page.url
-    except Exception:
-        before = ""
-    now = before
-    last_err: Exception | None = None
-    for i in range(2):
-        try:
-            btn = cell.locator("xpath=ancestor::tr").locator("text=详情").first
-            btn.click(timeout=timeout)
-            page.wait_for_url("**/order/detail**", timeout=timeout)
-            page.wait_for_load_state("domcontentloaded", timeout=timeout)
-            return
-        except Exception as exc:
-            last_err = exc
-            try:
-                now = page.url
-            except Exception:
-                now = before
-            if _is_order_detail_url(now):
-                return
-            if i == 0:
-                _emit(callback, f"{code} 详情首次点击无跳转（地址无变化），重找该行再点一次")
-                try:
-                    if list_url and "takeOutList" not in (now or ""):
-                        page.goto(list_url, timeout=timeout, wait_until="domcontentloaded")
-                    cell, _ = _find_order_cell(
-                        page, code, config, callback,
-                        occurrence=occurrence, start_page=start_page,
-                    )
-                except Exception:
-                    pass
-                continue
-    raise LookupError(f"订单 {code} 详情未点开（点击后地址仍为：{now or before or '未知'}），已放弃，绝不执行返回") from last_err
-
-
-def _wait_for_detail(page: Any, timeout: int, callback: Callable[[str], Any] | None = None) -> None:
-    """点详情后确认真的进了详情路由，且关键字段已渲染。
-
-    站点 SPA 可能在进入 detail 路由后立刻把页面弹回 #/home（内容变成
-    首页仪表盘），此时直接读取必然全空。发现弹回（或字段迟迟不渲染）
-    就用详情地址重新直达一次——直达加载出的详情页是完整的。
-    """
-    page.wait_for_url("**/order/detail**", timeout=timeout)
-    page.wait_for_load_state("domcontentloaded", timeout=timeout)
-    try:
-        detail_url = page.url
-    except Exception:
-        detail_url = ""
-    pattern = re.compile(r"收货人|收件人|下单人|联系电话")
-    for attempt in range(2):
-        try:
-            page.get_by_text(pattern).first.wait_for(
-                state="visible", timeout=min(max(timeout, 1), 5000)
-            )
-            if _is_order_detail_url(getattr(page, "url", "")):
-                return
-        except Exception:
-            pass
-        if not detail_url or attempt > 0:
-            break
-        try:
-            here = page.url
-        except Exception:
-            here = "未知"
-        if _is_order_detail_url(here):
-            _emit(callback, "详情页字段未渲染，用详情地址重新直达")
-        else:
-            _emit(callback, f"详情页被弹回 {here}，用详情地址重新直达")
-        try:
-            page.goto(detail_url, timeout=timeout, wait_until="domcontentloaded")
-        except Exception as exc:
-            _emit(callback, f"重新直达详情失败：{exc}")
-            return
-    _emit(callback, "详情页字段等待超时，尝试直接读取")
-
-
-def _read_contact(page: Any, timeout: int, locators: dict[str, Any] | None) -> tuple[str, str]:
-    """按新旧两套标签读取姓名电话：收货人 -> 下单人 -> 联系电话。"""
-    for label in ("收货人", "下单人"):
-        value = _label(page, label, timeout, locators)
-        name, phone = parse_receiver_info(value)
-        if name or phone:
-            return name, phone
-    phone = _label(page, "联系电话", timeout, locators).strip()
-    name = _label(page, "下单人", timeout, locators).strip()
-    if not name:
-        name, phone2 = parse_receiver_info(phone)
-        phone = phone2 or phone
-    return name, phone
-
-
-def _read_address(page: Any, timeout: int, locators: dict[str, Any] | None) -> str:
-    for label in ("配送地址", "收货地址", "送餐地址", "用户备注"):
-        value = _label(page, label, timeout, locators).strip()
-        if value:
-            return value
-    return ""
-
-
-def _back_to_order_list(page: Any, timeout: int, list_url: str, reason: str = "返回",
-                        callback: Callable[[str], Any] | None = None) -> bool:
-    """从详情页回到订单列表：彻底不用浏览器历史，一律用记录的列表地址直达。
-
-    历史后退在 SPA 里不可靠（详情没点开时一次 go_back 就会弹回 #/home）；
-    直达会重置 Tab，调用方下次搜索前会重新确认外送订单 Tab。
-    """
-    if not _is_order_detail_url(getattr(page, "url", "")):
-        # 根本没进详情，绝不能碰历史，直接确认表格还在即可。
-        try:
-            _wait_for_order_table(page, min(timeout, 2000))
-            return True
-        except Exception:
-            pass
-    if list_url:
-        try:
-            page.goto(list_url, timeout=timeout, wait_until="domcontentloaded")
-            _wait_for_order_table(page, timeout)
-            _emit(callback, f"{reason}列表成功（直达）：{list_url}")
-            return True
-        except Exception as exc:
-            _emit(callback, f"{reason}列表直达失败：{exc}")
-    try:
-        _wait_for_order_table(page, timeout)
-        return True
-    except Exception:
-        return False
-
-
-def _go_to_first_order_page(page: Any, pause: int) -> None:
-    first_page = page.locator('.el-pagination li.number').filter(has_text=re.compile(r'^\s*1\s*$')).first
-    try:
-        if first_page.is_visible() and "active" not in (first_page.get_attribute("class") or ""):
-            first_page.click()
-            page.wait_for_timeout(pause)
-    except Exception:
-        pass
-
-
-def _click_order_page_number(page: Any, page_number: int, timeout: int, pause: int) -> bool:
-    button = page.locator('.el-pagination li.number').filter(
-        has_text=re.compile(rf'^\s*{page_number}\s*$')
-    ).first
-    try:
-        button.wait_for(state="visible", timeout=timeout)
-        button.click(timeout=timeout)
-        page.wait_for_load_state("domcontentloaded", timeout=min(timeout, 5000))
-        page.wait_for_timeout(pause)
-        return True
-    except Exception:
-        try:
-            button = page.locator(
-                f'//div[contains(@class,"el-pagination")]//li[contains(@class,"number") and normalize-space()="{page_number}"]'
-            ).first
-            button.wait_for(state="visible", timeout=timeout)
-            button.click(timeout=timeout)
-            page.wait_for_load_state("domcontentloaded", timeout=min(timeout, 5000))
-            page.wait_for_timeout(pause)
-            return True
-        except Exception:
-            return False
-
-
-def _order_page_jump_sequence(target_page: int) -> list[int]:
-    target_page = max(1, int(target_page))
-    if target_page <= PAGE_JUMP_THRESHOLD:
-        return [target_page]
-    return [*range(PAGE_JUMP_THRESHOLD, target_page, 2), target_page]
-
-
-def _jump_to_order_page(page: Any, target_page: int, timeout: int, pause: int,
-                        callback: Callable[[str], Any] | None = None) -> bool:
-    """Reach a page using the pagination control's visible jump sequence.
-
-    Element Plus hides later page buttons behind an ellipsis.  Clicking 6,
-    then 8, then 10, and so on makes the next target button visible, matching
-    the navigation sequence used by the original automation.
-    """
-    _go_to_first_order_page(page, pause)
-    for page_number in _order_page_jump_sequence(target_page):
-        if not _click_order_page_number(page, page_number, timeout, pause):
-            _emit(callback, f"无法跳转到第 {page_number} 页")
-            return False
-    return True
-
-
-def _find_order_cell(page: Any, code: str, config: Any, callback: Callable[[str], Any] | None,
-                     occurrence: int = 0, start_page: int = 1) -> tuple[Any, int]:
-    """Find an exact order number, starting at a remembered page and wrapping once."""
-    timeout = max(1000, int(getattr(config, "order_search_timeout_ms", 8000)))
-    pause = max(200, int(getattr(config, "retry_wait_ms", 1000)))
-    attempts = max(1, int(getattr(config, "order_search_attempts", 3)))
-    max_pages = max(1, int(getattr(config, "max_page_search", MAX_PAGE_SEARCH)))
-
-    start_page = max(1, min(int(start_page), max_pages))
-    remaining = max(0, int(occurrence))
-    last_error: Exception | None = None
-    for targets in (range(start_page, max_pages + 1), range(1, start_page)):
-        for page_number in targets:
-            if not _jump_to_order_page(page, page_number, timeout, pause, callback):
-                break
-            matches = page.locator('.el-table__body-wrapper tbody tr:visible td, table tbody tr:visible td').filter(
-                has_text=re.compile(rf'^\s*{re.escape(code)}\s*$')
-            )
-            for attempt in range(1, attempts + 1):
-                try:
-                    count = matches.count()
-                    if count > remaining:
-                        cell = matches.first if remaining == 0 else matches.nth(remaining)
-                        cell.wait_for(state="visible", timeout=timeout)
-                        return cell, page_number
-                    raise LookupError(f"订单 {code} 不在第 {page_number} 页")
-                except Exception as exc:
-                    last_error = exc
-                    if attempt < attempts:
-                        _emit(callback, f"{code} 页面仍在刷新，{pause / 1000:g} 秒后重试 ({attempt}/{attempts - 1})")
-                        page.wait_for_timeout(pause)
-
-            remaining = max(0, remaining - matches.count())
-    raise OrderSearchNotFound(f"订单 {code} 未找到（已搜索全部订单页）") from last_error
-
-
-__all__ = ["run_job", "ensure_browser", "find_bundled_browser", "bundled_browser_dir", "browser_manifest", "BrowserNotFoundError", "LocatorError", "parse_receiver_info", "parse_meal_rows", "extract_meal_info", "extract_product_note_text", "get_yijin_address_from_product_note", "get_address_base_sheet_name", "get_donghu_address_segment"]

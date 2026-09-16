@@ -1,6 +1,16 @@
-# 一口轻食桌面程序
+# 一口轻食（网页版）
 
-这是一个使用 pywebview（React + TypeScript + Tailwind 前端）+ Playwright + openpyxl 的订单处理桌面程序。账号密码不会写入源码；密码通过 Windows Credential Manager、macOS Keychain 或 Linux SecretService（GNOME Keyring/KWallet，`keyring`）保存；系统没有可用密钥环时退化为每次运行手动输入。
+这是一个**网页版专用**的订单处理服务：Python 提供 HTTP 接口 + React/TypeScript/Tailwind 前端，
+可跑在手机（Termux）上当服务器，其他人用浏览器访问。账号密码不会写入源码；运行主机上的
+密码通过系统密钥环（`keyring`：Windows Credential Manager / macOS Keychain /
+Linux SecretService）保存，没有可用密钥环时退化为每次运行手动输入。
+
+> **架构说明**：本项目原先同时提供桌面原生窗口版（pywebview）与浏览器自动化备用模式
+> （Playwright）。两者已**全部移除**，只保留纯接口模式：
+> - 桌面窗口层、PyInstaller 打包、三平台发布流水线、自动更新器 —— 已删；
+> - Playwright 浏览器模式与页面定位器（`locators.json`）—— 已删。
+>
+> 现在只有一条路径：**HTTP 调用平台接口**。
 
 此项目是本人自用，代码功能不完善，还有许多需要改进的地方，项目公开，大家也可以以我项目为基础开发出更完整功能的项目。
 
@@ -10,8 +20,7 @@
 - **云文档同步**：把本地排单表的内容增量写入 WPS 云端的排单表（见下文）；
 - **闪时送下单**：从独立的《闪时送.xlsx》读取订单（午餐/晚餐两表），在闪时送平台逐单创建预约单。
 
-默认使用**纯接口模式**：不启动浏览器，直接调用平台 HTTP 接口完成登录、读单和下单。
-界面里可关闭“纯接口模式”开关，回退到原来的 Playwright 浏览器模式作为备用。
+固定使用**纯接口模式**：直接调用平台 HTTP 接口完成登录、读单和下单，不启动任何浏览器。
 
 ## 网页版（手机 / 服务器当主机）
 
@@ -35,23 +44,112 @@ python run.py --web --new-token      # 轮换访问令牌
 把「其它设备访问」那条网址在电脑/平板上打开即可。网址里的 `?token=` 只要带一次，
 之后会被浏览器记住；令牌本身保存在用户配置目录的 `web_token`。
 
-### 和桌面版的区别
+### 它是怎么跑的
 
-- 页面由 `app/web_server.py` 提供：静态前端 + `POST /api/<方法名>` 调用与桌面端
-  **完全同一套** `app/bridge.py` 逻辑，事件仍然是「Python 追加 + 前端按 cursor 轮询」；
-- 没有原生窗口，所以标题栏不显示最小化/最大化，只有「停止服务」（＝关闭服务）；
-- **选择 Excel 文件**改用服务器端文件浏览器：任务在主机上跑，Excel 也在主机上，
-  所以浏览并选择的是**主机上的路径**，而不是打开网页那台设备的文件。
+- 页面由 `app/web_server.py` 提供：静态前端 + `POST /api/<方法名>`，业务逻辑全在
+  `app/bridge.py`；事件是「Python 追加 + 前端按 cursor 轮询」，因此不需要 WebSocket；
+- **选择 Excel 文件**用服务器端文件浏览器：任务在主机上跑，Excel 也在主机上，
+  所以浏览并选择的是**主机上的路径**，而不是打开网页那台设备的文件；
+- 没有原生窗口，标题栏不提供最小化/最大化。
+
+### 账号与访问审批
+
+网页版等于把这台机器的完整操作权限交给「能进得来的人」——它能读取管理后台密码、
+使用 WPS 云文档授权、并真实下单。因此除了令牌，还有一套**账号体系**：整站
+（包括首页和全部静态资源）都要求登录，未登录一律跳 `/login`。
+
+- **注册申请**：访客在登录页填账号密码提交申请，进入待审批队列；
+- **管理员审批**：`approved` 之前**密码正确也登不进来**；管理员在 `/admin` 点同意/拒绝；
+- **邀请码**：管理员可生成邀请码，凭码注册直接通过，省一轮人工审批；
+- **会话**：登录成功发 `HttpOnly` 会话 Cookie（30 天）；访问 `/api/*` 靠会话，
+  失效/被拒/改密后旧会话立即失效。
+
+管理员账号用命令行维护（密码不会写进源码，磁盘上只存 PBKDF2 哈希）：
+
+```bash
+python run.py --web --create-admin            # 交互式创建第一个管理员
+python run.py --web --create-admin --username you@example.com   # 指定账号名
+python run.py --web --reset-admin-password    # 忘记密码时重置
+python run.py --web --list-users              # 列出账号与审批状态
+```
+
+账号数据落在用户配置目录的 `users.json`（手机上是 `~/.config/yikou-light-food/`）。
 
 ### 安全须知（重要）
 
-网页版等于把这台机器的完整操作权限开放给「知道网址的人」——它能读取管理后台密码、
-使用 WPS 云文档授权、并真实下单。因此：
+- **令牌只对本地/局域网直连有效**：`?token=` 是忘记管理员密码时的自救入口，一旦请求
+  经网关（带 `CF-Connecting-IP` / `X-Forwarded-*`）进来就**一律失效**，不能绕过审批；
+- 默认只监听局域网；要对外发布请走下面的 Cloudflare Tunnel，**不要做端口映射**
+  （手机在运营商 CGNAT 后面，本来也映射不通）；
+- 服务自身只提供 HTTP（无 TLS）。公网入口的 HTTPS 由 Cloudflare 边缘终结，
+  所以隧道部署下浏览器地址栏是有效证书；纯局域网 HTTP 理论上可被嗅探；
+- 管理页（`/admin`）建议再叠一层 Cloudflare Access：设好 `YIKOU_ACCESS_TEAM_DOMAIN`
+  与 `YIKOU_ACCESS_AUD` 后，该页会校验 `Cf-Access-Jwt-Assertion` 的签名（只看明文
+  请求头是可以伪造的，所以必须验签）。
 
-- 令牌是唯一的防线，**不要把带令牌的网址发到群里 / 截图外发**；怀疑泄露就 `--new-token`；
-- 默认只监听局域网，**不要直接映射到公网**；需要在外网使用时，用 Tailscale/WireGuard
-  这类组网工具，或 `ssh -L 8756:127.0.0.1:8756` 端口转发，而不是做端口映射；
-- 服务只提供 HTTP（无 TLS），同局域网内理论上可被嗅探，公共 WiFi 下谨慎使用。
+### 部署到公网（Android / Termux + Cloudflare Tunnel）
+
+> ⚠️ **已知阻断（2026-09-16 实测）**：当前使用的域名 `zimu5683.kdns.fr`
+> **在中国大陆被 SNI 阻断** —— 服务端与隧道完全正常，但国内直连打不开，
+> 必须走代理才能访问。已逐一排除所有免费域名方案（noip / ddns.net / duckdns /
+> eu.org / afraid 等同类后缀均在过滤名单内）。
+> **换一个未被阻断的域名即可解决，服务端无需改动。**
+> 完整证据链、已排除方案与换域名步骤见
+> [`design/公网访问现状与域名阻断.md`](design/公网访问现状与域名阻断.md)。
+
+手机在 CGNAT 后面没有公网 IP，用 Cloudflare Tunnel 由手机主动向 Cloudflare 建出站
+连接，公网请求沿该连接回源，因此不需要公网 IP、不需要端口映射、也不需要 DDNS。
+
+服务用 runit 托管（崩溃自动拉起，开机自动启动）：
+
+```bash
+termux-wake-lock                     # 防止息屏后被挂起
+sv status yikou-light-food           # 查看状态
+sv restart yikou-light-food           # 重启
+tail -f $LOGDIR/sv/yikou-light-food/current   # 实时日志
+```
+
+开机自启依赖 **Termux:Boot**（F-Droid 安装，必须**手动打开一次**才会生效），
+脚本在 `~/.termux/boot/start-services`。厂商省电策略、电池优化、自启动白名单都要
+手动放开，否则撑不过一天。
+
+#### 手机上开着 VPN / 代理时：必须用 http2
+
+这是实测踩到并解决的坑。`cloudflared` 默认用 **QUIC（UDP 7844）** 连 Cloudflare
+边缘，而手机上的 VPN/代理（Clash、Surge 一类，特征是 tun0 网卡 + `198.18.0.0/15`
+fake-ip）会破坏 UDP，症状是：
+
+```
+UDP Connectivity  region1.v2.argotunnel.com  FAIL   QUIC connection failed
+TCP Connectivity  region1.v2.argotunnel.com  FAIL   HTTP/2 connection is blocked or unreachable
+ERROR: Allow outbound QUIC traffic on port 7844 or use HTTP2.
+```
+
+隧道会一直 `inactive`，公网访问得到 **Cloudflare 1033**。注意那些 precheck 的
+**TCP / API 项是假警报**（`api.cloudflare.com` 明明能用，隧道 API 也建成功了），
+真正的问题只在 QUIC。
+
+解决办法：**在服务的 run 脚本里给 cloudflared 加 `--protocol http2`**。
+
+```sh
+# /data/data/com.termux/files/usr/var/service/cloudflared/run
+exec cloudflared tunnel run --protocol http2 --token-file "$HOME/.cloudflared/token"
+```
+
+改完 `sv restart cloudflared`，日志里会出现
+`Registered tunnel connection ... protocol=http2`，隧道变 `healthy`。
+
+⚠️ **两个容易踩的坑**（都实际踩过）：
+
+1. **不要指望 `~/.cloudflared/config.yml`**。包自带的 run 脚本不传 `--config`，
+   写在那里的 `protocol` 不会被读取。参数要直接写在命令行上。
+2. **YAML 里冒号后面必须有空格**。写成 `protocol:http2` 是不合法的，cloudflared
+   会直接报 `Invalid config` 起不来。
+
+另外，`pkg upgrade` 可能覆盖包自带的 run 脚本、把 `--protocol http2` 冲掉
+（症状：服务显示在跑，但公网 1033）。用 `~/fix-http2.sh` 可一键重新应用。
+
+日志里 `ip=198.18.0.x` 是 VPN 代理的转发地址，属**正常现象**，不要去"修"它。
 
 ### 手机（Termux）上长期当服务器的建议
 
@@ -65,36 +163,30 @@ termux-setup-storage          # 首次需要读取手机存储里的 Excel 时�
 
 ## 开发
 
-```powershell
+```bash
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python scripts/fetch_browser.py    # 抓取并精简内置 Chromium 到 vendor/browser/
-python run.py
+cd frontend && pnpm install && pnpm build && cd ..   # 生成 frontend/dist/index.html
+python run.py                                        # 无参数即启动网页服务
 ```
 
-`fetch_browser.py` 只做一次即可；它优先复用本机 Playwright 缓存，缺失时才下载。开发态会依次在仓库根 `browser/` 和 `vendor/browser/` 中查找内置 Chromium，也可以用环境变量 `YIKOU_BROWSER_DIR` 指向别处。
-
-也可以在 Visual Studio 中打开仓库目录，将 `run.py` 设为启动文件并使用 Python 调试器。
+前端改动后必须重新 `pnpm build`，否则服务仍在提供旧的 `frontend/dist/index.html`。
 
 ### 在 Termux（Android）上开发
 
-`--web` 模式不需要 GTK/WebKitGTK，也不需要 Playwright 浏览器，因此在手机上是完整可跑的：
+不需要 GTK/WebKitGTK，也不需要任何浏览器，因此在手机上是完整可跑的：
 
 ```bash
 pkg install python nodejs-lts git proot
 python -m venv --system-site-packages .venv
-.venv/bin/pip install openpyxl keyring requests pywebview   # --web 模式实际用到的依赖
+.venv/bin/pip install openpyxl keyring requests
 pkg install python-cryptography                             # cryptography 没有 Android 轮子，用 Termux 包
 cd frontend && pnpm install && pnpm build && cd ..           # 前端产物 frontend/dist/index.html
-.venv/bin/python run.py --web
+.venv/bin/python run.py                                      # 启动网页服务
 ```
 
-已知限制：`playwright`（浏览器备用模式）与 `ruff==0.15.22` 在 Android 上没有可安装的包。
-前者只影响「关闭纯接口模式」的备用路径（纯接口模式默认开启，不受影响）；后者可用
-`pkg install ruff` 代替，但版本不同、默认规则集比 CI 更严，以 CI 结果为准。
-桌面端 `PyInstaller` 打包不能跨平台，Windows/macOS/Linux 发行包请在对应系统或
-GitHub Actions 上构建。
+已知限制：`ruff==0.15.22` 在 Android 上没有可安装的包，可用 `pkg install ruff` 代替，
+但版本不同、默认规则集比 CI 更严，以 CI 结果为准。
 
 ### Termux 上的 kdocs-cli（云文档同步 / 闪时送云端名单）
 
@@ -122,67 +214,6 @@ tar xzf k.tar.gz -C vendor/kdocs-cli && chmod +x vendor/kdocs-cli/kdocs-cli
 打开确认即可。Android 没有系统密钥链，CLI 会自动退化为加密文件
 （`~/.config/kdocs-cli/token.enc`）。若已在电脑上授权过，也可以用
 `kdocs-cli auth set-token <token>` 直接导入 Token。
-
-## Windows 构建
-
-```powershell
-.\scripts\build_windows.ps1
-```
-
-构建产物有两份：`dist/yikou-light-food.exe`（单文件可执行程序）和 `dist/yikou-light-food-windows-x64.zip`（**首次安装请分发这个**）。zip 内是 exe 与内置 Chromium 目录：
-
-```
-yikou-light-food.exe
-browser/
-  browser.json
-  chromium-<revision>/chrome-win64/chrome.exe
-```
-
-解压后**必须保持 `browser/` 与 exe 同级**，自动化会固定调用这份内置 Chromium，不再探测系统 Edge/Chrome，也不会在运行时下载浏览器。可执行 `yikou-light-food.exe --check-browser` 做自检，它会打印内置 Chromium 的路径与版本。
-
-增量更新只替换 exe，`browser/` 目录保持不动，因此日常小版本升级仍然只下载差分补丁。
-
-## macOS 构建
-
-普通用户可在 GitHub [Releases](https://github.com/zimu5683/yikou-light-food-desktop/releases/latest) 页面下载 `yikou-light-food-macos.zip`。解压后将 `yikou-light-food.app` 拖入“应用程序”目录即可运行。当前下载包适用于 Apple 芯片（M1/M2/M3/M4 等）Mac；首次打开若被 macOS 拦截，请右键应用选择“打开”，或前往“系统设置 → 隐私与安全性”允许运行。
-
-开发者也可以在 macOS 上从源码构建：
-
-```bash
-./scripts/build_macos.sh
-```
-
-推送版本标签后，GitHub Actions 会构建 `.app`，打包为 `yikou-light-food-macos.zip`，并自动附加到对应的 GitHub Release 下载页面。
-
-## Linux 构建
-
-普通用户可在 GitHub [Releases](https://github.com/zimu5683/yikou-light-food-desktop/releases/latest) 页面下载 `yikou-light-food-linux-x64.tar.gz`（x86_64 发行版，基于 glibc 2.35 构建）。Linux 版本使用系统 GTK 3 + WebKitGTK 4.0/4.1 作为 pywebview 渲染内核；Ubuntu/Debian 通常需要先安装对应运行库。从 v3.0.2 起，Linux 打包不再捆绑 GTK/GLib/C++ 运行库，运行时直接使用当前系统的对应库，避免在新版发行版上因捆绑旧库导致 WebKit 启动失败：
-
-```bash
-sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1
-```
-
-部分较旧发行版将最后一个包命名为 `gir1.2-webkit2-4.0`。程序启动时会检查前端文件和图形后端，缺少依赖会显示明确错误，而不是打开空白窗口。满足这些依赖后，Ubuntu 22.04、Debian 12 及更新版本可按下列方式运行：
-
-```bash
-tar -xzf yikou-light-food-linux-x64.tar.gz
-chmod +x yikou-light-food
-./yikou-light-food
-```
-
-解压后当前目录下会同时得到可执行文件与内置的 `browser/` 目录，两者必须放在一起。自检命令：`./yikou-light-food --check-browser`。
-
-Linux 打包版同样支持自动更新：启动时会后台检查 GitHub Release，发现新版本后可以直接下载、校验并自动替换重启（需程序所在目录可写，失败时仍会引导前往 Release 页面手动下载）。
-
-浏览器方面无需在系统里安装 Edge/Chrome：发行包已经内置 Chromium，自动化固定使用它。若内置 Chromium 因缺少系统运行库而无法启动，可参照 Playwright 文档安装 Chromium 的依赖项。
-
-开发者也可以在 Linux 上从源码构建：
-
-```bash
-./scripts/build_linux.sh
-```
-
-产物为仓库根目录的 `yikou-light-food-linux-<架构>.tar.gz` 及其 SHA-256 校验文件。推送版本标签后，GitHub Actions 会构建并自动附加到对应的 GitHub Release 下载页面。
 
 ## 云文档同步（WPS 云端排单表）
 
@@ -275,16 +306,6 @@ Linux 打包版同样支持自动更新：启动时会后台检查 GitHub Releas
 
 旧版脚本保存在 `legacy_一口轻食.py`，仅作参考，不是新程序的运行入口。
 
-## 页面定位与网站改版适配
-
-程序定位页面元素采用“候选链”策略：每一步按顺序尝试多个定位方式，第一个命中即用。候选按稳定性从高到低排列：
-
-1. **URL 路由直达**（`goto` + `wait_url`）：直接打开目标页面路由，完全不依赖页面文字；
-2. **DOM 结构与 ARIA 角色**（`css` / `role`）：依赖 Element UI 的渲染结构，不随文案变化；
-3. **显示文字**（`text` / `text_re`）：最后兜底，支持正则与中英文多候选。
-
-定位器配置在首次运行时自动生成到用户配置目录的 `locators.json`。网站改版导致定位失败时，程序会提示失败的步骤，并把**页面截图、HTML 快照和当前网址**保存到用户配置目录的 `logs/`；对照快照修改 `locators.json` 即可适配，无需改代码或重新打包。删除 `locators.json` 并重启程序会重新生成默认配置。
-
 ## 闪时送下单
 
 切到「闪时送下单」页签后填写：闪时送网址、账号、密码、订单 Excel 文件（云端模式下是**留档文件**，可留空），以及下单时的「商品名称」与「常用地址」默认值。
@@ -313,37 +334,6 @@ Linux 打包版同样支持自动更新：启动时会后台检查 GitHub Releas
   - Excel 格式：`午餐`、`晚餐`两个工作表，第 1 行表头、第 2 行占位，从第 3 行开始为 A=姓名、B=门牌号、C=电话、D=送达时间（D 列暂不使用，送达时间由程序按规则计算；云端模式留档时 E1 = 当天日期）。
 - 只读自检（不写云端、不写本地文件）：`python -m app.main --sss-import-check` 会打印
   `kdocs-cli` 路径/授权状态、生效目标表、当天日期、两张表当天列标 1 的人数与地址过滤后的人数。
-- **登录需手动完成**：闪时送登录有图形验证码。纯接口模式下程序会在应用内弹出验证码小窗，输入后自动完成登录并逐单下单，不再弹出浏览器；浏览器备用模式下仍是在浏览器中手动输入验证码。
-- 闪时送平台的定位器独立保存在用户配置目录的 `sss_locators.json`，改版失败时同样会保存截图/HTML/网址到 `logs/`，修改该文件即可适配。
+- **登录需手动完成**：闪时送登录有图形验证码。程序会在页面内弹出验证码小窗，输入后自动完成登录并逐单下单。
 - 下单默认采用 **at-least-once + 对账确认**：平台抓包报文未发现客户端幂等字段，因此不会向未知 schema 强塞字段。程序在下单前后查询站内订单、校验完整订单指纹和批次时间窗口，网络异常或超时不会自动重发 POST；如果平台后续确认支持幂等字段，可在配置中设置 `sss_idempotency_field` 启用稳定 `client_request_id`。
 - 闪时送密码使用独立凭据名 `yikou-light-food-sss`，与管理后台账号密码互不覆盖。
-
-- 候选字段：`css`（CSS 选择器）、`role` + `name`/`name_re`（ARIA 角色）、`placeholder`（输入框占位文字）、`text`（文字，子串匹配）、`text_re`（文字正则）、`has_text`/`has_text_re`（对结果按内含文字过滤）、`index`（取第 N 个匹配）
-- 步骤字段：`goto`（URL 模板，`{base}` 为站点根）、`wait_url`（跳转后 URL 校验，Playwright glob）、`action`（`click`/`dblclick`）、`wait_networkidle`、`confirm: "table"`（等待订单表格渲染）
-
-## 发布与更新
-
-发布新功能前，请先修改 `app/__init__.py` 中的 `__version__`，然后创建并推送版本标签：
-
-```powershell
-git tag v1.1.0
-git push origin main --tags
-```
-
-推送 `vX.Y.Z` 标签会触发 Windows、macOS 和 Linux 工作流，分别发布 `yikou-light-food.exe`、`yikou-light-food-macos.zip`、`yikou-light-food-linux-x64.tar.gz` 及其 SHA-256 校验文件。工作流会验证标签与应用内版本一致。应用启动时会在后台检查 GitHub Release；Windows、Linux 与 macOS 打包版均可校验、下载并自动安装（macOS 自用模式允许未签名更新，但仍强制校验签名清单与 SHA-256），源码运行模式只提示前往 Release 页面。Linux 自动更新会把新版 tar.gz 解压到程序目录下的 `.yikou-light-food.update-<pid>/` 暂存目录，待本进程退出后由后台脚本原子替换可执行文件并重启；macOS 会替换整个 `.app` bundle 并重启；安装目录不可写时回退为提示手动下载。
-
-更新真实性不再依赖 SHA-256 或镜像：发布工作流用 Ed25519 私钥对 `latest.json` 生成 `latest.json.sig`，客户端只使用内置公钥（`app/updater.py` 中的 `UPDATE_MANIFEST_PUBLIC_KEY`）验证通过的清单。SHA-256 仅用于完整性校验；镜像只负责传输字节流，不能成为信任根。更新器严格拒绝降级、同版本覆盖、非 SemVer 版本、平台/架构不匹配和超过大小限制的资源。
-
-发布仓库需要配置 GitHub Actions Secret `UPDATE_SIGNING_KEY`（Ed25519 PKCS#8 PEM 私钥内容）；可用 `python scripts/generate_update_signing_key.py` 生成并妥善备份，再执行：
-
-```bash
-gh secret set UPDATE_SIGNING_KEY < ~/.config/yikou-light-food/update-signing-key.pem
-```
-
-未配置时 `publish-manifest` 任务会失败，不会发布未签名清单。Windows/macOS 打包版还会分别校验 Authenticode 发布者与 codesign/Team ID/公证；这些公开信任锚在发布时由仓库变量 `YIKOU_WINDOWS_AUTHENTICODE_PUBLISHER` / `YIKOU_MACOS_TEAM_ID` 写入随包分发的 `app/update_trust.json`。本项目当前为个人自用，`app/update_trust.json` 中显式设置 `"allow_unsigned_update": true`：没有 Authenticode/Team ID 时跳过 OS 发布者签名校验，但 **Ed25519 清单签名、SHA-256、版本/平台/架构校验仍然强制**。如果未来要公开发布，配置真实证书并把该开关改为 `false` 即可恢复 fail-closed。新清单通过 `requires_platform_metadata` 强制每个平台资源声明 `platform`/`architecture`，不再允许“缺少字段就放行”。Linux 更新包只允许单个 `yikou-light-food` 文件，拒绝夹带额外文件或 setuid 位。替换前会运行新产物的 `--self-check`；替换后新 GUI 必须写入启动健康标记，超时未写入会自动恢复上一版并重启。更新过程会写入用户目录的 `update.log`，便于排查“已下载但仍是旧版本”一类问题。Windows 与 Linux 有上一版可对照时，发布工作流会生成 bsdiff 差分补丁：更新器按本地文件的 SHA-256 匹配基线，命中则只下载补丁还原出新版，未命中自动回退全量下载。
-
-提交前建议额外运行一次工作区卫生检查（含未跟踪文件）：
-
-```bash
-python scripts/check_workspace_hygiene.py --working-tree
-```

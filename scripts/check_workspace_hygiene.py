@@ -18,8 +18,6 @@ FORBIDDEN_PATTERNS = (
     "*.xlsm",
     "*.xls",
     "*.log",
-    "latest.json",
-    "latest.json.sig",
     "*.bak",
     "*.pem",
     "*.key",

@@ -1,12 +1,15 @@
-# Runtime dependencies
-playwright>=1.40,<2
+# 运行时依赖（网页版专用）
+# 本项目只跑网页版：桌面原生窗口（pywebview）与浏览器自动化（Playwright）
+# 已随浏览器模式一起移除，详见 README「网页版」一节。
 openpyxl>=3.1,<4
 keyring>=24,<26
-pywebview>=5.4,<6
 requests>=2.31,<3
+# Cloudflare Access 的 JWT 验签（app/web_auth.py）用到
 cryptography>=42,<52
 
-# Build/test dependencies (install these when developing or packaging)
-pyinstaller>=6.0,<7
+# 开发/测试依赖
 pytest>=8,<9
 ruff==0.15.22
+
+# 前端构建（需要 Node + pnpm）
+# cd frontend && pnpm install && pnpm build

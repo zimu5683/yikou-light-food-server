@@ -207,66 +207,66 @@ function OrderForm() {
           撑到底部，下方就露出滚动容器的空白（「更多」下面那块空缺）；滚动时
           表单内容又会从它后面滑过。做成页脚后这两种情况都不存在。 */}
       <div className="scroll-contain min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-1 sm:px-5">
-      <Field label="管理网址" htmlFor="order-url" error={modeError(fields, 'url')} helper="用于登录管理后台">
-        <TextInput
-          id="order-url"
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-          placeholder="https://example.com/admin"
-        />
-      </Field>
-
-      <Field label="手机号 / 账号" htmlFor="order-phone" error={modeError(fields, 'phone')} helper="用于登录管理后台">
-        <TextInput
-          id="order-phone"
-          value={phone}
-          onChange={(e) => setPhone(e.target.value)}
-        />
-      </Field>
-
-      <Field label="登录密码" htmlFor="order-password" error={modeError(fields, 'password')} helper="密码仅保存在系统凭据管理器中">
-        <TextInput
-          id="order-password"
-          type="password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-        />
-      </Field>
-
-      <Field label="Excel 文件" htmlFor="order-excel" error={excelError} okMessage={excelOk} helper="支持 .xlsx / .xlsm">
-        <div className="flex gap-1.5">
+        <Field label="管理网址" htmlFor="order-url" error={modeError(fields, 'url')} helper="用于登录管理后台">
           <TextInput
-            id="order-excel"
-            value={excel}
-            onChange={(e) => setExcel(e.target.value)}
-            state={excel && !excelError ? 'valid' : undefined}
-            className="min-w-0 flex-1"
-            placeholder="选择排单 .xlsx 文件"
+            id="order-url"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://example.com/admin"
           />
-          <GhostButton onClick={chooseFile}>选择文件</GhostButton>
-          <GhostButton onClick={newTemplate}>新建模板</GhostButton>
+        </Field>
+
+        <Field label="手机号 / 账号" htmlFor="order-phone" error={modeError(fields, 'phone')} helper="用于登录管理后台">
+          <TextInput
+            id="order-phone"
+            value={phone}
+            onChange={(e) => setPhone(e.target.value)}
+          />
+        </Field>
+
+        <Field label="登录密码" htmlFor="order-password" error={modeError(fields, 'password')} helper="密码仅保存在系统凭据管理器中">
+          <TextInput
+            id="order-password"
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+        </Field>
+
+        <Field label="Excel 文件" htmlFor="order-excel" error={excelError} okMessage={excelOk} helper="支持 .xlsx / .xlsm">
+          <div className="flex gap-1.5">
+            <TextInput
+              id="order-excel"
+              value={excel}
+              onChange={(e) => setExcel(e.target.value)}
+              state={excel && !excelError ? 'valid' : undefined}
+              className="min-w-0 flex-1"
+              placeholder="选择排单 .xlsx 文件"
+            />
+            <GhostButton onClick={chooseFile}>选择文件</GhostButton>
+            <GhostButton onClick={newTemplate}>新建模板</GhostButton>
+          </div>
+        </Field>
+
+        <Field label="目标日期" error={modeError(fields, 'date')} helper="留空默认今天；只允许选择今天或过去日期">
+          <DateField value={date} onChange={setDate} invalid={Boolean(modeError(fields, 'date'))} />
+        </Field>
+
+        <Field label="待处理订单数" error={modeError(fields, 'count')}>
+          <Stepper value={count} onChange={setCount} invalid={Boolean(modeError(fields, 'count'))} />
+          <p className="mt-1 text-[11px] text-muted-foreground">留空=全部订单</p>
+        </Field>
+
+        <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
+          <Switch checked={remember} onCheckedChange={setRemember} aria-label="保存到系统凭据管理器" />
+          <span>保存到系统凭据管理器</span>
         </div>
-      </Field>
 
-      <Field label="目标日期" error={modeError(fields, 'date')} helper="留空默认今天；只允许选择今天或过去日期">
-        <DateField value={date} onChange={setDate} invalid={Boolean(modeError(fields, 'date'))} />
-      </Field>
-
-      <Field label="待处理订单数" error={modeError(fields, 'count')}>
-        <Stepper value={count} onChange={setCount} invalid={Boolean(modeError(fields, 'count'))} />
-        <p className="mt-1 text-[11px] text-muted-foreground">留空=全部订单</p>
-      </Field>
-
-      <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
-        <Switch checked={remember} onCheckedChange={setRemember} aria-label="保存到系统凭据管理器" />
-        <span>保存到系统凭据管理器</span>
-      </div>
-
-      <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
-        <Switch checked={apiMode} onCheckedChange={setApiMode} aria-label="纯接口模式（不启动浏览器）" />
-        <span>纯接口模式（不启动浏览器）</span>
-      </div>
-      </div>
+        <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
+          <Switch checked={apiMode} onCheckedChange={setApiMode} aria-label="纯接口模式（不启动浏览器）" />
+          <span>纯接口模式（不启动浏览器）</span>
+        </div>
+        </div>
 
       <BottomDock>
         <ActionBar
@@ -456,115 +456,115 @@ function SssForm() {
     <div className="flex min-h-0 flex-1 flex-col">
       {/* 与订单处理页签同构：字段区滚动 + 操作条做真页脚（不再 sticky） */}
       <div className="scroll-contain min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-1 sm:px-5">
-      <Field label="闪时送网址" htmlFor="sss-url" error={modeError(fields, 'url')} helper="闪时送下单平台地址">
-        <TextInput id="sss-url" value={url} onChange={(e) => setUrl(e.target.value)} />
-      </Field>
+        <Field label="闪时送网址" htmlFor="sss-url" error={modeError(fields, 'url')} helper="闪时送下单平台地址">
+          <TextInput id="sss-url" value={url} onChange={(e) => setUrl(e.target.value)} />
+        </Field>
 
-      <Field label="闪时送账号" htmlFor="sss-account" error={modeError(fields, 'account')} helper="用于登录闪时送平台">
-        <TextInput id="sss-account" value={account} onChange={(e) => setAccount(e.target.value)} />
-      </Field>
+        <Field label="闪时送账号" htmlFor="sss-account" error={modeError(fields, 'account')} helper="用于登录闪时送平台">
+          <TextInput id="sss-account" value={account} onChange={(e) => setAccount(e.target.value)} />
+        </Field>
 
-      <Field label="登录密码" htmlFor="sss-password" error={modeError(fields, 'password')} helper="密码仅保存在系统凭据管理器中">
-        <TextInput
-          id="sss-password"
-          type="password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-        />
-      </Field>
-
-      <Field
-        label="名单来源"
-        helper={
-          orderSource === 'wps'
-            ? '每次下单前读取东湖午餐/东湖晚餐「当天列标 1」的人；地址是大西/小的不下单'
-            : '读取《闪时送.xlsx》里的名单（人工准备），不做云端读取'
-        }
-      >
-        <div className="flex gap-1.5" role="group" aria-label="名单来源">
-          <SourceButton
-            active={orderSource === 'wps'}
-            onClick={() => setOrderSource('wps')}
-          >
-            云端当天名单
-          </SourceButton>
-          <SourceButton
-            active={orderSource === 'excel'}
-            onClick={() => setOrderSource('excel')}
-          >
-            本地 Excel
-          </SourceButton>
-        </div>
-      </Field>
-
-      <Field
-        label="订单 Excel 文件"
-        htmlFor="sss-excel"
-        error={excelError}
-        okMessage={excelOk}
-        helper={
-          orderSource === 'wps'
-            ? '云端模式：作为当天名单的留档文件，可留空'
-            : '午餐/晚餐两表，A=姓名 B=门牌号 C=电话'
-        }
-      >
-        <div className="flex gap-1.5">
+        <Field label="登录密码" htmlFor="sss-password" error={modeError(fields, 'password')} helper="密码仅保存在系统凭据管理器中">
           <TextInput
-            id="sss-excel"
-            value={excel}
-            onChange={(e) => setExcel(e.target.value)}
-            state={excel && !excelError ? 'valid' : undefined}
-            className="min-w-0 flex-1"
-            placeholder="选择闪时送 .xlsx 文件"
+            id="sss-password"
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
           />
-          <GhostButton onClick={chooseFile}>选择文件</GhostButton>
-          <GhostButton onClick={newTemplate}>新建模板</GhostButton>
+        </Field>
+
+        <Field
+          label="名单来源"
+          helper={
+            orderSource === 'wps'
+              ? '每次下单前读取东湖午餐/东湖晚餐「当天列标 1」的人；地址是大西/小的不下单'
+              : '读取《闪时送.xlsx》里的名单（人工准备），不做云端读取'
+          }
+        >
+          <div className="flex gap-1.5" role="group" aria-label="名单来源">
+            <SourceButton
+              active={orderSource === 'wps'}
+              onClick={() => setOrderSource('wps')}
+            >
+              云端当天名单
+            </SourceButton>
+            <SourceButton
+              active={orderSource === 'excel'}
+              onClick={() => setOrderSource('excel')}
+            >
+              本地 Excel
+            </SourceButton>
+          </div>
+        </Field>
+
+        <Field
+          label="订单 Excel 文件"
+          htmlFor="sss-excel"
+          error={excelError}
+          okMessage={excelOk}
+          helper={
+            orderSource === 'wps'
+              ? '云端模式：作为当天名单的留档文件，可留空'
+              : '午餐/晚餐两表，A=姓名 B=门牌号 C=电话'
+          }
+        >
+          <div className="flex gap-1.5">
+            <TextInput
+              id="sss-excel"
+              value={excel}
+              onChange={(e) => setExcel(e.target.value)}
+              state={excel && !excelError ? 'valid' : undefined}
+              className="min-w-0 flex-1"
+              placeholder="选择闪时送 .xlsx 文件"
+            />
+            <GhostButton onClick={chooseFile}>选择文件</GhostButton>
+            <GhostButton onClick={newTemplate}>新建模板</GhostButton>
+          </div>
+        </Field>
+
+        {orderSource === 'wps' && (
+          <div className="mb-4 -mt-1 flex items-center gap-2">
+            <GhostButton onClick={readDayOrders} disabled={dayBusy || workerAlive}>
+              {dayBusy ? '读取中…' : '读取云端当天名单'}
+            </GhostButton>
+            <span className="text-[11px] text-muted-foreground">
+              只读取并写留档，不下单
+            </span>
+          </div>
+        )}
+
+        <Field label="商品名称" htmlFor="sss-product" helper="下单时商品“名称”的默认值">
+          <TextInput
+            id="sss-product"
+            value={productName}
+            onChange={(e) => setProductName(e.target.value)}
+          />
+        </Field>
+
+        <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
+          <Switch checked={remember} onCheckedChange={setRemember} aria-label="保存到系统凭据管理器" />
+          <span>保存到系统凭据管理器</span>
         </div>
-      </Field>
 
-      {orderSource === 'wps' && (
-        <div className="mb-4 -mt-1 flex items-center gap-2">
-          <GhostButton onClick={readDayOrders} disabled={dayBusy || workerAlive}>
-            {dayBusy ? '读取中…' : '读取云端当天名单'}
-          </GhostButton>
-          <span className="text-[11px] text-muted-foreground">
-            只读取并写留档，不下单
-          </span>
+        <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
+          <Switch checked={dryRun} onCheckedChange={setDryRun} aria-label="干跑：只预览报文，不创建订单" />
+          <span>干跑：只预览报文，不创建订单</span>
         </div>
-      )}
 
-      <Field label="商品名称" htmlFor="sss-product" helper="下单时商品“名称”的默认值">
-        <TextInput
-          id="sss-product"
-          value={productName}
-          onChange={(e) => setProductName(e.target.value)}
-        />
-      </Field>
+        <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
+          <Switch
+            checked={preflight}
+            onCheckedChange={setPreflight}
+            aria-label="预检：登录并检查，不创建订单"
+          />
+          <span>预检：登录并检查余额/订单，不创建订单</span>
+        </div>
 
-      <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
-        <Switch checked={remember} onCheckedChange={setRemember} aria-label="保存到系统凭据管理器" />
-        <span>保存到系统凭据管理器</span>
-      </div>
-
-      <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
-        <Switch checked={dryRun} onCheckedChange={setDryRun} aria-label="干跑：只预览报文，不创建订单" />
-        <span>干跑：只预览报文，不创建订单</span>
-      </div>
-
-      <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
-        <Switch
-          checked={preflight}
-          onCheckedChange={setPreflight}
-          aria-label="预检：登录并检查，不创建订单"
-        />
-        <span>预检：登录并检查余额/订单，不创建订单</span>
-      </div>
-
-      <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
-        <Switch checked={apiMode} onCheckedChange={setApiMode} aria-label="纯接口模式（不启动浏览器）" />
-        <span>纯接口模式（不启动浏览器）</span>
-      </div>
-      </div>
+        <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
+          <Switch checked={apiMode} onCheckedChange={setApiMode} aria-label="纯接口模式（不启动浏览器）" />
+          <span>纯接口模式（不启动浏览器）</span>
+        </div>
+        </div>
 
       <BottomDock>
         <ActionBar
@@ -676,7 +676,7 @@ function ActionBar({
 }
 
 function ToolsMenu({ mode }: { mode: TaskMode }) {
-  const { checkBrowser, clearPassword, checkUpdates } = useApp()
+  const { clearPassword, checkUpdates } = useApp()
   const [confirmClear, setConfirmClear] = useState(false)
 
   return (
@@ -693,7 +693,6 @@ function ToolsMenu({ mode }: { mode: TaskMode }) {
             </button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="start" className="rounded-md text-xs">
-            <DropdownMenuItem onClick={checkBrowser}>检查浏览器</DropdownMenuItem>
             <DropdownMenuItem onClick={() => setConfirmClear(true)}>清除密码</DropdownMenuItem>
             <DropdownMenuItem onClick={() => checkUpdates(true)}>检查更新</DropdownMenuItem>
           </DropdownMenuContent>

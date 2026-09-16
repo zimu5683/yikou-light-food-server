@@ -375,7 +375,6 @@ interface PywebviewApi {
   resolve_address_input(id: string, entries: Record<string, string>): Promise<{ ok: boolean }>
   choose_excel(mode: 'order' | 'sss', path?: string): Promise<{ path: string; error: string }>
   new_template(mode: 'order' | 'sss', path?: string): Promise<{ path: string; error: string }>
-  check_browser(): Promise<{ ok: boolean }>
   wps_status(): Promise<WpsStatus>
   wps_preview(): Promise<WpsResult>
   wps_upload(): Promise<WpsResult>
@@ -388,7 +387,6 @@ interface PywebviewApi {
   open_external(url: string): Promise<{ ok: boolean }>
   frontend_report(payload: Record<string, unknown> | string): Promise<{ ok: boolean }>
   drain_events(lastSequence?: number, ackSequence?: number, producerId?: string): Promise<DrainEventsResult>
-  begin_window_drag(x: number, y: number): Promise<{ ok: boolean; handled: boolean }>
   echo_test(message: string, payload?: Record<string, unknown>): Promise<{ echo: string; payload_keys: string[] | null }>
   window_action(action: 'minimize' | 'toggle_maximize' | 'close'): Promise<{ action?: string }>
   request_close(): Promise<{ action: string }>

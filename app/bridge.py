@@ -1,7 +1,7 @@
-"""pywebview 桥接层：把业务模块暴露给 Web 前端（js_api + 事件推送）。
+"""业务逻辑与网页前端之间的桥接层（HTTP + 事件推送）。
 
 职责边界：本模块只做「UI 协议」，业务规则全部留在原模块
-（automation/sss/processing/updater/credentials/config）。旧 Tkinter 界面
+（automation/sss/processing/release_check/credentials/config）。旧 Tkinter 界面
 （app/gui.py）里的每一条用户交互在这里都有对应实现，迁移对照表见
 tests 与 README。
 
@@ -45,21 +45,14 @@ from pathlib import Path as _Path
 from typing import Any
 
 from . import __version__
-from .automation import (
-    BrowserNotFoundError,
-    browser_description,
-    browser_version_warning,
-    ensure_browser,
-    parse_target_date,
-    run_job,
-)
+from .automation import parse_target_date, run_job
 from .config import AppConfig, clamp_split_ratio, default_wps_address_order
 from .credentials import (delete_password, delete_sss_password, get_password,
                           get_sss_password, set_password, set_sss_password)
 from .excel_templates import write_order_template, write_sss_template
 from .sss import expected_delivery_date, run_sss_job
 from .sss_import import ImportRefused, prepare_day_orders
-from .updater import ReleaseInfo, UpdateError, check_for_update, download_and_install
+from .release_check import ReleaseCheckError, check_for_update
 from .wps_cloud import (KdocsCli, SyncLedger, WpsCloudError, apply_plan,
                         build_plan, effective_tables, format_plan,
                         read_local_orders, summarize_plan, target_date_for)
@@ -67,7 +60,7 @@ from .wps_cloud import (KdocsCli, SyncLedger, WpsCloudError, apply_plan,
 logger = logging.getLogger(__name__)
 
 EXCEL_EXTS = {".xlsx", ".xlsm"}
-# pywebview 的文件过滤器在 Win/GTK/Cocoa 三端统一使用 "描述 (*.a;*.b)" 写法。
+# 文件对话框过滤器沿用 "描述 (*.a;*.b)" 写法（历史格式，保持配置兼容）。
 FILE_DIALOG_FILTERS = ["Excel 工作簿 (*.xlsx)", "Excel 启用宏的工作簿 (*.xlsm)", "所有文件 (*)"]
 
 MAX_ORDER_COUNT = 9999
@@ -138,7 +131,6 @@ class Bridge:
         self._push_lock = threading.Lock()
         self._worker_lock = threading.Lock()
         self._update_checking = False
-        self._pending_release: ReleaseInfo | None = None
         self._decision_seq = 0
         self._decisions: dict[str, _PendingInteraction] = {}
         self._interaction_timeout_s = DEFAULT_INTERACTION_TIMEOUT_S
@@ -589,8 +581,6 @@ class Bridge:
                              pending_address_callback=self._pending_address_input)
             self._finish_task(f"处理完成：已处理 {result.get('processed', '?')} 项，"
                               f"找到 {result.get('found', '?')} 项", result)
-        except BrowserNotFoundError as exc:
-            self._task_error(str(exc))
         except Exception as exc:
             self._task_error(str(exc))
 
@@ -642,8 +632,6 @@ class Bridge:
                 message = (f"闪时送下单完成：已创建 {result.get('created', '?')} 单，"
                            f"处理 {result.get('processed', '?')} 项")
             self._finish_task(message, result)
-        except BrowserNotFoundError as exc:
-            self._task_error(str(exc))
         except Exception as exc:
             self._task_error(str(exc))
 
@@ -915,25 +903,6 @@ class Bridge:
     # ------------------------------------------------------------------
     # js_api：浏览器检查 / 凭据 / 更新
     # ------------------------------------------------------------------
-    def check_browser(self) -> dict[str, Any]:
-        """启动内置浏览器自检（后台线程），立即返回；结果通过日志事件回报。"""
-        self._set_status("updating")
-        self.log("正在检查浏览器...")
-        threading.Thread(target=self._check_browser_worker, daemon=True).start()
-        return {"ok": True}
-
-    def _check_browser_worker(self) -> None:
-        try:
-            path = ensure_browser()
-            self.log(f"内置浏览器可用：{browser_description()}（{path}）", "OK")
-            if warning := browser_version_warning():
-                self.log(warning, "WARN")
-            self._set_status("ready")
-        except Exception as exc:
-            self._worker = None
-            self._set_status("error")
-            self._emit_event("task:error", {"message": str(exc)})
-
     # ------------------------------------------------------------------
     # WPS 云文档同步
     # ------------------------------------------------------------------
@@ -1358,12 +1327,13 @@ class Bridge:
         try:
             release = check_for_update()
             if release:
-                self._pending_release = release
+                # can_auto_install 恒为 False：本项目只跑网页版（源码运行），
+                # 没有可替换的打包产物，前端据此不显示「立即安装」按钮。
                 self._emit_event("update:available", {
                     "tag": release.tag_name,
                     "current": __version__,
                     "body": release.body or "（暂无更新说明）",
-                    "can_auto_install": _can_auto_install(),
+                    "can_auto_install": False,
                 })
             elif manual:
                 self._set_status("ready")
@@ -1371,40 +1341,27 @@ class Bridge:
             else:
                 self.log("已是最新版本")
                 self._set_status("ready")
-        except UpdateError as exc:
+        except ReleaseCheckError as exc:
             self._set_status("error")
             self._emit_event("update:error", {"message": str(exc)})
         finally:
             self._update_checking = False
 
     def install_update(self) -> dict[str, Any]:
-        """安装已发现的更新；没有待安装版本时返回 ``{"ok": False, "reason": "no_release"}``。"""
-        release = self._pending_release
-        if release is None:
-            return {"ok": False, "reason": "no_release"}
-        self.log(f"获取更新清单完成，正在下载版本 {release.version}...")
-        threading.Thread(target=self._install_update_worker, args=(release,), daemon=True).start()
-        return {"ok": True}
+        """网页版不支持就地自动安装（保留方法签名以兼容前端契约）。
 
-    def _install_update_worker(self, release: ReleaseInfo) -> None:
-        try:
-            download_and_install(
-                release,
-                progress_callback=lambda downloaded, total: self._emit_event(
-                    "update:progress", {"downloaded": downloaded, "total": total}),
-                stage_callback=lambda stage: self._emit_event("update:stage", {"stage": stage}),
-            )
-            self._emit_event("update:installed", {"message": "更新已下载，程序将重启"})
-            # 对齐旧版行为：提示后自毁窗口，由更新器外部脚本替换二进制并重启。
-            time.sleep(1.5)
-            try:
-                if self._window is not None:
-                    self._window.destroy()
-            except Exception:
-                pass
-        except Exception as exc:
-            self._set_status("error")
-            self._emit_event("update:install_error", {"message": str(exc)})
+        原实现会下载新版 .exe、校验签名、替换二进制并重启进程 —— 那是 Windows
+        打包版的路径，网页版（源码运行在 Termux）不适用。前端只在 ``frozen`` 时
+        才显示「立即安装」按钮，所以这个分支在实际部署里不会被点到。
+
+        升级方式：``cd ~/yikou-light-food-server && git pull && sv restart yikou-light-food``
+        """
+        return {
+            "ok": False,
+            "reason": "web_mode",
+            "message": "网页版请用 git pull 更新，然后 sv restart yikou-light-food",
+            "release_url": "https://github.com/zimu5683/yikou-light-food-desktop/releases",
+        }
 
     def open_external(self, url: str) -> dict[str, Any]:
         """用系统默认程序打开外链。
@@ -1461,34 +1418,6 @@ class Bridge:
         elif action == "close":
             return self.request_close()
         return {"ok": True}
-
-    def begin_window_drag(self, x: float, y: float) -> dict[str, Any]:
-        """自绘标题栏拖拽（Linux GTK）。
-
-        pywebview 5.4 的 GTK 后端在 frameless + easy_drag=False 时完全不注册
-        拖拽处理器，`pywebview-drag-region` CSS 类在其上无效；这里直接调用
-        GTK 的 begin_move_drag，把后续拖动交还给窗口管理器。
-        x/y 为 JS 事件的 screenX/screenY（X11 下即根窗口坐标）。
-        Windows/macOS 走各自的 CSS 类拖拽机制，此方法直接忽略。
-        """
-        if not sys.platform.startswith("linux"):
-            return {"ok": True, "handled": False}
-        try:
-            # pywebview 5.x/6.x 的 window.gui 都是平台模块；实例注册在
-            # BrowserView.instances[window.uid]，其 .window 才是 Gtk.Window。
-            from webview.platforms import gtk as gtk_module
-
-            renderer = gtk_module.BrowserView.instances.get(self._window.uid)
-            if renderer is None:
-                raise RuntimeError("GTK 渲染器实例不存在")
-            gtk_win = renderer.window
-            # GDK 时间戳是 32 位毫秒（X 服务时间），系统纪元毫秒需截断，否则 OverflowError。
-            timestamp = int(time.time() * 1000) & 0xFFFFFFFF
-            gtk_win.begin_move_drag(1, int(x), int(y), timestamp)
-            return {"ok": True, "handled": True}
-        except Exception as exc:
-            logger.warning("begin_window_drag 失败: %s", exc)
-            return {"ok": False, "handled": False}
 
     def request_close(self) -> dict[str, Any]:
         """标题栏 ✕ / Alt+F4 共用的关闭入口，带任务运行保护。"""
@@ -1557,15 +1486,6 @@ class Bridge:
 # ----------------------------------------------------------------------
 # 模块级工具
 # ----------------------------------------------------------------------
-def _can_auto_install() -> bool:
-    """Windows / Linux / macOS 打包版均支持自用自动更新。"""
-    return (
-        os.name == "nt"
-        or sys.platform.startswith("linux")
-        or sys.platform == "darwin"
-    ) and getattr(sys, "frozen", False)
-
-
 def _excel_field_error(path: str) -> str:
     """与旧 GUI 的 Excel 字段校验完全一致：存在 + 后缀。空路径视为「未选择」。"""
     if not path:

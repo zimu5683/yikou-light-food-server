@@ -7,9 +7,8 @@
   取错就会拿到空路径或 ``TypeError``。``new_template`` 还会在写盘失败时给出明确原因。
 * ``open_external``：只放行 ``http(s)`` —— 这是**白名单**，写漏了就等于把
   ``file://`` 之类交给系统去打开。
-* ``begin_window_drag``：只在 Linux GTK 上有意义，其它平台必须**原样返回
   ``handled=False``**，不能抛异常（它在窗口拖拽的每次 mouseDown 上被调用）。
-* ``check_browser`` / ``check_updates``：都是「置状态 → 起后台线程 → 立刻返回」，
+* ``check_updates``：置状态 → 起后台线程 → 立刻返回，
   以及 ``check_updates`` 的**防重入**守卫。
 """
 from __future__ import annotations
@@ -231,43 +230,7 @@ def test_open_external_tolerates_non_string(tmp_path, monkeypatch):
 
 
 # ----------------------------------------------------------------------
-# begin_window_drag：非 Linux 直接忽略
 # ----------------------------------------------------------------------
-def test_begin_window_drag_is_ignored_off_linux(tmp_path, monkeypatch):
-    monkeypatch.setattr(bridge_module.sys, "platform", "win32")
-    assert _bridge(tmp_path).begin_window_drag(10, 20) == {"ok": True, "handled": False}
-
-
-def test_begin_window_drag_never_raises_when_gtk_is_unavailable(tmp_path, monkeypatch):
-    """它挂在每次 mouseDown 上，出任何问题都只能返回 handled=False，不能抛。"""
-    monkeypatch.setattr(bridge_module.sys, "platform", "linux")
-    bridge = _bridge(tmp_path)
-    bridge.attach(_FakeWindow(None))
-    # 让 ``from webview.platforms import gtk`` 失败
-    monkeypatch.setitem(sys.modules, "webview", None)
-    monkeypatch.setitem(sys.modules, "webview.platforms", None)
-
-    got = bridge.begin_window_drag(10, 20)
-
-    assert got == {"ok": False, "handled": False}
-
-
-# ----------------------------------------------------------------------
-# check_browser / check_updates：置状态 → 起线程 → 立刻返回
-# ----------------------------------------------------------------------
-def test_check_browser_sets_status_and_starts_a_worker(tmp_path, no_threads):
-    bridge = _bridge(tmp_path)
-
-    assert bridge.check_browser() == {"ok": True}
-
-    assert bridge.status == "updating"
-    assert len(no_threads) == 1
-    assert no_threads[0]["target"] == bridge._check_browser_worker
-    logs = [e["payload"]["msg"] for e in bridge.drain_events(0)["events"]
-            if e["event"] == "log"]
-    assert any("检查浏览器" in line for line in logs)
-
-
 def test_check_updates_starts_a_worker_with_the_manual_flag(tmp_path, no_threads):
     bridge = _bridge(tmp_path)
 
