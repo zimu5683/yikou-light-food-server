@@ -32,13 +32,14 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from . import __version__, web_pages
 from .bridge import Bridge
 from .config import user_data_dir
-from .web_auth import (ROLE_ADMIN, AccessVerifier, AuthError, AuthStore,
-                       access_verifier_from_env, default_auth_dir)
+from .web_auth import (SESSION_TTL_SECONDS, STATUS_PENDING, AccessVerifier,
+                       AuthError, AuthStore, access_verifier_from_env,
+                       default_auth_dir)
 
 #: 默认端口。选一个不常用的高位端口，避免和 Termux 里其它服务撞车。
 DEFAULT_PORT = 8756
@@ -69,6 +70,22 @@ _ADMIN_PATHS = frozenset({"/admin"})
 
 #: 网关转发过来的请求会带这些头。用于区分「本地直连」与「公网入口」。
 _PROXY_HEADERS = ("cf-connecting-ip", "cf-ray", "x-forwarded-for", "x-forwarded-proto")
+
+
+class _RecoveryUser:
+    """本地旧令牌对应的身份：本机/局域网直连时可用，等价于管理员。
+
+    存在意义是「自救」：忘记管理员密码、或账号文件损坏时，仍能在手机本地用
+    ``?token=`` 进审批页。公网入口永远不会走到这里（见 ``_legacy_token_ok``）。
+    """
+
+    username = "local-recovery"
+    role = "admin"
+    status = "approved"
+
+    @property
+    def is_admin(self) -> bool:
+        return True
 
 
 class WebServerError(RuntimeError):
@@ -239,16 +256,40 @@ class _Handler(BaseHTTPRequestHandler):
     def _send_bytes(self, body: bytes, status: int = 200,
                     content_type: str = "application/octet-stream",
                     extra_headers: dict[str, str] | None = None) -> None:
+        """发送一个完整响应。
+
+        客户端随时可能中途断开（浏览器取消、手机切网、隧道侧掐断回源连接）。
+        这时写 socket 会抛 BrokenPipeError/ConnectionResetError；如果不吞掉，
+        它会变成未捕获异常，让 Cloudflare 判定「源站无响应」并给访客返回
+        **502 Bad Gateway**。真实案例：输错密码本应看到"密码不正确"的提示，
+        结果因为这次断连变成了 502 报错页。
+
+        因此这里把「写失败」当作正常情况处理：对端已经走了，没有别的补救动作，
+        静静收场即可（Debug 级别留痕，便于排查但不刷屏）。
+        """
         self._drain_body()
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("X-Content-Type-Options", "nosniff")
-        for key, value in (extra_headers or {}).items():
-            self.send_header(key, value)
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            for key, value in (extra_headers or {}).items():
+                self.send_header(key, value)
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            self._note_closed(exc)
+        except OSError as exc:
+            # 写超时（ETIMEDOUT）等其它 socket 级失败同样不该 500。
+            self._note_closed(exc)
+            self.close_connection = True
+
+    def _note_closed(self, exc: OSError) -> None:
+        """客户端已断开：关掉 keep-alive，不再尝试复用这条连接。"""
+        self.close_connection = True
+        if getattr(self.server, "log_closed_connections", False):  # pragma: no cover
+            print(f"客户端提前断开，响应未送达：{type(exc).__name__}: {exc}", file=sys.stderr)
 
     def _send_json(self, payload: Any, status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
@@ -311,7 +352,7 @@ class _Handler(BaseHTTPRequestHandler):
             if user is not None:
                 return user
         if self._legacy_token_ok():
-            return _LegacyTokenUser()
+            return _RecoveryUser()
         return None
 
     def _wants_json(self, path: str) -> bool:
@@ -342,38 +383,27 @@ class _Handler(BaseHTTPRequestHandler):
         return proto == "https"
 
     # -- 路由拦截 ------------------------------------------------------
-    def handle_one_request(self) -> None:
-        """在分发到 do_GET/do_POST 之前统一做鉴权。
+    def parse_request(self) -> bool:
+        """在解析请求的过程中做统一鉴权。
 
-        放在这里（而不是各个 do_* 里）是因为这是所有请求的唯一必经之路：新增任何
-        路由都不会绕过鉴权，这正是「公网暴露」场景最需要的默认安全。
+        为什么挂在 ``parse_request`` 而不是 ``handle_one_request``：正常流程是
+        「handle_one_request → parse_request → do_* → 读 body」，鉴权只要插在
+        ``parse_request`` 成功之后即可，body 还留在流里由 ``do_*`` 照常读取。
+        早先的写法在 handle_one_request 里手动 readline+parse 再回填 BytesIO，
+        会因为丢弃未读的 body 字节而让 POST 解析错位（400 bad_arguments）。
+
+        放在这里的第二个好处：这是所有路由的唯一入口，新加路由不可能绕过鉴权。
         """
-        try:
-            self.raw_requestline = self.rfile.readline(65537)
-        except (OSError, ValueError):
-            self.close_connection = True
-            return
-        if not self.raw_requestline:
-            self.close_connection = True
-            return
-        if not self.parse_request():
-            return
-        # parse_request 把头部读掉了，但 do_* 还要再读一次：回填原始字节。
-        self.rfile = io.BytesIO(self.raw_requestline + self.headers.as_bytes())
-
+        if not super().parse_request():
+            return False
+        # 到这里头部已解析、body 仍未读取。先初始化 _body_read，
+        # 因为拒绝分支会调 _drain_body()，而它原本由 do_GET/do_POST 初始化。
+        self._body_read = False
         path = urlparse(self.path).path
         if path not in _PUBLIC_PATHS and self._current_user() is None:
             self._reject_unauthenticated(path)
-            return
-        self._dispatch()
-
-    def _dispatch(self) -> None:
-        """等价于 BaseHTTPRequestHandler 的默认 ``method()`` 调用。"""
-        method = getattr(self, "do_" + self.command, None)
-        if method is None:
-            self.send_error(HTTPStatus.NOT_IMPLEMENTED, "Unsupported method (%r)" % self.command)
-            return
-        method()
+            return False
+        return True
 
     def _reject_unauthenticated(self, path: str) -> None:
         if self._wants_json(path):
@@ -490,21 +520,23 @@ class _Handler(BaseHTTPRequestHandler):
         if user is None:
             self._reject_unauthenticated("/admin")
             return
-        if not getattr(user, "is_admin", False) or user.username != "cli-recovery":
-            self._send_html(web_pages.denied_page(
-                title="无权访问审批页",
-                message="当前账号不是管理员，无法审批访问申请。",
-                username=user.username), HTTPStatus.FORBIDDEN)
+        if not getattr(user, "is_admin", False):
+            self._send_denied("无权访问审批页",
+                              "当前账号不是管理员，无法审批访问申请。", user)
             return
         if not self._access_ok():
             # Access 已配置但验签失败：直连源站或在 Cloudflare 之外，拒绝。
-            self._send_html(web_pages.denied_page(
-                title="请通过 Cloudflare Access 访问",
-                message="此页面要求通过 Cloudflare Access 邮箱验证。"
-                        "请从管理子域正常访问。",
-                username=user.username), HTTPStatus.FORBIDDEN)
+            self._send_denied("请通过 Cloudflare Access 访问",
+                              "此页面要求通过 Cloudflare Access 邮箱验证。"
+                              "请从管理子域正常访问。", user)
             return
         self._render_admin(user)
+
+    def _send_denied(self, title: str, message: str, user: Any) -> None:
+        """403：身份已识别但权限不够。与 401（没登录）必须区分开。"""
+        self._send_html(web_pages.denied_page(
+            title=title, message=message,
+            username=getattr(user, "username", "")), HTTPStatus.FORBIDDEN)
 
     def _render_admin(self, user: Any, *, error: str = "", notice: str = "") -> None:
         self._send_html(web_pages.admin_page(
@@ -520,14 +552,17 @@ class _Handler(BaseHTTPRequestHandler):
     def _handle_admin_post(self) -> None:
         """审批页的表单动作：同意 / 拒绝 / 建邀请码 / 停用邀请码 / 改密码。"""
         user = self._current_user()
-        if user is None or not getattr(user, "is_admin", False):
+        if user is None:
             self._reject_unauthenticated("/admin")
             return
+        if not getattr(user, "is_admin", False):
+            # 已登录但不是管理员：这是权限问题（403），不是没登录（401/跳登录页）。
+            self._send_denied("无权访问审批页",
+                              "当前账号不是管理员，无法审批访问申请。", user)
+            return
         if not self._access_ok():
-            self._send_html(web_pages.denied_page(
-                title="请通过 Cloudflare Access 访问",
-                message="此页面要求通过 Cloudflare Access 邮箱验证。",
-                username=user.username), HTTPStatus.FORBIDDEN)
+            self._send_denied("请通过 Cloudflare Access 访问",
+                              "此页面要求通过 Cloudflare Access 邮箱验证。", user)
             return
 
         form = self._read_form()
@@ -581,12 +616,18 @@ class _Handler(BaseHTTPRequestHandler):
         return bool(supplied) and secrets.compare_digest(supplied, expected)
 
     def _require_token(self) -> bool:
-        if self._token_ok():
+        """``/api/*`` 的凭据闸门。
+
+        原来只认单一的静态令牌 ``self.server.token``；现在改成认「账号会话」，
+        同时保留本地直连的旧令牌（见 :meth:`_legacy_token_ok`）。之所以不直接复用
+        ``_token_ok``：静态令牌不能成为绕过审批链的后门。
+        """
+        if self._current_user() is not None:
             return True
         self._send_error_json(
             HTTPStatus.UNAUTHORIZED,
-            "缺少或错误的访问令牌：请在网址后加 ?token=<令牌> 打开页面",
-            "unauthorized",
+            "需要登录：请在 /login 登录后再操作",
+            "login_required",
         )
         return False
 
@@ -597,6 +638,15 @@ class _Handler(BaseHTTPRequestHandler):
         if route == "/healthz":
             # 免鉴权的最小连通性探测：只回答「服务活着」，不泄露任何状态。
             self._send_json({"ok": True})
+            return
+        if route == "/login":
+            self._serve_login()
+            return
+        if route == "/logout":
+            self._serve_logout()
+            return
+        if route in _ADMIN_PATHS:
+            self._serve_admin()
             return
         if route == "/api/fs/list":
             if not self._require_token():
@@ -614,6 +664,15 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         self._body_read = False
         route = urlparse(self.path).path
+        if route == "/login":
+            self._handle_login_post()
+            return
+        if route == "/logout":
+            self._serve_logout()
+            return
+        if route in _ADMIN_PATHS:
+            self._handle_admin_post()
+            return
         if not route.startswith("/api/"):
             self._send_error_json(HTTPStatus.NOT_FOUND, "未知路径", "not_found")
             return
@@ -802,10 +861,12 @@ def build_bridge(on_destroy: Any = None, config_path: Any = None) -> Bridge:
 
 
 def serve(host: str = "0.0.0.0", port: int = DEFAULT_PORT, *, dist_dir: Path | None = None,
-          token: str = "", rotate_token: bool = False, announce: bool = True) -> int:
+          token: str = "", rotate_token: bool = False, announce: bool = True,
+          auth_dir: Path | None = None) -> int:
     """启动网页版服务并阻塞到被关闭；返回进程退出码。"""
     access_token = token or load_or_create_token(rotate=rotate_token)
-    httpd = create_server(host, port, dist_dir=dist_dir, token=access_token)
+    httpd = create_server(host, port, dist_dir=dist_dir, token=access_token,
+                          auth_dir=auth_dir)
 
     actual_port = httpd.server_address[1]
     if announce:
@@ -823,7 +884,9 @@ def serve(host: str = "0.0.0.0", port: int = DEFAULT_PORT, *, dist_dir: Path | N
 
 
 def create_server(host: str, port: int, *, dist_dir: Path | None = None, token: str = "",
-                  on_destroy: Any = None, config_path: Any = None) -> ThreadingHTTPServer:
+                  on_destroy: Any = None, config_path: Any = None,
+                  auth_dir: Path | None = None, auth: AuthStore | None = None,
+                  access: AccessVerifier | None = None) -> ThreadingHTTPServer:
     """构造（但不启动）网页版服务器。
 
     单独拆出来便于测试与嵌用：调用方可以 ``serve_forever()`` 自己控制生命周期，
@@ -836,7 +899,9 @@ def create_server(host: str, port: int, *, dist_dir: Path | None = None, token: 
             "请先构建前端：cd frontend && pnpm install && pnpm build"
         )
     try:
-        return _Server((host, port), dist, build_bridge(on_destroy, config_path), token)
+        return _Server((host, port), dist, build_bridge(on_destroy, config_path), token,
+                       auth=auth if auth is not None else AuthStore(auth_dir or default_auth_dir()),
+                       access=access)
     except OSError as exc:
         raise WebServerError(
             f"无法监听 {host}:{port}（{exc}）。端口可能已被占用，可用 --port 换一个。"
@@ -870,12 +935,80 @@ def _announce(host: str, port: int, token: str) -> None:
     print("\n".join(lines), flush=True)
 
 
+def _prompt_password(prompt: str) -> str:
+    """读取口令：优先隐藏输入，终端不可用时退化为普通输入。"""
+    import getpass
+
+    try:
+        return getpass.getpass(prompt)
+    except (EOFError, OSError, getpass.GetPassWarning):
+        return input(prompt)
+
+
+def _admin_cli(argv: list[str], auth_dir: Path | None) -> int | None:
+    """处理 ``--create-admin`` / ``--list-users`` / ``--reset-admin-password``。
+
+    交互式命令，返回退出码；不是这类命令时返回 None 让调用方继续启动服务。
+    """
+    wants_create = "--create-admin" in argv
+    wants_list = "--list-users" in argv
+    wants_reset = "--reset-admin-password" in argv
+    if not (wants_create or wants_list or wants_reset):
+        return None
+
+    store = AuthStore(auth_dir or default_auth_dir())
+    try:
+        if wants_list:
+            users = store.list_users()
+            if not users:
+                print("还没有任何账号。用 --create-admin 建管理员。")
+                return 0
+            print(f"账号总数 {len(users)}（待审批 {store.pending_count()}）：")
+            for user in users:
+                print(f"  {user.username:<32} {user.status:<10} {user.role}")
+            return 0
+
+        username = ""
+        if "--username" in argv:
+            index = argv.index("--username")
+            if index + 1 < len(argv):
+                username = argv[index + 1]
+        try:
+            if not username:
+                username = input("管理员账号（邮箱或用户名）：").strip()
+            password = _prompt_password("管理员密码（至少 6 位）：")
+            confirm = _prompt_password("再输一次确认：")
+        except EOFError:
+            print("需要交互式终端来输入账号密码。", file=sys.stderr)
+            return 2
+        if password != confirm:
+            print("两次输入不一致。", file=sys.stderr)
+            return 2
+        user = store.create_admin(username, password, force=wants_reset)
+        action = "已重置密码" if wants_reset else "已创建管理员"
+        print(f"{action}：{user.username}")
+        print(f"数据文件：{store.path}")
+        return 0
+    except AuthError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
-    """``python run.py --web [--host H] [--port P] [--new-token]`` 的实现。"""
+    """实现 ``python run.py --web`` 及账号管理子命令。
+
+    账号管理：``--create-admin`` / ``--reset-admin-password`` / ``--list-users``，
+    均可配 ``--username`` 与 ``--auth-dir``。
+    """
     argv = list(sys.argv[1:] if argv is None else argv)
     host = "0.0.0.0"
     port = DEFAULT_PORT
     rotate = "--new-token" in argv
+    auth_dir: Path | None = None
+    if "--auth-dir" in argv:
+        index = argv.index("--auth-dir")
+        if index + 1 < len(argv):
+            auth_dir = Path(argv[index + 1]).expanduser()
     if "--host" in argv:
         host = argv[argv.index("--host") + 1]
     if "--port" in argv:
@@ -884,8 +1017,12 @@ def main(argv: list[str] | None = None) -> int:
         except (IndexError, ValueError):
             print("--port 需要一个整数端口", file=sys.stderr)
             return 2
+
+    if (code := _admin_cli(argv, auth_dir)) is not None:
+        return code
+
     try:
-        return serve(host=host, port=port, rotate_token=rotate)
+        return serve(host=host, port=port, rotate_token=rotate, auth_dir=auth_dir)
     except WebServerError as exc:
         print(str(exc), file=sys.stderr)
         return 1
