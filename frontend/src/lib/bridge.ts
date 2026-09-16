@@ -287,7 +287,8 @@ export interface OrderFormPayload {
   date: string
   count: string
   remember: boolean
-  api_mode: boolean
+  /** 可选：后端已固定纯接口模式，缺省即为 true（保留字段以兼容旧客户端）。 */
+  api_mode?: boolean
 }
 
 /** 订单表单防抖即时保存的载荷（不触发任务、不带密码）。 */
@@ -334,7 +335,8 @@ export interface SssFormPayload {
   remember: boolean
   dry_run: boolean
   preflight: boolean
-  api_mode: boolean
+  /** 可选：后端已固定纯接口模式，缺省即为 true（保留字段以兼容旧客户端）。 */
+  api_mode?: boolean
 }
 
 export interface FieldErrors {

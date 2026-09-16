@@ -25,6 +25,7 @@ import {
   UpdateProgressDialog,
 } from '@/components/dialogs'
 import { LogConsole } from '@/components/LogConsole'
+import { useLogSheetDrag } from '@/lib/useLogSheetDrag'
 import { TaskPanel } from '@/components/TaskPanel'
 import { TitleBar } from '@/components/TitleBar'
 import { useApp } from '@/hooks/appContext'
@@ -66,19 +67,22 @@ export default function App() {
   const { config, setSplitRatio, authError, status, workerAlive } = useApp()
   const layout = useLayout()
   const [ratio, setRatio] = useState(config?.split_ratio ?? 0.38)
-  // 手机端日志是底部抽屉；App 只需要知道「现在是不是展开着」，
-  // 具体高度由 PhoneLogSheet 自己管（并记忆上次拖到的位置）。
-  const [logOpen, setLogOpen] = useState(false)
+  // 手机端日志抽屉：开合与高度由 hook 统一管理，操作栏的「日志」按钮
+  // 和抽屉把手共用同一份状态（按钮因此既是开关也是拖拽把手）。
+  const logSheet = useLogSheetDrag()
   const containerRef = useRef<HTMLDivElement>(null)
   const dragging = useRef(false)
 
   // 手机上按下「开始处理」后自动弹出日志抽屉：这个工具的流程就是
   // 配置 → 启动 → 盯日志 → 收结果，启动那一刻要看的正是日志。
   const wasRunning = useRef(false)
+  // 取出 setter 再依赖它：setState 的 setter 是稳定引用，
+  // 这样依赖数组里不必放整个 logSheet 对象（每次渲染都是新对象）。
+  const setLogSheetOpen = logSheet.setOpen
   useEffect(() => {
-    if (layout === 'phone' && workerAlive && !wasRunning.current) setLogOpen(true)
+    if (layout === 'phone' && workerAlive && !wasRunning.current) setLogSheetOpen(true)
     wasRunning.current = workerAlive
-  }, [workerAlive, layout])
+  }, [workerAlive, layout, setLogSheetOpen])
 
   const onDividerDown = useCallback((e: ReactPointerEvent) => {
     dragging.current = true
@@ -109,22 +113,25 @@ export default function App() {
 
       {layout === 'phone' ? (
         <>
-          <main className="flex min-h-0 flex-1 flex-col">
-            {/* 任务面板常驻：日志现在是它上面的抽屉，不再是与它并列的一屏。
+          {/* paddingBottom = 抽屉当前高度：抽屉收起时约 34px（只露把手），
+              展开时等于抽屉高度，于是底部的开始/停止按钮永远在抽屉之上，点得到。 */}
+          <main className="flex min-h-0 flex-1 flex-col" style={{ paddingBottom: logSheet.height }}>
+            {/* 任务面板常驻：日志是它上面的抽屉，不再是与它并列的一屏。
                 常驻也避免了「切走再切回」把表单里未落盘的输入清掉。 */}
             <div className="flex min-h-0 flex-1">
-              <TaskPanel />
+              {/* 「日志」按钮在操作栏里（原来在最底部 tab 栏，已移除），
+                  它同时是可拖拽把手：见 TaskPanel 的 LogToggleButton。 */}
+              <TaskPanel
+                logToggle={{
+                  open: logSheet.open,
+                  status,
+                  running: workerAlive,
+                  drag: logSheet,
+                }}
+              />
             </div>
           </main>
-          {/* 底部 tab 栏由 LogConsole 内部与抽屉同列渲染：两者必须做兄弟节点，
-              否则抽屉的把手会被 tab 栏压住（见 LogConsole 的 PhoneLogTabBar 注释）。 */}
-          <LogConsole
-            layout="phone"
-            open={logOpen}
-            onOpenChange={setLogOpen}
-            status={status}
-            running={workerAlive}
-          />
+          <LogConsole layout="phone" drag={logSheet} />
         </>
       ) : (
         <main

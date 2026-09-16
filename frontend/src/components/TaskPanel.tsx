@@ -3,7 +3,7 @@
  * 校验结果由桥接层返回（start_order/start_sss 的 fields），前端渲染字段错误态。
  */
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { MoreHorizontal } from 'lucide-react'
+import { MoreHorizontal, ScrollText } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { CloudForm } from '@/components/CloudForm'
@@ -24,7 +24,7 @@ import {
 import { Switch } from '@/components/ui/switch'
 import { DateField, Field, GhostButton, Stepper, TextInput } from '@/components/fields'
 import { FileBrowserDialog } from '@/components/FileBrowserDialog'
-import { useApp, type FieldErrors, type TaskMode } from '@/hooks/appContext'
+import { statusLabel, useApp, type FieldErrors, type TaskMode } from '@/hooks/appContext'
 import {
   api,
   isApiReady,
@@ -32,10 +32,12 @@ import {
   type OrderFormPayload,
   type SssFormPayload,
 } from '@/lib/bridge'
+import type { StatusState } from '@/lib/bridge'
+import type { LogSheetDrag } from '@/lib/useLogSheetDrag'
 import { cn } from '@/lib/utils'
 import { modeError } from '@/lib/format'
 
-export function TaskPanel() {
+export function TaskPanel({ logToggle }: { logToggle?: LogToggleProps }) {
   const { mode, setMode, workerAlive, config } = useApp()
   const formKey = config ? 'ready' : 'loading'
   return (
@@ -68,13 +70,13 @@ export function TaskPanel() {
           每个表单自己管「字段区滚动 + 底部操作条」，所以这里必须是能撑满的
           flex 列容器（不能是 block）。 */}
       <div className={cn('min-h-0 flex-1 flex-col', mode === 'order' ? 'flex' : 'hidden')}>
-        <OrderForm key={formKey} />
+        <OrderForm key={formKey} logToggle={logToggle} />
       </div>
       <div className={cn('min-h-0 flex-1 flex-col', mode === 'cloud' ? 'flex' : 'hidden')}>
         <CloudForm key={formKey} />
       </div>
       <div className={cn('min-h-0 flex-1 flex-col', mode === 'sss' ? 'flex' : 'hidden')}>
-        <SssForm key={formKey} />
+        <SssForm key={formKey} logToggle={logToggle} />
       </div>
       {workerAlive && (
         <p className="shrink-0 border-t px-3 py-1.5 text-[11px] text-muted-foreground sm:px-5">
@@ -117,7 +119,7 @@ function ModeTab({
 /* 订单处理                                                             */
 /* ------------------------------------------------------------------ */
 
-function OrderForm() {
+function OrderForm({ logToggle }: { logToggle?: LogToggleProps }) {
   const { config, passwords, startOrder, workerAlive } = useApp()
   const [url, setUrl] = useState(config?.target_url ?? '')
   const [phone, setPhone] = useState(config?.phone_number ?? '')
@@ -126,7 +128,6 @@ function OrderForm() {
   const [date, setDate] = useState(config?.order_date ?? '')
   const [count, setCount] = useState<number | null>(config?.order_count ?? null)
   const [remember, setRemember] = useState(true)
-  const [apiMode, setApiMode] = useState(config?.api_mode ?? true)
   const [fields, setFields] = useState<FieldErrors | null>(null)
   const [busy, setBusy] = useState(false)
   // 网页版的服务端文件浏览器：null 表示未打开。
@@ -136,7 +137,7 @@ function OrderForm() {
   const scheduleSave = useDebouncedSave(() => {
     if (!isApiReady()) return
     api()
-      .save_order_config({ url, phone, excel, date, count, api_mode: apiMode })
+      .save_order_config({ url, phone, excel, date, count })
       .catch(() => {})
   })
   const firstSave = useRef(true)
@@ -146,7 +147,7 @@ function OrderForm() {
       return
     }
     scheduleSave()
-  }, [url, phone, excel, date, count, apiMode, scheduleSave])
+  }, [url, phone, excel, date, count, scheduleSave])
 
   const excelError = modeError(fields, 'excel')
   const excelOk = !excelError && excel && !fields ? '文件已准备' : undefined
@@ -156,7 +157,9 @@ function OrderForm() {
     setBusy(true)
     setFields(null)
     try {
-      const payload: OrderFormPayload = { url, phone, password, excel, date, count: count === null ? '' : String(count), remember, api_mode: apiMode }
+      // 不再传 api_mode：后端已固定纯接口模式（浏览器模式已移除），
+      // 后端缺省值即为 True。
+      const payload: OrderFormPayload = { url, phone, password, excel, date, count: count === null ? '' : String(count), remember }
       const errors = await startOrder(payload)
       if (errors) setFields(errors)
     } finally {
@@ -261,11 +264,6 @@ function OrderForm() {
           <Switch checked={remember} onCheckedChange={setRemember} aria-label="保存到系统凭据管理器" />
           <span>保存到系统凭据管理器</span>
         </div>
-
-        <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
-          <Switch checked={apiMode} onCheckedChange={setApiMode} aria-label="纯接口模式（不启动浏览器）" />
-          <span>纯接口模式（不启动浏览器）</span>
-        </div>
         </div>
 
       <BottomDock>
@@ -274,6 +272,7 @@ function OrderForm() {
           onStart={onStart}
           startBusy={busy}
           startDisabled={workerAlive}
+          logToggle={logToggle}
         />
         <ToolsMenu mode="order" />
       </BottomDock>
@@ -294,7 +293,7 @@ function OrderForm() {
 /* 闪时送下单                                                           */
 /* ------------------------------------------------------------------ */
 
-function SssForm() {
+function SssForm({ logToggle }: { logToggle?: LogToggleProps }) {
   const { config, passwords, startSss, workerAlive } = useApp()
   const [url, setUrl] = useState(config?.sss_url ?? '')
   const [account, setAccount] = useState(config?.sss_account ?? '')
@@ -312,7 +311,6 @@ function SssForm() {
   const [remember, setRemember] = useState(true)
   const [dryRun, setDryRun] = useState(config?.sss_dry_run ?? true)
   const [preflight, setPreflight] = useState(config?.sss_preflight ?? false)
-  const [apiMode, setApiMode] = useState(config?.api_mode ?? true)
   const [fields, setFields] = useState<FieldErrors | null>(null)
   const [busy, setBusy] = useState(false)
   const [dayBusy, setDayBusy] = useState(false)
@@ -337,7 +335,6 @@ function SssForm() {
         fixed_address_detail: fixedAddressDetail,
         dry_run: dryRun,
         preflight,
-        api_mode: apiMode,
       })
       .catch(() => {})
   })
@@ -350,7 +347,7 @@ function SssForm() {
     scheduleSave()
   }, [
     url, account, excel, productName, commonAddress, useFixedAddress,
-    fixedLnt, fixedLat, fixedAreaCode, fixedAddressDetail, dryRun, preflight, apiMode,
+    fixedLnt, fixedLat, fixedAreaCode, fixedAddressDetail, dryRun, preflight,
     orderSource,
     scheduleSave,
   ])
@@ -379,7 +376,6 @@ function SssForm() {
         remember,
         dry_run: dryRun,
         preflight,
-        api_mode: apiMode,
       }
       const errors = await startSss(payload)
       if (errors) setFields(errors)
@@ -559,11 +555,6 @@ function SssForm() {
           />
           <span>预检：登录并检查余额/订单，不创建订单</span>
         </div>
-
-        <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
-          <Switch checked={apiMode} onCheckedChange={setApiMode} aria-label="纯接口模式（不启动浏览器）" />
-          <span>纯接口模式（不启动浏览器）</span>
-        </div>
         </div>
 
       <BottomDock>
@@ -572,6 +563,7 @@ function SssForm() {
           onStart={onStart}
           startBusy={busy}
           startDisabled={workerAlive}
+          logToggle={logToggle}
         />
         <ToolsMenu mode="sss" />
       </BottomDock>
@@ -641,11 +633,14 @@ function ActionBar({
   onStart,
   startBusy,
   startDisabled,
+  logToggle,
 }: {
   startLabel: string
   onStart: () => void
   startBusy: boolean
   startDisabled: boolean
+  /** 手机端把「日志」按钮并进操作栏（原来在最底部的 tab 栏里，已移除）。 */
+  logToggle?: LogToggleProps
 }) {
   const { stopTask, workerAlive } = useApp()
   const [confirming, setConfirming] = useState(false)
@@ -654,6 +649,7 @@ function ActionBar({
     <>
       {/* 顶边与上间距由 BottomDock 提供，这里不再重复画 border-t */}
       <div className="flex gap-2">
+        {logToggle && <LogToggleButton {...logToggle} />}
         <Button
           className="btn-serif-primary h-[38px] flex-1 rounded-[6px] text-sm"
           disabled={startDisabled || startBusy}
@@ -673,6 +669,69 @@ function ActionBar({
       <ConfirmStopDialog open={confirming} onOpenChange={setConfirming} onConfirm={stopTask} />
     </>
   )
+}
+
+/**
+ * 手机端操作栏里的「日志」按钮。
+ *
+ * 双重身份：
+ * - **点** → 开合日志抽屉；
+ * - **拖** → 直接调抽屉高度（不用先打开再去找把手）。
+ *
+ * 两个关键细节：
+ * 1. 必须 `touch-none`。否则手机上竖向拖动会被浏览器当成页面滚动，
+ *    随即发出 `pointercancel` 把拖动打断 —— 表现就是「拖不动」。
+ * 2. 拖动/点击用位移阈值区分（见 isClick）：拖过就不当成点击，避免松手误切换。
+ */
+function LogToggleButton({ open, status, running, drag }: LogToggleProps) {
+  const pressed = useRef(false)
+
+  return (
+    <button
+      type="button"
+      aria-label={open ? '收起日志' : '展开日志'}
+      aria-pressed={open}
+      onPointerDown={(e) => {
+        pressed.current = true
+        // 指针捕获在 hook 内部完成（手指移出按钮范围也要继续收到 move/up）
+        drag.onPointerDown(e)
+      }}
+      onPointerMove={(e) => {
+        if (pressed.current) drag.onPointerMove(e)
+      }}
+      onPointerUp={() => {
+        if (!pressed.current) return
+        pressed.current = false
+        // 开合与「是否算点击」都由 hook 统一判定，避免两处各判一次而不一致
+        drag.onPointerUp()
+      }}
+      onPointerCancel={() => {
+        if (!pressed.current) return
+        pressed.current = false
+        drag.onPointerUp()
+      }}
+      className={cn(
+        'flex h-[38px] w-[58px] shrink-0 touch-none select-none flex-col items-center justify-center',
+        'rounded-[6px] border bg-card text-[10px] transition-colors',
+        open ? 'border-primary/60 text-primary' : 'border-border text-muted-foreground',
+      )}
+    >
+      <span className="flex items-center gap-1">
+        {running && <span className="led-breathe size-[5px] rounded-[1px] bg-primary" />}
+        <ScrollText className="size-3.5" />
+      </span>
+      <span className="leading-tight">{running ? statusLabel(status) : '日志'}</span>
+    </button>
+  )
+}
+
+/** 操作栏日志按钮需要的 props（由 App 透传下来）。 */
+export interface LogToggleProps {
+  open: boolean
+  status: StatusState
+  running: boolean
+  /** 抽屉的拖拽状态机（由 App 的 useLogSheetDrag 提供）。 */
+  drag: LogSheetDrag
 }
 
 function ToolsMenu({ mode }: { mode: TaskMode }) {
