@@ -16,9 +16,7 @@ import {
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
-  type ReactNode,
 } from 'react'
-import { ClipboardList, ScrollText } from 'lucide-react'
 import { Toaster } from '@/components/ui/sonner'
 import {
   CaptchaDialog,
@@ -29,8 +27,7 @@ import {
 import { LogConsole } from '@/components/LogConsole'
 import { TaskPanel } from '@/components/TaskPanel'
 import { TitleBar } from '@/components/TitleBar'
-import { statusLabel, useApp } from '@/hooks/appContext'
-import type { StatusState } from '@/lib/bridge'
+import { useApp } from '@/hooks/appContext'
 import { cn } from '@/lib/utils'
 
 /** 分栏比例的上下限（与旧版一致，含持久化夹紧）。 */
@@ -42,7 +39,6 @@ const PHONE_MAX = 640
 const DESKTOP_MIN = 1024
 
 type Layout = 'phone' | 'tablet' | 'desktop'
-type PhoneView = 'task' | 'log'
 
 function readLayout(): Layout {
   const width = window.innerWidth
@@ -69,16 +65,18 @@ function useLayout(): Layout {
 export default function App() {
   const { config, setSplitRatio, authError, status, workerAlive } = useApp()
   const layout = useLayout()
-  const [view, setView] = useState<PhoneView>('task')
   const [ratio, setRatio] = useState(config?.split_ratio ?? 0.38)
+  // 手机端日志是底部抽屉；App 只需要知道「现在是不是展开着」，
+  // 具体高度由 PhoneLogSheet 自己管（并记忆上次拖到的位置）。
+  const [logOpen, setLogOpen] = useState(false)
   const containerRef = useRef<HTMLDivElement>(null)
   const dragging = useRef(false)
 
-  // 手机上按下「开始处理」后自动切到日志屏：这个工具的流程就是
+  // 手机上按下「开始处理」后自动弹出日志抽屉：这个工具的流程就是
   // 配置 → 启动 → 盯日志 → 收结果，启动那一刻要看的正是日志。
   const wasRunning = useRef(false)
   useEffect(() => {
-    if (layout === 'phone' && workerAlive && !wasRunning.current) setView('log')
+    if (layout === 'phone' && workerAlive && !wasRunning.current) setLogOpen(true)
     wasRunning.current = workerAlive
   }, [workerAlive, layout])
 
@@ -112,15 +110,21 @@ export default function App() {
       {layout === 'phone' ? (
         <>
           <main className="flex min-h-0 flex-1 flex-col">
-            {/* 两屏都常驻、只切可见性：卸载会清掉表单里尚未落盘的输入 */}
-            <div className={cn('min-h-0 flex-1', view === 'task' ? 'flex' : 'hidden')}>
+            {/* 任务面板常驻：日志现在是它上面的抽屉，不再是与它并列的一屏。
+                常驻也避免了「切走再切回」把表单里未落盘的输入清掉。 */}
+            <div className="flex min-h-0 flex-1">
               <TaskPanel />
             </div>
-            <div className={cn('min-h-0 flex-1', view === 'log' ? 'flex' : 'hidden')}>
-              <LogConsole />
-            </div>
           </main>
-          <PhoneTabBar view={view} onView={setView} status={status} running={workerAlive} />
+          {/* 底部 tab 栏由 LogConsole 内部与抽屉同列渲染：两者必须做兄弟节点，
+              否则抽屉的把手会被 tab 栏压住（见 LogConsole 的 PhoneLogTabBar 注释）。 */}
+          <LogConsole
+            layout="phone"
+            open={logOpen}
+            onOpenChange={setLogOpen}
+            status={status}
+            running={workerAlive}
+          />
         </>
       ) : (
         <main
@@ -166,75 +170,3 @@ export default function App() {
   )
 }
 
-/** 手机底部双 tab；横屏/手势条安全区在这里吃掉。 */
-function PhoneTabBar({
-  view,
-  onView,
-  status,
-  running,
-}: {
-  view: PhoneView
-  onView: (next: PhoneView) => void
-  status: StatusState
-  running: boolean
-}) {
-  return (
-    <nav
-      className="flex shrink-0 items-stretch border-t bg-card"
-      style={{ paddingBottom: 'var(--safe-bottom)', paddingLeft: 'var(--safe-left)', paddingRight: 'var(--safe-right)' }}
-    >
-      <PhoneTab active={view === 'task'} onClick={() => onView('task')} icon={<ClipboardList className="size-4" />}>
-        任务
-      </PhoneTab>
-      <PhoneTab
-        active={view === 'log'}
-        onClick={() => onView('log')}
-        icon={<ScrollText className="size-4" />}
-        // 运行中直接把状态写进 tab：不用切过去也知道跑到哪一步了
-        hint={running ? statusLabel(status) : undefined}
-        led={running}
-      >
-        日志
-      </PhoneTab>
-    </nav>
-  )
-}
-
-function PhoneTab({
-  active,
-  onClick,
-  icon,
-  hint,
-  led,
-  children,
-}: {
-  active: boolean
-  onClick: () => void
-  icon: ReactNode
-  hint?: string
-  led?: boolean
-  children: ReactNode
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-current={active ? 'page' : undefined}
-      className={cn(
-        // 两行（图标 + 文字）就够：原来还多出一行状态和一个下划线，整条近 66px，
-        // 在手机上太占地方。状态并到文字行里。
-        'flex min-h-11 flex-1 flex-col items-center justify-center gap-0.5 py-1.5 transition-colors',
-        active ? 'text-primary' : 'text-muted-foreground',
-      )}
-    >
-      <span className="flex items-center gap-1.5">
-        {led && <span className="led-breathe size-[6px] rounded-[1px] bg-primary" />}
-        {icon}
-      </span>
-      <span className="text-[11px] font-medium">
-        {children}
-        {hint && <span className="ml-1 text-primary">{hint}</span>}
-      </span>
-    </button>
-  )
-}
