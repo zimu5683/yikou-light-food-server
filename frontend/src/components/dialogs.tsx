@@ -38,7 +38,7 @@ export function DecisionDialog() {
   if (!decision) return null
   return (
     <AlertDialog open onOpenChange={(open) => { if (!open) resolveDecision(decision.id, 'cancel') }}>
-      <AlertDialogContent className="max-w-md rounded-lg">
+      <AlertDialogContent className="sm:max-w-md rounded-lg">
         <AlertDialogHeader>
           <AlertDialogTitle className="font-serif">{decision.title}</AlertDialogTitle>
           <AlertDialogDescription className="whitespace-pre-wrap">
@@ -80,7 +80,7 @@ export function CaptchaDialog() {
 
   return (
     <Dialog open onOpenChange={(open) => { if (!open) cancel() }}>
-      <DialogContent className="max-w-sm rounded-lg">
+      <DialogContent className="sm:max-w-sm rounded-lg">
         <DialogHeader>
           <DialogTitle className="font-serif">闪时送登录验证</DialogTitle>
           <DialogDescription>
@@ -142,7 +142,7 @@ export function UpdateAvailableDialog() {
 
   return (
     <Dialog open onOpenChange={(open) => { if (!open) setAvailable(null) }}>
-      <DialogContent className="max-w-md rounded-lg">
+      <DialogContent className="sm:max-w-md rounded-lg">
         <DialogHeader>
           <DialogTitle className="font-serif">发现新版本 {available.tag}</DialogTitle>
           <DialogDescription className="max-h-40 overflow-y-auto whitespace-pre-wrap">
@@ -184,7 +184,7 @@ export function UpdateProgressDialog() {
   return (
     <Dialog open>
       <DialogContent
-        className="max-w-sm rounded-lg [&>button]:hidden"
+        className="sm:max-w-sm rounded-lg [&>button]:hidden"
         onInteractOutside={(e) => e.preventDefault()}
         onEscapeKeyDown={(e) => e.preventDefault()}
       >

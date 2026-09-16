@@ -23,8 +23,15 @@ import {
 } from '@/components/ui/dialog'
 import { Switch } from '@/components/ui/switch'
 import { DateField, Field, GhostButton, Stepper, TextInput } from '@/components/fields'
+import { FileBrowserDialog } from '@/components/FileBrowserDialog'
 import { useApp, type FieldErrors, type TaskMode } from '@/hooks/appContext'
-import { api, isApiReady, type OrderFormPayload, type SssFormPayload } from '@/lib/bridge'
+import {
+  api,
+  isApiReady,
+  isWebTransport,
+  type OrderFormPayload,
+  type SssFormPayload,
+} from '@/lib/bridge'
 import { cn } from '@/lib/utils'
 import { modeError } from '@/lib/format'
 
@@ -32,14 +39,18 @@ export function TaskPanel() {
   const { mode, setMode, workerAlive, config } = useApp()
   const formKey = config ? 'ready' : 'loading'
   return (
-    <section className="flex min-h-0 flex-1 flex-col border-border lg:border-r">
-      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-5 pb-3 pt-4">
+    // 分栏边框由 App 外壳负责（桌面才画），这里再画一次会变成 2px
+    <section className="flex min-h-0 flex-1 flex-col border-border">
+      {/* 标题与模式 tab 固定不滚：手机上它们是导航，滚走就找不回来了。
+          副标题是装饰性文案，窄屏收起，把高度让给表单。 */}
+      <div className="shrink-0 px-3 pt-4 sm:px-5">
         <h1 className="font-serif text-lg font-semibold tracking-[1px]">任务配置</h1>
-        <p className="mb-3.5 mt-0.5 text-xs text-muted-foreground">
+        <p className="mb-3.5 mt-0.5 hidden text-xs text-muted-foreground sm:block">
           选择任务类型，准备好资料后启动。
         </p>
 
-        <div role="tablist" className="mb-4 flex gap-[18px] border-b">
+        {/* 手机上三个 tab 均分整行（触控目标更大），桌面回到左对齐的紧凑排布 */}
+        <div role="tablist" className="mb-3 flex gap-2 border-b sm:gap-[18px]">
           <ModeTab active={mode === 'order'} onClick={() => setMode('order')}>
             订单处理
           </ModeTab>
@@ -50,21 +61,23 @@ export function TaskPanel() {
             闪时送下单
           </ModeTab>
         </div>
+      </div>
 
-        {/* 两个表单常驻渲染（仅切换可见性）：卸载会清空各字段的 useState，
-            导致切页签后已输入内容丢失并被旧 config 重新填充。 */}
-        <div className={cn(mode === 'order' ? 'block' : 'hidden')}>
-          <OrderForm key={formKey} />
-        </div>
-        <div className={cn(mode === 'cloud' ? 'block' : 'hidden')}>
-          <CloudForm key={formKey} />
-        </div>
-        <div className={cn(mode === 'sss' ? 'block' : 'hidden')}>
-          <SssForm key={formKey} />
-        </div>
+      {/* 三个表单常驻渲染（仅切换可见性）：卸载会清空各字段的 useState，
+          导致切页签后已输入内容丢失并被旧 config 重新填充。
+          每个表单自己管「字段区滚动 + 底部操作条」，所以这里必须是能撑满的
+          flex 列容器（不能是 block）。 */}
+      <div className={cn('min-h-0 flex-1 flex-col', mode === 'order' ? 'flex' : 'hidden')}>
+        <OrderForm key={formKey} />
+      </div>
+      <div className={cn('min-h-0 flex-1 flex-col', mode === 'cloud' ? 'flex' : 'hidden')}>
+        <CloudForm key={formKey} />
+      </div>
+      <div className={cn('min-h-0 flex-1 flex-col', mode === 'sss' ? 'flex' : 'hidden')}>
+        <SssForm key={formKey} />
       </div>
       {workerAlive && (
-        <p className="border-t px-5 py-1.5 text-[11px] text-muted-foreground">
+        <p className="shrink-0 border-t px-3 py-1.5 text-[11px] text-muted-foreground sm:px-5">
           任务运行中，开始与表单暂不可用。
         </p>
       )}
@@ -87,7 +100,9 @@ function ModeTab({
       aria-selected={active}
       onClick={onClick}
       className={cn(
-        'relative pb-2 pt-1.5 text-[13.5px] font-medium transition-colors',
+        // 手机：均分整行 + ≥44px 触控高度；桌面：保持规范里的紧凑下划线 tab
+        'relative flex min-h-10 flex-1 items-center justify-center pb-2 pt-1.5 text-[13.5px] font-medium transition-colors',
+        'sm:min-h-0 sm:flex-none sm:justify-start',
         active ? 'font-semibold text-foreground' : 'text-muted-foreground hover:text-foreground',
         active &&
           "after:absolute after:inset-x-0 after:-bottom-px after:h-0.5 after:bg-primary after:content-['']",
@@ -114,6 +129,8 @@ function OrderForm() {
   const [apiMode, setApiMode] = useState(config?.api_mode ?? true)
   const [fields, setFields] = useState<FieldErrors | null>(null)
   const [busy, setBusy] = useState(false)
+  // 网页版的服务端文件浏览器：null 表示未打开。
+  const [browser, setBrowser] = useState<'open' | 'save' | null>(null)
 
   // 字段停止变化后自动落盘（切页签/退出重进都从后端还原，配置不丢失）。
   const scheduleSave = useDebouncedSave(() => {
@@ -147,22 +164,49 @@ function OrderForm() {
     }
   }
 
-  async function chooseFile() {
-    if (!isApiReady()) return
-    const result = await api().choose_excel('order')
+  function applyExcelResult(result: { path: string; error: string }) {
     if (result.path) setExcel(result.path)
     if (result.error) setFields((prev) => ({ ...prev, excel: { message: result.error } }))
+  }
+
+  async function chooseFile() {
+    if (!isApiReady()) return
+    // 网页版走服务端文件浏览器：任务在手机上跑，Excel 也在手机上，
+    // 浏览器自己的文件选择器只能拿到客户端文件，用不上。
+    if (isWebTransport()) {
+      setBrowser('open')
+      return
+    }
+    applyExcelResult(await api().choose_excel('order'))
   }
 
   async function newTemplate() {
     if (!isApiReady()) return
-    const result = await api().new_template('order')
-    if (result.path) setExcel(result.path)
-    if (result.error) setFields((prev) => ({ ...prev, excel: { message: result.error } }))
+    if (isWebTransport()) {
+      setBrowser('save')
+      return
+    }
+    applyExcelResult(await api().new_template('order'))
+  }
+
+  /** 文件浏览器选中路径后回填，并让后端按同一套规则校验/落盘。 */
+  async function onBrowserPick(path: string) {
+    const picked = browser
+    setBrowser(null)
+    if (picked === 'save') {
+      applyExcelResult(await api().new_template('order', path))
+      return
+    }
+    applyExcelResult(await api().choose_excel('order', path))
   }
 
   return (
-    <div>
+    <div className="flex min-h-0 flex-1 flex-col">
+      {/* 字段区自己滚动，操作条是它的兄弟节点（真页脚）。
+          原来操作条用 sticky bottom-0 待在滚动区内部：内容不足一屏时它不会被
+          撑到底部，下方就露出滚动容器的空白（「更多」下面那块空缺）；滚动时
+          表单内容又会从它后面滑过。做成页脚后这两种情况都不存在。 */}
+      <div className="scroll-contain min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-1 sm:px-5">
       <Field label="管理网址" htmlFor="order-url" error={modeError(fields, 'url')} helper="用于登录管理后台">
         <TextInput
           id="order-url"
@@ -222,6 +266,7 @@ function OrderForm() {
         <Switch checked={apiMode} onCheckedChange={setApiMode} aria-label="纯接口模式（不启动浏览器）" />
         <span>纯接口模式（不启动浏览器）</span>
       </div>
+      </div>
 
       <BottomDock>
         <ActionBar
@@ -232,6 +277,15 @@ function OrderForm() {
         />
         <ToolsMenu mode="order" />
       </BottomDock>
+      {browser && (
+        <FileBrowserDialog
+          open
+          mode={browser}
+          initialPath={excel}
+          onCancel={() => setBrowser(null)}
+          onPick={(path) => void onBrowserPick(path)}
+        />
+      )}
     </div>
   )
 }
@@ -262,6 +316,8 @@ function SssForm() {
   const [fields, setFields] = useState<FieldErrors | null>(null)
   const [busy, setBusy] = useState(false)
   const [dayBusy, setDayBusy] = useState(false)
+  // 网页版的服务端文件浏览器：null 表示未打开。
+  const [browser, setBrowser] = useState<'open' | 'save' | null>(null)
 
   // 字段停止变化后自动落盘（切页签/退出重进都从后端还原，配置不丢失）。
   const scheduleSave = useDebouncedSave(() => {
@@ -332,18 +388,39 @@ function SssForm() {
     }
   }
 
-  async function chooseFile() {
-    if (!isApiReady()) return
-    const result = await api().choose_excel('sss')
+  function applyExcelResult(result: { path: string; error: string }) {
     if (result.path) setExcel(result.path)
     if (result.error) setFields((prev) => ({ ...prev, excel: { message: result.error } }))
   }
 
+  async function chooseFile() {
+    if (!isApiReady()) return
+    // 网页版走服务端文件浏览器（同订单处理页签：选的是手机上的路径）。
+    if (isWebTransport()) {
+      setBrowser('open')
+      return
+    }
+    applyExcelResult(await api().choose_excel('sss'))
+  }
+
   async function newTemplate() {
     if (!isApiReady()) return
-    const result = await api().new_template('sss')
-    if (result.path) setExcel(result.path)
-    if (result.error) setFields((prev) => ({ ...prev, excel: { message: result.error } }))
+    if (isWebTransport()) {
+      setBrowser('save')
+      return
+    }
+    applyExcelResult(await api().new_template('sss'))
+  }
+
+  /** 文件浏览器选中路径后回填，并让后端按同一套规则校验/落盘。 */
+  async function onBrowserPick(path: string) {
+    const picked = browser
+    setBrowser(null)
+    if (picked === 'save') {
+      applyExcelResult(await api().new_template('sss', path))
+      return
+    }
+    applyExcelResult(await api().choose_excel('sss', path))
   }
 
   /** 读取云端当天名单（东湖午餐/东湖晚餐）并留档，不下单。 */
@@ -376,7 +453,9 @@ function SssForm() {
   }
 
   return (
-    <div>
+    <div className="flex min-h-0 flex-1 flex-col">
+      {/* 与订单处理页签同构：字段区滚动 + 操作条做真页脚（不再 sticky） */}
+      <div className="scroll-contain min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-1 sm:px-5">
       <Field label="闪时送网址" htmlFor="sss-url" error={modeError(fields, 'url')} helper="闪时送下单平台地址">
         <TextInput id="sss-url" value={url} onChange={(e) => setUrl(e.target.value)} />
       </Field>
@@ -485,6 +564,7 @@ function SssForm() {
         <Switch checked={apiMode} onCheckedChange={setApiMode} aria-label="纯接口模式（不启动浏览器）" />
         <span>纯接口模式（不启动浏览器）</span>
       </div>
+      </div>
 
       <BottomDock>
         <ActionBar
@@ -495,6 +575,15 @@ function SssForm() {
         />
         <ToolsMenu mode="sss" />
       </BottomDock>
+      {browser && (
+        <FileBrowserDialog
+          open
+          mode={browser}
+          initialPath={excel}
+          onCancel={() => setBrowser(null)}
+          onPick={(path) => void onBrowserPick(path)}
+        />
+      )}
     </div>
   )
 }
@@ -519,7 +608,7 @@ function SourceButton({
       aria-pressed={active}
       onClick={onClick}
       className={cn(
-        'h-[34px] flex-1 rounded-[4px] border px-3 text-xs transition-colors',
+        'h-[38px] flex-1 rounded-[4px] border px-3 text-xs transition-colors sm:h-[34px]',
         active
           ? 'border-primary bg-secondary font-medium text-primary-strong'
           : 'border-border bg-card text-muted-foreground hover:border-primary hover:text-primary-strong',
@@ -531,9 +620,17 @@ function SourceButton({
 }
 
 /** 表单底部停靠坞：更多菜单 + 主操作条整体吸底 */
+/**
+ * 表单底部操作条 —— **非滚动的真页脚**。
+ *
+ * 它原本是滚动容器内部的 `sticky bottom-0`：内容不足一屏时不会被撑到底部，
+ * 「更多」下方就露出滚动容器的空白，而滚动时表单内容又会从它后面滑过。
+ * 现在它是滚动区的兄弟节点，永远贴住面板底部，也不再需要负边距对齐
+ * （横向内边距由自己给）。底部安全区不在这里加：手机最底部是 tab 栏。
+ */
 function BottomDock({ children }: { children: ReactNode }) {
   return (
-    <div className="sticky bottom-0 -mx-5 bg-background px-5 pb-3 pt-2">
+    <div className="shrink-0 border-t bg-background px-3 pb-3 pt-2.5 sm:px-5">
       {children}
     </div>
   )
@@ -555,7 +652,8 @@ function ActionBar({
 
   return (
     <>
-      <div className="flex gap-2 border-t pt-3.5">
+      {/* 顶边与上间距由 BottomDock 提供，这里不再重复画 border-t */}
+      <div className="flex gap-2">
         <Button
           className="btn-serif-primary h-[38px] flex-1 rounded-[6px] text-sm"
           disabled={startDisabled || startBusy}
@@ -622,7 +720,7 @@ function ConfirmStopDialog({
 }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-sm rounded-lg">
+      <DialogContent className="sm:max-w-sm rounded-lg">
         <DialogHeader>
           <DialogTitle className="font-serif">暂停处理</DialogTitle>
           <DialogDescription>是否停止当前任务？停止后需等待浏览器操作结束。</DialogDescription>
@@ -666,7 +764,7 @@ function ConfirmClearPassword({
 }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-sm rounded-lg">
+      <DialogContent className="sm:max-w-sm rounded-lg">
         <DialogHeader>
           <DialogTitle className="font-serif">清除密码</DialogTitle>
           <DialogDescription>

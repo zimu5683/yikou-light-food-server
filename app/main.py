@@ -35,7 +35,7 @@ def _enable_high_dpi_awareness() -> str:
 
 
 def main() -> None:
-    """命令行入口：``--apply-update`` / ``--check-browser`` / ``--version`` / ``--self-check`` / ``--wps-check`` / ``--sss-import-check`` 等子命令，无参数时启动 pywebview 窗口。"""
+    """命令行入口：``--apply-update`` / ``--check-browser`` / ``--version`` / ``--self-check`` / ``--wps-check`` / ``--sss-import-check`` / ``--web`` 等子命令，无参数时启动 pywebview 窗口。"""
     if "--apply-update" in sys.argv:
         index = sys.argv.index("--apply-update")
         if len(sys.argv) < index + 3:
@@ -161,6 +161,12 @@ def main() -> None:
             if meal.order_count > 5:
                 print(f"    …其余 {meal.order_count - 5} 人已省略")
         return
+    if "--web" in sys.argv:
+        # 网页版：把 js_api 桥接层暴露成 HTTP 服务，让其它设备用浏览器远程操作
+        # （手机/无桌面环境跑任务时使用）。见 app/web_server.py。
+        from .web_server import main as web_main
+
+        raise SystemExit(web_main())
     _enable_high_dpi_awareness()
     from .webview_app import run as webview_run
     webview_run()

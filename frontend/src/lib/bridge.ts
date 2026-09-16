@@ -3,6 +3,10 @@
  *
  * Python→JS：window.__bridge.dispatch({event, payload})，由本模块分发。
  * JS→Python：window.pywebview.api.<method>()，返回 Promise。
+ *
+ * 网页版（手机/服务器模式，见 app/web_server.py）：没有 pywebview，改用
+ * ``POST /api/<method>``（JSON 数组按位置传参）调用同一批 Python 方法；访问令牌
+ * 从网址的 ``?token=`` 读取并持久化，之后随 ``X-Yikou-Token`` 头发送。
  */
 
 // ---------- 协议类型 ----------
@@ -369,8 +373,8 @@ interface PywebviewApi {
   resolve_decision(id: string, choice: string): Promise<{ ok: boolean }>
   resolve_captcha(id: string, code: string): Promise<{ ok: boolean }>
   resolve_address_input(id: string, entries: Record<string, string>): Promise<{ ok: boolean }>
-  choose_excel(mode: 'order' | 'sss'): Promise<{ path: string; error: string }>
-  new_template(mode: 'order' | 'sss'): Promise<{ path: string; error: string }>
+  choose_excel(mode: 'order' | 'sss', path?: string): Promise<{ path: string; error: string }>
+  new_template(mode: 'order' | 'sss', path?: string): Promise<{ path: string; error: string }>
   check_browser(): Promise<{ ok: boolean }>
   wps_status(): Promise<WpsStatus>
   wps_preview(): Promise<WpsResult>
@@ -398,6 +402,156 @@ declare global {
     pywebview?: { api: PywebviewApi }
     __bridge: { dispatch(message: BridgeEvent): void }
   }
+}
+
+// ---------- 传输方式 ----------
+
+/**
+ * `pywebview`：桌面端原生窗口（原有行为）；
+ * `http`：网页版，浏览器 ↔ app/web_server.py；
+ * `mock`：纯浏览器直开（无 Python），只给样式开发用的静态假数据。
+ */
+export type Transport = 'pywebview' | 'http' | 'mock'
+
+let transport: Transport = 'mock'
+
+export function currentTransport(): Transport {
+  return transport
+}
+
+/** 网页版（走 HTTP 服务端）时为 true。 */
+export function isWebTransport(): boolean {
+  return transport === 'http'
+}
+
+// ---------- 网页版：访问令牌 ----------
+
+const TOKEN_STORAGE_KEY = 'yikou.web.token.v1'
+
+function readToken(): string {
+  // 优先用网址里带的令牌（首次点开链接），否则用之前存下的，保证刷新后仍可用。
+  try {
+    const fromUrl = new URLSearchParams(window.location.search).get('token')
+    if (fromUrl) {
+      window.localStorage.setItem(TOKEN_STORAGE_KEY, fromUrl)
+      return fromUrl
+    }
+    return window.localStorage.getItem(TOKEN_STORAGE_KEY) ?? ''
+  } catch {
+    // 无 location / localStorage（Node 测试、隐私模式）时退化为无令牌。
+    return ''
+  }
+}
+
+let authToken = readToken()
+
+export function hasAuthToken(): boolean {
+  return Boolean(authToken)
+}
+
+/** 允许调用方在运行时补一个令牌（例如从设置里粘贴）。 */
+export function setAuthToken(token: string): void {
+  authToken = token
+  try {
+    window.localStorage.setItem(TOKEN_STORAGE_KEY, token)
+  } catch {
+    // 忽略存储失败；本次会话内仍然生效。
+  }
+}
+
+function authHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (authToken) headers['X-Yikou-Token'] = authToken
+  return headers
+}
+
+async function postJson(url: string, body: unknown): Promise<{ ok: boolean; status: number; data: unknown }> {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify(body),
+  })
+  const text = await response.text()
+  let data: unknown = null
+  if (text) {
+    try {
+      data = JSON.parse(text)
+    } catch {
+      data = { error: text }
+    }
+  }
+  return { ok: response.ok, status: response.status, data }
+}
+
+function errorMessage(data: unknown, status: number): string {
+  if (data && typeof data === 'object' && 'error' in data) {
+    const message = (data as { error?: unknown }).error
+    if (typeof message === 'string' && message) return message
+  }
+  return `请求失败（HTTP ${status}）`
+}
+
+/** 用 HTTP 实现整个 PywebviewApi：方法名即路径，参数按位置传。 */
+function createHttpApi(): PywebviewApi {
+  const call = async (method: string, args: unknown[]): Promise<unknown> => {
+    const { ok, status, data } = await postJson(`/api/${method}`, args)
+    if (!ok) {
+      if (status === 401) throw new Error('访问令牌无效或已失效，请用带 ?token= 的完整网址重新打开')
+      throw new Error(errorMessage(data, status))
+    }
+    return data
+  }
+  return new Proxy({} as PywebviewApi, {
+    get(_target, prop) {
+      if (typeof prop !== 'string') return undefined
+      return (...args: unknown[]) => call(prop, args)
+    },
+  })
+}
+
+// ---------- 网页版：服务器端文件浏览器 ----------
+//
+// 客户端选中的必须是**运行任务那台机器**上的路径（Excel 在手机上，不在打开
+// 网页的设备上），所以文件列表由服务端提供，而不是用 <input type="file">。
+
+export interface FsEntry {
+  name: string
+  path: string
+  is_dir: boolean
+  size: number
+}
+
+export interface FsShortcut {
+  name: string
+  path: string
+}
+
+export interface FsListResult {
+  path: string
+  parent?: string
+  entries: FsEntry[]
+  shortcuts?: FsShortcut[]
+  error: string
+}
+
+/** 列出服务端目录（仅返回目录与 Excel 文件）。 */
+export async function listServerDir(path = ''): Promise<FsListResult> {
+  const query = path ? `?path=${encodeURIComponent(path)}` : ''
+  const response = await fetch(`/api/fs/list${query}`, { headers: authHeaders() })
+  const text = await response.text()
+  let data: FsListResult | null = null
+  try {
+    data = text ? (JSON.parse(text) as FsListResult) : null
+  } catch {
+    data = null
+  }
+  if (!response.ok || !data) {
+    if (response.status === 401) {
+      throw new Error('访问令牌无效或已失效，请用带 ?token= 的完整网址重新打开')
+    }
+    throw new Error(data ? data.error : `读取目录失败（HTTP ${response.status}）`)
+  }
+  return data
 }
 
 // ---------- 客户端实现 ----------
@@ -534,52 +688,100 @@ export function onBridgeEvent(listener: Listener): () => void {
   return () => listeners.delete(listener)
 }
 
+let httpApi: PywebviewApi | null = null
+
 export function api(): PywebviewApi {
   const raw = window.pywebview?.api
-  if (!raw) throw new Error('pywebview API 尚未就绪')
-  return new Proxy(raw, {
-    get(target, prop) {
-      const value = Reflect.get(target, prop)
-      if (typeof value !== 'function') return value
-      return (...args: unknown[]) => {
-        const promise = (value as (...a: unknown[]) => Promise<unknown>).apply(target, args)
-        // evaluate_js 结果投递在 WebKitGTK 上可能被吞，超时兜底避免 UI 永久悬挂。
-        // 文件对话框等会合法长阻塞的调用不设超时。
-        const timeoutMs = prop === 'drain_events' ? 4000 : 0
-        if (!timeoutMs) return promise
-        return new Promise((resolve, reject) => {
-          const timer = setTimeout(() => reject(new Error('bridge timeout')), timeoutMs)
-          promise.then(
-            (value) => {
-              clearTimeout(timer)
-              resolve(value)
-            },
-            (error) => {
-              clearTimeout(timer)
-              reject(error)
-            },
-          )
-        })
-      }
-    },
-  }) as PywebviewApi
+  if (raw) {
+    return new Proxy(raw, {
+      get(target, prop) {
+        const value = Reflect.get(target, prop)
+        if (typeof value !== 'function') return value
+        return (...args: unknown[]) => {
+          const promise = (value as (...a: unknown[]) => Promise<unknown>).apply(target, args)
+          // evaluate_js 结果投递在 WebKitGTK 上可能被吞，超时兜底避免 UI 永久悬挂。
+          // 文件对话框等会合法长阻塞的调用不设超时。
+          const timeoutMs = prop === 'drain_events' ? 4000 : 0
+          if (!timeoutMs) return promise
+          return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('bridge timeout')), timeoutMs)
+            promise.then(
+              (value) => {
+                clearTimeout(timer)
+                resolve(value)
+              },
+              (error) => {
+                clearTimeout(timer)
+                reject(error)
+              },
+            )
+          })
+        }
+      },
+    }) as PywebviewApi
+  }
+  if (transport === 'http') {
+    httpApi ??= createHttpApi()
+    return httpApi
+  }
+  throw new Error('桥接 API 尚未就绪')
 }
 
 export function isApiReady(): boolean {
-  return Boolean(window.pywebview?.api)
+  return Boolean(window.pywebview?.api) || transport === 'http'
 }
 
 export interface ReadyResult {
   state: AppState
-  /** 模拟浏览器开发环境（无 pywebview）时为 true。 */
+  /** 模拟浏览器开发环境（无 Python 壳）时为 true。 */
   mocked: boolean
+  /** 实际使用的传输方式，便于界面区分「网页版」与「mock 预览」。 */
+  transport: Transport
+  /** 网页版令牌无效时的提示（非空表示需要用户换用带令牌的网址）。 */
+  authError: string
+}
+
+/** 网页版握手：成功返回初始状态，令牌不对返回提示，没有服务端返回 null。 */
+async function tryHttpHandshake(): Promise<{ state: AppState | null; authError: string }> {
+  try {
+    const { ok, status, data } = await postJson('/api/bridge_ready', [])
+    if (status === 401) {
+      return {
+        state: null,
+        authError: errorMessage(data, status),
+      }
+    }
+    if (ok && data && typeof data === 'object' && 'event_producer_id' in data) {
+      return { state: data as AppState, authError: '' }
+    }
+    return { state: null, authError: '' }
+  } catch {
+    // 网络错误 / 不是本服务（例如 Vite 开发服务器返回 HTML）：当作没有服务端。
+    return { state: null, authError: '' }
+  }
 }
 
 /**
- * 等待 pywebview 注入完成，完成握手并回放积压事件。
- * 开发态（纯浏览器）下返回一份静态 mock 状态，便于脱离 Python 调 UI。
+ * 建立桥接：优先 pywebview，其次网页版 HTTP，最后降级 mock。
+ *
+ * 网页版探测放在前面且很快返回，避免浏览器直开时白等 pywebview 的 10 秒注入窗口；
+ * 桌面端（file:// 或 Vite 开发服务器）探测一定失败，行为与以前一致。
  */
 export async function connectBridge(): Promise<ReadyResult> {
+  if (!window.pywebview?.api) {
+    const { state, authError } = await tryHttpHandshake()
+    if (state) {
+      transport = 'http'
+      adoptProducer(state.event_producer_id)
+      apiReady = true
+      for (const message of queued.splice(0)) dispatch(message)
+      return { state, mocked: false, transport, authError: '' }
+    }
+    if (authError) {
+      // 服务端在，但令牌不对：不能悄悄退化成 mock，否则用户会以为连上了。
+      return { state: mockState(), mocked: true, transport: 'mock', authError }
+    }
+  }
   if (!window.pywebview) {
     await new Promise<void>((resolve) => {
       // pywebview 6 GTK 的注入可能晚于首帧；10s 内未注入才降级 mock。
@@ -592,14 +794,16 @@ export async function connectBridge(): Promise<ReadyResult> {
   }
   if (!window.pywebview?.api) {
     // 浏览器直开（无 Python 壳）：提供 mock 状态方便样式开发。
+    transport = 'mock'
     apiReady = true
-    return { state: mockState(), mocked: true }
+    return { state: mockState(), mocked: true, transport, authError: '' }
   }
+  transport = 'pywebview'
   const state = await api().bridge_ready()
   adoptProducer(state.event_producer_id)
   apiReady = true
   for (const message of queued.splice(0)) dispatch(message)
-  return { state, mocked: false }
+  return { state, mocked: false, transport, authError: '' }
 }
 
 function mockState(): AppState {

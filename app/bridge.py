@@ -859,32 +859,46 @@ class Bridge:
     # ------------------------------------------------------------------
     # js_api：文件对话框与模板
     # ------------------------------------------------------------------
-    def choose_excel(self, mode: str = "order") -> dict[str, Any]:
+    def choose_excel(self, mode: str = "order", path: str = "") -> dict[str, Any]:
         """弹出文件选择框，返回 ``{"path": ..., "error": ...}``。
 
         ``error`` 由 :func:`_excel_field_error` 给出（空路径 / 文件不存在 / 后缀不是
         ``.xlsx``/``.xlsm``）。注意：只接受对话框返回 ``list``/``tuple`` 的情形。
-        """
-        import webview
 
-        result = self._window.create_file_dialog(
-            webview.OPEN_DIALOG, allow_multiple=False, file_types=FILE_DIALOG_FILTERS)
-        path = result[0] if isinstance(result, (list, tuple)) and result else ""
+        传入 ``path`` 时跳过系统对话框，直接校验该路径——网页版由浏览器端文件
+        浏览器选好路径后回填（WebView/pywebview 没有原生对话框可用），桌面端不传
+        该参数，行为与以前完全一致。
+        """
+        if not str(path or "").strip():
+            import webview
+
+            result = self._window.create_file_dialog(
+                webview.OPEN_DIALOG, allow_multiple=False, file_types=FILE_DIALOG_FILTERS)
+            path = result[0] if isinstance(result, (list, tuple)) and result else ""
+        else:
+            path = str(path).strip()
         error = _excel_field_error(path)
         return {"path": path, "error": error}
 
-    def new_template(self, mode: str = "order") -> dict[str, Any]:
+    def new_template(self, mode: str = "order", path: str = "") -> dict[str, Any]:
         """弹出保存框并生成空白模板（``mode="order"`` 生成排单表，否则生成闪时送表）。
 
         用户取消时返回 ``{"path": "", "error": ""}``（**不算错误**）；没有 Excel 后缀会
         自动补 ``.xlsx``；写盘失败返回 ``{"path": "", "error": "无法写入模板文件：…"}``。
-        """
-        import webview
 
+        传入 ``path`` 时跳过系统对话框，直接写到该路径——网页版由服务器的文件浏览器
+        给出手机上的落盘位置（客户端的文件系统不是运行任务的那台机器），桌面端不传该
+        参数，行为与以前完全一致。
+        """
         save_name = "排单.xlsx" if mode == "order" else "闪时送.xlsx"
-        result = self._window.create_file_dialog(
-            webview.SAVE_DIALOG, file_types=FILE_DIALOG_FILTERS, save_filename=save_name)
-        path = result if isinstance(result, str) else (result[0] if isinstance(result, (list, tuple)) and result else "")
+        if str(path or "").strip():
+            path = str(path).strip()
+        else:
+            import webview
+
+            result = self._window.create_file_dialog(
+                webview.SAVE_DIALOG, file_types=FILE_DIALOG_FILTERS, save_filename=save_name)
+            path = result if isinstance(result, str) else (result[0] if isinstance(result, (list, tuple)) and result else "")
         if not path:
             return {"path": "", "error": ""}
         dest = _with_excel_suffix(_Path(path))
@@ -1298,7 +1312,7 @@ class Bridge:
         import subprocess
         try:
             proc = subprocess.run(cli.login_argv(), capture_output=True, text=True,
-                                  timeout=330)
+                                  timeout=330, env=cli.login_env())
             out = (proc.stdout or "") + (proc.stderr or "")
             for line in out.splitlines():
                 if line.strip():

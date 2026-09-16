@@ -14,6 +14,7 @@ import {
   type OrderFormPayload,
   type SssFormPayload,
   type StatusState,
+  type Transport,
   type UpdateAvailable,
 } from '@/lib/bridge'
 
@@ -34,6 +35,10 @@ export type FieldErrors = Record<string, { message: string } | undefined>
 export interface AppStateBundle {
   ready: boolean
   mocked: boolean
+  /** 实际传输方式：桌面 pywebview / 网页版 HTTP / 无后端的 mock。 */
+  transport: Transport
+  /** 网页版令牌无效时的提示；非空时界面提示改用带令牌的完整网址。 */
+  authError: string
   version: string
   status: StatusState
   frozen: boolean

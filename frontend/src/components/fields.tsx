@@ -60,7 +60,9 @@ export function TextInput({
   return (
     <Input
       className={cn(
-        'h-[34px] rounded-[4px] border-transparent bg-secondary text-[13px] transition-colors focus-visible:bg-card',
+        // 手机上 34px 高够不到（触控目标需 ≥44px），字号也放大一档；
+        // sm 及以上回到规范冻结的 34px / 13px。
+        'h-[38px] rounded-[4px] border-transparent bg-secondary text-[13px] transition-colors focus-visible:bg-card sm:h-[34px]',
         state === 'valid' &&
           'border-success/50 bg-success/5 focus-visible:border-success focus-visible:ring-success/20',
         state === 'invalid' && 'border-destructive bg-destructive/5',
@@ -79,7 +81,7 @@ export function GhostButton({
     <Button
       variant="outline"
       className={cn(
-        'h-[34px] shrink-0 rounded-[4px] border-border bg-card px-3 text-xs text-foreground hover:border-primary hover:bg-card hover:text-primary-strong',
+        'h-[38px] shrink-0 rounded-[4px] border-border bg-card px-3 text-xs text-foreground hover:border-primary hover:bg-card hover:text-primary-strong sm:h-[34px]',
         className,
       )}
       {...props}
@@ -145,7 +147,7 @@ export function Stepper({
       <button
         type="button"
         aria-label="减少"
-        className="h-[34px] w-[30px] text-[15px] text-muted-foreground hover:bg-secondary hover:text-foreground"
+        className="h-[38px] w-[38px] sm:h-[34px] sm:w-[30px] text-[15px] text-muted-foreground hover:bg-secondary hover:text-foreground"
         onClick={() => step(-1)}
       >
         <Minus className="mx-auto size-3.5" />
@@ -153,7 +155,7 @@ export function Stepper({
       <input
         aria-label="待处理订单数"
         inputMode="numeric"
-        className="tabular h-[34px] w-11 border-x bg-transparent text-center font-mono text-[13px] outline-none"
+        className="tabular h-[38px] w-[38px] border-x sm:h-[34px] bg-transparent text-center font-mono text-[13px] outline-none"
         value={draft ?? (value === null ? '' : String(value))}
         onChange={(e) => {
           const raw = e.target.value.replace(/[^0-9]/g, '').slice(0, 4)
@@ -174,7 +176,7 @@ export function Stepper({
       <button
         type="button"
         aria-label="增加"
-        className="h-[34px] w-[30px] text-[15px] text-muted-foreground hover:bg-secondary hover:text-foreground"
+        className="h-[38px] w-[38px] sm:h-[34px] sm:w-[30px] text-[15px] text-muted-foreground hover:bg-secondary hover:text-foreground"
         onClick={() => step(1)}
       >
         <Plus className="mx-auto size-3.5" />
@@ -230,7 +232,7 @@ export function DateField({
           <button
             type="button"
             className={cn(
-              'flex h-[34px] flex-1 items-center rounded-[4px] border border-transparent bg-secondary px-2.5 text-left text-[13px] transition-colors hover:bg-secondary/80',
+              'flex h-[38px] flex-1 items-center sm:h-[34px] rounded-[4px] border border-transparent bg-secondary px-2.5 text-left text-[13px] transition-colors hover:bg-secondary/80',
               invalid && 'border-destructive bg-destructive/5',
               open && 'border-primary bg-card',
             )}

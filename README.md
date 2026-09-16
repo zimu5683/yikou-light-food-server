@@ -13,6 +13,56 @@
 默认使用**纯接口模式**：不启动浏览器，直接调用平台 HTTP 接口完成登录、读单和下单。
 界面里可关闭“纯接口模式”开关，回退到原来的 Playwright 浏览器模式作为备用。
 
+## 网页版（手机 / 服务器当主机）
+
+不想开原生窗口，或想把跑任务的那台机器当服务器、用**其它设备**（电脑、平板、另一台手机）
+打开网址来操作时，用网页版：
+
+```bash
+python run.py --web                  # 默认监听 0.0.0.0:8756（同一 WiFi 下其它设备可访问）
+python run.py --web --port 9000      # 换端口
+python run.py --web --host 127.0.0.1 # 只允许本机访问
+python run.py --web --new-token      # 轮换访问令牌
+```
+
+启动后终端会列出可直接点开的网址（含访问令牌），例如：
+
+```
+本机访问：   http://127.0.0.1:8756/?token=XXXX
+其它设备访问：http://10.103.85.74:8756/?token=XXXX  [wlan0]
+```
+
+把「其它设备访问」那条网址在电脑/平板上打开即可。网址里的 `?token=` 只要带一次，
+之后会被浏览器记住；令牌本身保存在用户配置目录的 `web_token`。
+
+### 和桌面版的区别
+
+- 页面由 `app/web_server.py` 提供：静态前端 + `POST /api/<方法名>` 调用与桌面端
+  **完全同一套** `app/bridge.py` 逻辑，事件仍然是「Python 追加 + 前端按 cursor 轮询」；
+- 没有原生窗口，所以标题栏不显示最小化/最大化，只有「停止服务」（＝关闭服务）；
+- **选择 Excel 文件**改用服务器端文件浏览器：任务在主机上跑，Excel 也在主机上，
+  所以浏览并选择的是**主机上的路径**，而不是打开网页那台设备的文件。
+
+### 安全须知（重要）
+
+网页版等于把这台机器的完整操作权限开放给「知道网址的人」——它能读取管理后台密码、
+使用 WPS 云文档授权、并真实下单。因此：
+
+- 令牌是唯一的防线，**不要把带令牌的网址发到群里 / 截图外发**；怀疑泄露就 `--new-token`；
+- 默认只监听局域网，**不要直接映射到公网**；需要在外网使用时，用 Tailscale/WireGuard
+  这类组网工具，或 `ssh -L 8756:127.0.0.1:8756` 端口转发，而不是做端口映射；
+- 服务只提供 HTTP（无 TLS），同局域网内理论上可被嗅探，公共 WiFi 下谨慎使用。
+
+### 手机（Termux）上长期当服务器的建议
+
+```bash
+pkg install termux-api        # 可选
+termux-wake-lock              # 防止息屏后 Termux 被系统挂起（服务会跟着断）
+termux-setup-storage          # 首次需要读取手机存储里的 Excel 时执行，并在弹窗里允许
+```
+
+不执行 `termux-setup-storage` 时文件浏览器打不开 `/sdcard`，会直接提示这条命令。
+
 ## 开发
 
 ```powershell
@@ -26,6 +76,52 @@ python run.py
 `fetch_browser.py` 只做一次即可；它优先复用本机 Playwright 缓存，缺失时才下载。开发态会依次在仓库根 `browser/` 和 `vendor/browser/` 中查找内置 Chromium，也可以用环境变量 `YIKOU_BROWSER_DIR` 指向别处。
 
 也可以在 Visual Studio 中打开仓库目录，将 `run.py` 设为启动文件并使用 Python 调试器。
+
+### 在 Termux（Android）上开发
+
+`--web` 模式不需要 GTK/WebKitGTK，也不需要 Playwright 浏览器，因此在手机上是完整可跑的：
+
+```bash
+pkg install python nodejs-lts git proot
+python -m venv --system-site-packages .venv
+.venv/bin/pip install openpyxl keyring requests pywebview   # --web 模式实际用到的依赖
+pkg install python-cryptography                             # cryptography 没有 Android 轮子，用 Termux 包
+cd frontend && pnpm install && pnpm build && cd ..           # 前端产物 frontend/dist/index.html
+.venv/bin/python run.py --web
+```
+
+已知限制：`playwright`（浏览器备用模式）与 `ruff==0.15.22` 在 Android 上没有可安装的包。
+前者只影响「关闭纯接口模式」的备用路径（纯接口模式默认开启，不受影响）；后者可用
+`pkg install ruff` 代替，但版本不同、默认规则集比 CI 更严，以 CI 结果为准。
+桌面端 `PyInstaller` 打包不能跨平台，Windows/macOS/Linux 发行包请在对应系统或
+GitHub Actions 上构建。
+
+### Termux 上的 kdocs-cli（云文档同步 / 闪时送云端名单）
+
+kdocs-cli 的 `linux-arm64` 版本是**静态链接**的 aarch64 二进制，能在 Android 上直接运行
+（`scripts/fetch_kdocs_cli.py` 或手动下载官方包放到 `vendor/kdocs-cli/kdocs-cli`）：
+
+```bash
+curl -L -o k.tar.gz https://wpsai.wpscdn.cn/skillhub/pro/v2.5.29/releases/kdocs-cli-2.5.29-linux-arm64.tar.gz
+sha256sum -c vendor/kdocs-cli/checksums.txt      # 校验
+tar xzf k.tar.gz -C vendor/kdocs-cli && chmod +x vendor/kdocs-cli/kdocs-cli
+```
+
+但**静态链接**意味着它不经过 Termux 对绝对路径的重写，在 Android 上必然踩两个坑，
+程序已自动处理（见 `app/wps_cloud.py` 的 `termux_cli_runtime()`）：
+
+| 症状 | 原因 | 处理 |
+|---|---|---|
+| `lookup ... on [::1]:53: connection refused` | 读不到 `/etc/resolv.conf`（Android 的 `/etc` 只读且没有它） | 用 `proot -b $PREFIX/etc/resolv.conf:/etc/resolv.conf` 包一层 |
+| `x509: certificate signed by unknown authority` | 读不到 `/etc/ssl/certs/ca-certificates.crt` | `SSL_CERT_FILE=$PREFIX/etc/tls/cert.pem` |
+| `SIGSYS: bad system call`（`auth login`） | Android seccomp 拦截 `faccessat2` | 同样靠 proot 接管系统调用 |
+
+因此 Termux 上 **`pkg install proot` 是云文档功能的硬依赖**。
+
+授权：界面上的「去授权」会跑 `kdocs-cli auth login`，把授权链接打进日志，在手机浏览器里
+打开确认即可。Android 没有系统密钥链，CLI 会自动退化为加密文件
+（`~/.config/kdocs-cli/token.enc`）。若已在电脑上授权过，也可以用
+`kdocs-cli auth set-token <token>` 直接导入 Token。
 
 ## Windows 构建
 

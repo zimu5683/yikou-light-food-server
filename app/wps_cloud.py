@@ -617,6 +617,38 @@ def effective_tables(config: Any) -> dict[str, dict[str, str]]:
     return active
 
 
+def termux_cli_runtime() -> tuple[list[str], dict[str, str]]:
+    """Termux/Android 上运行 kdocs-cli 需要的 (命令前缀, 额外环境变量)。
+
+    kdocs-cli 是**静态链接**的 linux/arm64 Go 程序，不经过 Termux 对绝对路径的
+    重写（那套机制依赖动态链接器），因此在 Android 上会遇到两个必然失败的问题：
+
+    1. 读不到 ``/etc/resolv.conf``。Android 的 ``/etc`` 是指向只读 ``/system/etc``
+       的符号链接，里面没有 resolv.conf；纯 Go 解析器因此退化成只查本机 DNS，
+       所有请求都以 ``lookup ... connection refused`` 失败。
+       用 ``proot`` 把 Termux 的 resolv.conf 绑定到 ``/etc/resolv.conf`` 解决。
+    2. 读不到 ``/etc/ssl/certs/ca-certificates.crt``（Termux 的 CA 包在
+       ``$PREFIX/etc/tls/cert.pem``），证书池为空，每个 HTTPS 请求都报
+       ``x509: certificate signed by unknown authority``。
+       用 ``SSL_CERT_FILE`` 指过去解决。
+
+    非 Termux 环境返回空前缀与空环境变量，桌面端行为完全不变。
+    """
+    prefix = os.environ.get("PREFIX", "")
+    if "com.termux" not in prefix:
+        return [], {}
+    extra_env: dict[str, str] = {}
+    ca_bundle = Path(prefix) / "etc" / "tls" / "cert.pem"
+    if ca_bundle.is_file():
+        extra_env["SSL_CERT_FILE"] = str(ca_bundle)
+    resolv_conf = Path(prefix) / "etc" / "resolv.conf"
+    proot = shutil.which("proot")
+    # 只有当系统真的缺 /etc/resolv.conf 时才套 proot（有则无需付出开销）。
+    if proot and resolv_conf.is_file() and not Path("/etc/resolv.conf").exists():
+        return [proot, "-b", f"{resolv_conf}:/etc/resolv.conf"], extra_env
+    return [], extra_env
+
+
 class KdocsCli:
     """kdocs-cli 的最小封装。"""
 
@@ -650,7 +682,9 @@ class KdocsCli:
         raise last_error
 
     def _run_once(self, *args: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        cmd = [self.path, *args]
+        # Termux/Android 需要 proot 绑 resolv.conf + SSL_CERT_FILE；桌面端两项都为空。
+        prefix, extra_env = termux_cli_runtime()
+        cmd = [*prefix, self.path, *args]
         if self.token:
             cmd += ["--token", self.token]
         tmp: str | None = None
@@ -662,7 +696,8 @@ class KdocsCli:
             cmd += ["--file", tmp]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=self.timeout)
+                                  timeout=self.timeout,
+                                  env={**os.environ, **extra_env} if extra_env else None)
         except FileNotFoundError as exc:
             raise WpsCloudError(f"无法执行 kdocs-cli：{exc}") from exc
         except subprocess.TimeoutExpired as exc:
@@ -724,8 +759,19 @@ class KdocsCli:
             return False
 
     def login_argv(self) -> list[str]:
-        """返回可交给调用方在终端/新窗口里执行的授权命令。"""
-        return [self.path, "auth", "login"]
+        """返回可交给调用方在终端/新窗口里执行的授权命令。
+
+        在 Termux/Android 上会带上 ``proot`` 前缀：``auth login`` 原本会因 Android
+        seccomp 拦截 ``faccessat2`` 而以 ``SIGSYS: bad system call`` 崩溃，
+        proot 接管系统调用后即可正常走完 OAuth 流程。
+        """
+        prefix, _ = termux_cli_runtime()
+        return [*prefix, self.path, "auth", "login"]
+
+    def login_env(self) -> dict[str, str] | None:
+        """授权命令需要的环境变量（Termux 下需要 ``SSL_CERT_FILE``），无需时返回 None。"""
+        _, extra_env = termux_cli_runtime()
+        return {**os.environ, **extra_env} if extra_env else None
 
     # ---- 表格读写 ----
 

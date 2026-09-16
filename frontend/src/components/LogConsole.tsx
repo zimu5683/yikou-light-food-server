@@ -62,10 +62,18 @@ export function LogConsole() {
   const { label: badgeLabel, live } = statusBadgeMeta(status)
 
   return (
-    <section className="flex min-h-0 flex-1 flex-col px-5 pb-4 pt-4">
-      <div className="flex items-center gap-2.5">
-        <h2 className="font-serif text-base font-semibold tracking-[1px]">运行日志</h2>
-        <span className="inline-flex h-6 items-center gap-1.5 rounded-[2px] border bg-card px-2 text-xs font-medium">
+    <section className="flex min-h-0 flex-1 flex-col px-3 pb-3 pt-4 sm:px-5 sm:pb-4">
+      {/*
+        这一行原来是不换行的单行 flex，窄屏（手机）时会被挤爆：
+        「运行日志」没有 shrink-0，被压到近 0 宽后 CJK 字符只能逐个换行，
+        于是标题变成竖排；固定 w-44 的过滤框又和三个按钮抢空间。
+        改成 flex-wrap 分三行排：标题+状态 / 过滤框整行 / 工具按钮。
+      */}
+      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-2">
+        <h2 className="shrink-0 whitespace-nowrap font-serif text-base font-semibold tracking-[1px]">
+          运行日志
+        </h2>
+        <span className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-[2px] border bg-card px-2 text-xs font-medium">
           <span
             className={cn(
               'size-[7px] rounded-[1px] bg-primary',
@@ -74,20 +82,20 @@ export function LogConsole() {
           />
           {badgeLabel}
         </span>
-        <div className="ml-auto flex items-center gap-1.5">
-          <Input
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            placeholder="过滤日志…"
-            className="h-7 w-44 rounded-[4px] border-border bg-card text-xs"
-          />
+        <Input
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          placeholder="过滤日志…"
+          className="h-8 w-full rounded-[4px] border-border bg-card text-xs sm:ml-auto sm:h-7 sm:w-44"
+        />
+        <div className="flex items-center gap-1.5">
           <ToolButton onClick={copyAll} label="复制日志">
             <Copy className="size-3.5" />
-            复制
+            <span className="hidden sm:inline">复制</span>
           </ToolButton>
           <ToolButton onClick={clearLogs} label="清空日志">
             <Eraser className="size-3.5" />
-            清空
+            <span className="hidden sm:inline">清空</span>
           </ToolButton>
           <ToolButton
             onClick={() => setAutoscroll((v) => !v)}
@@ -95,7 +103,7 @@ export function LogConsole() {
             label="自动滚动"
           >
             <ArrowDownToLine className="size-3.5" />
-            自动滚动
+            <span className="hidden sm:inline">自动滚动</span>
           </ToolButton>
         </div>
       </div>
@@ -104,7 +112,7 @@ export function LogConsole() {
         <div className="receipt-tear" />
         <div
           ref={paperRef}
-          className="receipt-paper min-h-0 flex-1 select-text overflow-y-auto border-x bg-card py-2.5 font-mono text-xs"
+          className="receipt-paper scroll-contain min-h-0 flex-1 select-text overflow-y-auto border-x bg-card py-2.5 font-mono text-xs"
         >
           {filtered.length === 0 && !addressInput && (
             <p className="px-4 py-6 text-center text-[11px] text-ink-faint">
@@ -260,7 +268,7 @@ function ToolButton({
       title={label}
       aria-label={label}
       className={cn(
-        'inline-flex h-7 items-center gap-1 rounded-[4px] border px-2 text-xs transition-colors',
+        'touch-target inline-flex h-8 items-center gap-1 rounded-[4px] border px-2.5 text-xs transition-colors sm:h-7 sm:px-2',
         active
           ? 'border-primary bg-primary-soft text-primary-strong'
           : 'border-border bg-card text-muted-foreground hover:border-primary hover:text-foreground',

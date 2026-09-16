@@ -16,6 +16,12 @@
   --popover-foreground: #2a241c;
   --primary: #7a5a3a; /* 全麦棕 */
   --primary-foreground: #ffffff;
+  /* DESIGN-WEB §5 冻结 token 规定了下面两个值，但一直没落到 CSS 上，
+     导致 bg-primary-soft / text-primary-strong / hover:bg-primary-strong
+     共 8 处引用全部解析为空：模式 tab 的选中态与悬停态、主按钮 hover、
+     日志筛选选中态、无命中提示框底色。 */
+  --primary-strong: #6b4e31; /* primary 悬停 */
+  --primary-soft: #f0e6d8; /* 选中态底、开关底 */
   --secondary: #efe8dd; /* 麸皮 */
   --secondary-foreground: #2a241c;
   --muted: #efe8dd;
@@ -48,6 +54,8 @@
   --popover-foreground: #f3ede3;
   --primary: #a67b4f; /* 棕金 */
   --primary-foreground: #ffffff;
+  --primary-strong: #b98a5c; /* primary 悬停（深色） */
+  --primary-soft: #3a2f22; /* 选中态底（深色） */
   --secondary: #2e271d;
   --secondary-foreground: #f3ede3;
   --muted: #2e271d;
@@ -119,7 +127,8 @@
   }
   body {
     @apply bg-background text-foreground font-sans antialiased select-none;
-    font-size: 13px;
+    /* 用 rem 而不是写死 13px：桌面仍是 13px（16px 根字号），手机上随根字号一起放大 */
+    font-size: 0.8125rem;
     line-height: 1.5;
   }
   input,
@@ -184,4 +193,51 @@
 /* 小票纸投影 */
 .receipt-paper {
   box-shadow: 0 6px 14px -10px var(--receipt-edge);
+}
+
+/* ============================================================
+   响应式基础 —— 网页版要同时跑在手机和电脑上
+   ------------------------------------------------------------
+   规范冻结的是桌面窗口（13px 正文、≥36px 触达目标、无边框窗口）。
+   搬到浏览器后只需补三件事：按屏宽缩放字号、手指够用的触控目标、
+   刘海/手势条安全区。色板、圆角、小票语言一律不动。
+   ============================================================ */
+
+html {
+  /* 所有 rem 类（text-xs/sm/base、间距）以它为基准缩放。
+     手机与桌面统一 16px：规范冻结的就是这套紧凑密度（正文 13px、
+     信息密度优先），手机上单独放大反而显得笨重。 */
+  font-size: 16px;
+  -webkit-text-size-adjust: 100%; /* 横屏时禁止浏览器再放大一次 */
+}
+
+/* 手机浏览器：height:100% 按「大视口」计算，底部会被地址栏/手势条盖住；
+   而本应用是整屏不滚动的布局，被盖住就等于看不全。dvh 跟随实际可见高度。 */
+@supports (height: 100dvh) {
+  html,
+  body,
+  #root {
+    height: 100dvh;
+  }
+}
+
+/* 安全区（刘海屏 / 手势条 / 圆角屏） */
+:root {
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+}
+
+/* 触控目标：规范要求桌面 ≥36px。手指操作给 38px——比桌面略大够点准，
+   但不采用 44px 那档，否则整页会明显变笨重。 */
+@media (pointer: coarse) {
+  .touch-target {
+    min-height: 38px;
+  }
+}
+
+/* 内部滚动容器不要把滚动传给页面（手机上容易误触下拉刷新） */
+.scroll-contain {
+  overscroll-behavior: contain;
 }

@@ -29,6 +29,7 @@ import {
   type SssFormPayload,
   type StatusState,
   type BridgeEvent,
+  type Transport,
   type UpdateAvailable,
 } from '@/lib/bridge'
 
@@ -44,6 +45,8 @@ import {
 export function AppProvider({ children }: { children: ReactNode }) {
   const [ready, setReady] = useState(false)
   const [mocked, setMocked] = useState(false)
+  const [transport, setTransport] = useState<Transport>('mock')
+  const [authError, setAuthError] = useState('')
   const [version, setVersion] = useState('')
   const [status, setStatus] = useState<StatusState>('ready')
   const [frozen, setFrozen] = useState(false)
@@ -65,10 +68,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
   // ---- 桥接握手 ----
   useEffect(() => {
     let active = true
-    connectBridge().then(({ state, mocked }) => {
+    connectBridge().then(({ state, mocked, transport, authError }) => {
       if (!active) return
       setReady(true)
       setMocked(mocked)
+      setTransport(transport)
+      setAuthError(authError)
       setVersion(state.version)
       setStatus(state.status)
       setFrozen(state.frozen)
@@ -289,6 +294,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     () => ({
       ready,
       mocked,
+      transport,
+      authError,
       version,
       status,
       frozen,
@@ -319,9 +326,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       resolveCaptcha,
       resolveAddressInput,
     }),
-    [ready, mocked, version, status, frozen, config, passwords, logs, decision,
-      updateProgress, mode, captcha, addressInput, startOrder, startSss, stopTask, chooseExcel,
-      newTemplate, checkBrowser, clearPassword, checkUpdates, installUpdate,
+    [ready, mocked, transport, authError, version, status, frozen, config, passwords, logs,
+      decision, updateProgress, mode, captcha, addressInput, startOrder, startSss, stopTask,
+      chooseExcel, newTemplate, checkBrowser, clearPassword, checkUpdates, installUpdate,
       openExternal, requestClose, setSplitRatio, clearLogs, resolveDecision, resolveCaptcha,
       resolveAddressInput],
   )

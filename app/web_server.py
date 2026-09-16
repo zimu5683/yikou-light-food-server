@@ -1,0 +1,895 @@
+"""网页版服务器：把 pywebview 的 js_api 桥接层暴露成 HTTP 接口。
+
+用途：把运行任务的机器（例如 Termux 手机）当服务器，其他设备用浏览器打开网址
+即可操作本项目全部任务（订单处理 / 云文档同步 / 闪时送下单）。
+
+设计要点：
+
+* **直接复用** :class:`app.bridge.Bridge` 的全部公开方法，不复制业务逻辑；桌面端
+  pywebview 路径完全不变。
+* **不需要 WebSocket/SSE**：桥接层的事件通道本来就是「Python 只追加 + 前端用
+  ``last_sequence`` 轮询 ``drain_events`` 并 ACK」的设计（见 ``bridge.py`` 顶部注释），
+  天然适配 HTTP 请求/响应。
+* **不使用全局调用锁**：交互式流程（验证码 / 决策 / 地址补录）要求 worker 线程阻塞
+  等待的同时，另一个请求还能调用 ``resolve_*``；加全局锁会直接死锁。因此沿用
+  Bridge 自身的锁与 worker 生命周期模型。
+* **强制令牌鉴权**：本应用持有管理后台密码、WPS 云文档授权，并能真实下单，因此
+  ``/api/*`` 一律要求令牌；未授权请求返回 401。
+
+文件对话框：网页版没有原生对话框，改用**服务器端文件浏览器**（``/api/fs/list``）——
+客户端选中的必须是运行任务那台机器上的路径，而不是客户端自己的文件系统。
+"""
+from __future__ import annotations
+
+import json
+import mimetypes
+import os
+import secrets
+import socket
+import sys
+import threading
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
+
+from . import __version__, web_pages
+from .bridge import Bridge
+from .config import user_data_dir
+from .web_auth import (ROLE_ADMIN, AccessVerifier, AuthError, AuthStore,
+                       access_verifier_from_env, default_auth_dir)
+
+#: 默认端口。选一个不常用的高位端口，避免和 Termux 里其它服务撞车。
+DEFAULT_PORT = 8756
+
+#: 不通过 HTTP 暴露的方法：attach 需要真实窗口对象，on_native_closing 是
+#: pywebview 的关闭事件回调，走 HTTP 没有意义。
+_NON_HTTP = frozenset({"attach", "on_native_closing"})
+
+#: 文件浏览器默认展示的根目录候选（按存在与否过滤）。
+_BROWSE_ROOTS = (
+    "/sdcard",
+    "/storage/emulated/0",
+    "/storage/emulated/0/Download",
+    "/storage/emulated/0/Documents",
+)
+
+#: Excel 相关后缀，供文件浏览器过滤。
+EXCEL_SUFFIXES = frozenset({".xlsx", ".xlsm", ".xls"})
+
+#: 会话 Cookie 名。HttpOnly 由服务端设置，前端不需要（也不能）读取它。
+SESSION_COOKIE = "yikou_session"
+
+#: 免登录路径：探活、登录页、提交登录/注册、登出。
+_PUBLIC_PATHS = frozenset({"/healthz", "/login", "/logout"})
+
+#: 角色为管理员才可访问的路径。
+_ADMIN_PATHS = frozenset({"/admin"})
+
+#: 网关转发过来的请求会带这些头。用于区分「本地直连」与「公网入口」。
+_PROXY_HEADERS = ("cf-connecting-ip", "cf-ray", "x-forwarded-for", "x-forwarded-proto")
+
+
+class WebServerError(RuntimeError):
+    """网页版启动失败（端口占用、前端产物缺失等）。"""
+
+
+# ----------------------------------------------------------------------
+# 令牌
+# ----------------------------------------------------------------------
+def _token_path() -> Path:
+    return user_data_dir() / "web_token"
+
+
+def load_or_create_token(rotate: bool = False) -> str:
+    """读取访问令牌，缺失或被要求轮换时新建一个并落盘。
+
+    持久化是为了让客户端设备能收藏一个稳定的网址；权限收紧到 ``0o600``。
+    """
+    path = _token_path()
+    if not rotate:
+        try:
+            existing = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            existing = ""
+        if existing:
+            return existing
+    token = secrets.token_urlsafe(24)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(token + "\n", encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        # Android 的部分挂载点不支持 chmod；令牌文件仍受应用私有目录保护。
+        pass
+    return token
+
+
+# ----------------------------------------------------------------------
+# 网络信息
+# ----------------------------------------------------------------------
+def _interface_addresses() -> list[tuple[str, str]]:
+    """枚举各网卡的 IPv4 地址。
+
+    Android 上 ``ifconfig`` 读不到 ``/proc/net/dev``（Permission denied），
+    因此用 ioctl ``SIOCGIFADDR`` 直接问内核要地址。
+    """
+    import fcntl
+    import struct
+
+    siocgifaddr = 0x8915
+    found: list[tuple[str, str]] = []
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for _, name in socket.if_nameindex():
+            if name == "lo":
+                continue
+            try:
+                packed = fcntl.ioctl(
+                    sock.fileno(), siocgifaddr, struct.pack("256s", name.encode()[:15]))
+            except OSError:
+                # 网卡没有 IPv4 地址（未连接 / 蜂窝数据未分配地址）时跳过。
+                continue
+            found.append((name, socket.inet_ntoa(packed[20:24])))
+    except OSError:
+        pass
+    finally:
+        sock.close()
+    return found
+
+
+def lan_addresses() -> list[tuple[str, str]]:
+    """按「客户端最可能连得上」的顺序返回候选地址。
+
+    WiFi（wlan0）优先，其次以太网/热点，``tun*``（VPN）排最后——只有同样在该
+    VPN 里的设备才连得上。**不能用默认路由探测来选地址**：本机默认路由走 VPN，
+    探测出来的 172.19.x.x 是其它设备根本连不上的地址。
+    """
+    candidates = _interface_addresses()
+    if not candidates:
+        return []
+    preferred = {"wlan0": 0, "eth0": 1, "ap0": 2, "rndis0": 3, "wlan1": 4}
+
+    def rank(item: tuple[str, str]) -> tuple[int, str]:
+        name = item[0]
+        if name.startswith(("tun", "ppp")):
+            return (9, name)
+        return (preferred.get(name, 5), name)
+
+    return sorted(candidates, key=rank)
+
+
+# ----------------------------------------------------------------------
+# 顶替 pywebview 的窗口对象
+# ----------------------------------------------------------------------
+class _WebWindow:
+    """只实现 :class:`Bridge` 真正用到的少量窗口方法。
+
+    Bridge 对窗口的依赖仅有：``create_file_dialog``（网页版改为前端选路径，
+    见 :meth:`Bridge.choose_excel` 的 ``path`` 参数）、``destroy``（关闭服务）、
+    ``minimize``/``restore``/``maximize``（浏览器里没有意义，空实现）。
+    """
+
+    def __init__(self, on_destroy: Any = None) -> None:
+        self.uid = "web"
+        self._on_destroy = on_destroy
+        self._closed = threading.Event()
+
+    def create_file_dialog(self, *args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        """网页版没有原生文件对话框，返回空选择让调用方走提示分支。"""
+        return ()
+
+    def destroy(self) -> None:
+        """关闭服务：由 request_close / 更新安装完成后调用。"""
+        if self._closed.is_set():
+            return
+        self._closed.set()
+        if self._on_destroy is not None:
+            self._on_destroy()
+
+    def minimize(self) -> None:
+        """浏览器标签页无法由服务端最小化，空实现。"""
+
+    def restore(self) -> None:
+        """同上。"""
+
+    def maximize(self) -> None:
+        """同上。"""
+
+
+# ----------------------------------------------------------------------
+# HTTP 处理
+# ----------------------------------------------------------------------
+class _Handler(BaseHTTPRequestHandler):
+    server_version = f"yikou-light-food/{__version__}"
+    protocol_version = "HTTP/1.1"
+
+    # -- 基础设施 ------------------------------------------------------
+    def log_message(self, fmt: str, *args: Any) -> None:
+        """默认实现往 stderr 刷每一条请求；轮询 drain_events 会淹没终端，故静音。"""
+
+    @property
+    def _bridge(self) -> Bridge:
+        return self.server.bridge  # type: ignore[attr-defined]
+
+    @property
+    def _dist(self) -> Path:
+        return self.server.dist_dir  # type: ignore[attr-defined]
+
+    def _drain_body(self) -> None:
+        """回错误前把未读取的请求体读掉。
+
+        keep-alive 下如果直接回响应而留下未读 body，剩余字节会被当成下一个请求，
+        导致后续请求整体错位。
+        """
+        if self._body_read:
+            return
+        self._body_read = True
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length > 0:
+            try:
+                self.rfile.read(length)
+            except OSError:
+                pass
+
+    def _send_bytes(self, body: bytes, status: int = 200,
+                    content_type: str = "application/octet-stream",
+                    extra_headers: dict[str, str] | None = None) -> None:
+        self._drain_body()
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _send_json(self, payload: Any, status: int = 200) -> None:
+        body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+        self._send_bytes(body, status, "application/json; charset=utf-8")
+
+    def _send_error_json(self, status: int, message: str, code: str = "") -> None:
+        self._send_json({"error": message, "code": code or f"http_{status}"}, status)
+
+    # -- 账号与会话 ----------------------------------------------------
+    @property
+    def _auth(self) -> AuthStore:
+        return self.server.auth  # type: ignore[attr-defined]
+
+    @property
+    def _access(self) -> AccessVerifier:
+        return self.server.access  # type: ignore[attr-defined]
+
+    @property
+    def _is_proxied(self) -> bool:
+        """请求是否经网关（Cloudflare 隧道）进来。
+
+        这个判断决定旧令牌还能不能用：旧令牌是单一静态口令，一旦允许它在公网入口
+        生效，就等于绕过了整套「申请-审批」流程。因此它只对本地/局域网直连有效。
+        """
+        return any(self.headers.get(h) for h in _PROXY_HEADERS)
+
+    def _cookie_token(self) -> str:
+        raw = self.headers.get("Cookie", "")
+        for part in raw.split(";"):
+            name, sep, value = part.strip().partition("=")
+            if sep and name == SESSION_COOKIE:
+                return value.strip()
+        return ""
+
+    def _supplied_token(self) -> str:
+        """客户端提供的凭据：先看请求头，再看会话 Cookie，最后看查询串。"""
+        supplied = (self.headers.get("X-Yikou-Token") or "").strip()
+        if supplied:
+            return supplied
+        if cookie := self._cookie_token():
+            return cookie
+        query = parse_qs(urlparse(self.path).query)
+        return (query.get("token") or [""])[0].strip()
+
+    def _legacy_token_ok(self) -> bool:
+        """旧的静态令牌：仅本地直连有效，且公网入口一律不认。"""
+        expected = self.server.token  # type: ignore[attr-defined]
+        if not expected or self._is_proxied:
+            return False
+        supplied = (self.headers.get("X-Yikou-Token") or "").strip()
+        if not supplied:
+            supplied = (parse_qs(urlparse(self.path).query).get("token") or [""])[0].strip()
+        return bool(supplied) and secrets.compare_digest(supplied, expected)
+
+    def _current_user(self) -> Any:
+        """把请求凭据解析成账号；会话（账号体系）优先，其次本地旧令牌。"""
+        supplied = self._supplied_token()
+        if supplied:
+            user = self._auth.resolve_session(supplied)
+            if user is not None:
+                return user
+        if self._legacy_token_ok():
+            return _LegacyTokenUser()
+        return None
+
+    def _wants_json(self, path: str) -> bool:
+        """/api/* 一律给 JSON；页面请求给可读的 HTML/重定向。"""
+        return path.startswith("/api/") or "application/json" in (self.headers.get("Accept") or "")
+
+    def _safe_next(self, value: str) -> str:
+        """只接受站内相对路径，避免 ``next=//evil.com`` 型开放重定向。"""
+        value = (value or "").strip()
+        if not value.startswith("/") or value.startswith("//"):
+            return "/"
+        return value
+
+    def _session_cookie(self, token: str, *, clear: bool = False) -> str:
+        parts = [f"{SESSION_COOKIE}=", "Path=/", "HttpOnly", "SameSite=Lax"]
+        if clear:
+            parts[0] = f"{SESSION_COOKIE}="
+            parts.append("Max-Age=0")
+        else:
+            parts[0] = f"{SESSION_COOKIE}={token}"
+            parts.append(f"Max-Age={SESSION_TTL_SECONDS}")
+        if self._is_secure_request():
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def _is_secure_request(self) -> bool:
+        proto = (self.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+        return proto == "https"
+
+    # -- 路由拦截 ------------------------------------------------------
+    def handle_one_request(self) -> None:
+        """在分发到 do_GET/do_POST 之前统一做鉴权。
+
+        放在这里（而不是各个 do_* 里）是因为这是所有请求的唯一必经之路：新增任何
+        路由都不会绕过鉴权，这正是「公网暴露」场景最需要的默认安全。
+        """
+        try:
+            self.raw_requestline = self.rfile.readline(65537)
+        except (OSError, ValueError):
+            self.close_connection = True
+            return
+        if not self.raw_requestline:
+            self.close_connection = True
+            return
+        if not self.parse_request():
+            return
+        # parse_request 把头部读掉了，但 do_* 还要再读一次：回填原始字节。
+        self.rfile = io.BytesIO(self.raw_requestline + self.headers.as_bytes())
+
+        path = urlparse(self.path).path
+        if path not in _PUBLIC_PATHS and self._current_user() is None:
+            self._reject_unauthenticated(path)
+            return
+        self._dispatch()
+
+    def _dispatch(self) -> None:
+        """等价于 BaseHTTPRequestHandler 的默认 ``method()`` 调用。"""
+        method = getattr(self, "do_" + self.command, None)
+        if method is None:
+            self.send_error(HTTPStatus.NOT_IMPLEMENTED, "Unsupported method (%r)" % self.command)
+            return
+        method()
+
+    def _reject_unauthenticated(self, path: str) -> None:
+        if self._wants_json(path):
+            self._send_error_json(
+                HTTPStatus.UNAUTHORIZED,
+                "需要登录：请先在 /login 登录后再操作",
+                "login_required",
+            )
+            return
+        self._send_redirect("/login?next=" + quote(path, safe=""))
+
+    def _access_ok(self) -> bool:
+        """管理页的 Cloudflare Access 校验。
+
+        未配置（``self._access.enabled`` 为假）时返回 True，即「暂时只靠账号密码”；
+        配置之后就变成强制项 —— 目的是让「忘记配置」表现为不可用，而不是静默放开。
+        """
+        verifier = self._access
+        if not verifier.enabled:
+            return True
+        email = verifier.verify(self.headers.get("Cf-Access-Jwt-Assertion", ""))
+        if email:
+            self._access_email = email
+            return True
+        return False
+
+    # -- 页面 ----------------------------------------------------------
+    def _send_html(self, body: str, status: int = 200) -> None:
+        self._send_bytes(body.encode("utf-8"), status, "text/html; charset=utf-8",
+                         {"Cache-Control": "no-store",
+                          "Content-Security-Policy":
+                              "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
+                              "base-uri 'none'; frame-ancestors 'none'",
+                          "Referrer-Policy": "no-referrer"})
+
+    def _send_redirect(self, location: str) -> None:
+        self._send_bytes(b"", HTTPStatus.FOUND, "text/plain; charset=utf-8",
+                         {"Location": location, "Cache-Control": "no-store"})
+
+    def _read_form(self) -> dict[str, str]:
+        """读取 ``application/x-www-form-urlencoded`` 表单体。"""
+        self._body_read = True
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        # 表单很小，1MB 上限足以防住恶意的超大请求体。
+        raw = self.rfile.read(min(length, 1 << 20)) if length > 0 else b""
+        try:
+            parsed = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+        except UnicodeDecodeError:
+            return {}
+        return {k: (v[0] if v else "") for k, v in parsed.items()}
+
+    def _client_ip(self) -> str:
+        forwarded = (self.headers.get("CF-Connecting-IP")
+                     or self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        return forwarded or self.client_address[0]
+
+    def _serve_login(self) -> None:
+        """登录页。已登录的人直接送回应用，不必重复登录。"""
+        if self._current_user() is not None:
+            self._send_redirect("/")
+            return
+        query = parse_qs(urlparse(self.path).query)
+        error = (query.get("error") or [""])[0]
+        notice = (query.get("notice") or [""])[0]
+        next_url = self._safe_next((query.get("next") or ["/"])[0])
+        self._send_html(web_pages.login_page(
+            error=error, notice=notice, next_url=next_url,
+            pending_count=self._auth.pending_count(),
+        ))
+
+    def _serve_logout(self) -> None:
+        self._auth.close_session(self._supplied_token())
+        self._send_bytes(b"", HTTPStatus.FOUND, "text/plain; charset=utf-8",
+                         {"Location": "/login?notice=" + quote("已退出登录"),
+                          "Set-Cookie": self._session_cookie("", clear=True),
+                          "Cache-Control": "no-store"})
+
+    def _handle_login_post(self) -> None:
+        """处理登录 / 注册表单提交。"""
+        form = self._read_form()
+        action = (form.get("action") or "login").strip()
+        next_url = self._safe_next(form.get("next") or "/")
+        username = (form.get("username") or "").strip()
+        password = form.get("password") or ""
+
+        try:
+            if action == "register":
+                user, auto = self._auth.register(
+                    username, password, invite_code=form.get("invite_code") or "",
+                    remote=self._client_ip())
+                notice = ("注册成功，已凭邀请码直接通过，请登录。" if auto
+                          else "访问申请已提交，请等待管理员批准后再登录。")
+                self._send_redirect("/login?next=" + quote(next_url, safe="")
+                                    + "&notice=" + quote(notice))
+                return
+            user = self._auth.authenticate(username, password, remote=self._client_ip())
+        except AuthError as exc:
+            self._send_redirect("/login?next=" + quote(next_url, safe="")
+                                + "&error=" + quote(str(exc)))
+            return
+
+        session = self._auth.open_session(user.username, remote=self._client_ip())
+        self._send_bytes(b"", HTTPStatus.FOUND, "text/plain; charset=utf-8",
+                         {"Location": next_url,
+                          "Set-Cookie": self._session_cookie(session.token),
+                          "Cache-Control": "no-store"})
+
+    # -- 管理员审批页 --------------------------------------------------
+    def _serve_admin(self) -> None:
+        user = self._current_user()
+        if user is None:
+            self._reject_unauthenticated("/admin")
+            return
+        if not getattr(user, "is_admin", False) or user.username != "cli-recovery":
+            self._send_html(web_pages.denied_page(
+                title="无权访问审批页",
+                message="当前账号不是管理员，无法审批访问申请。",
+                username=user.username), HTTPStatus.FORBIDDEN)
+            return
+        if not self._access_ok():
+            # Access 已配置但验签失败：直连源站或在 Cloudflare 之外，拒绝。
+            self._send_html(web_pages.denied_page(
+                title="请通过 Cloudflare Access 访问",
+                message="此页面要求通过 Cloudflare Access 邮箱验证。"
+                        "请从管理子域正常访问。",
+                username=user.username), HTTPStatus.FORBIDDEN)
+            return
+        self._render_admin(user)
+
+    def _render_admin(self, user: Any, *, error: str = "", notice: str = "") -> None:
+        self._send_html(web_pages.admin_page(
+            actor=user.username,
+            pending=[u.public() for u in self._auth.list_users(STATUS_PENDING)],
+            users=[u.public() for u in self._auth.list_users()],
+            invites=self._auth.list_invites(),
+            error=error, notice=notice,
+            access_email=getattr(self, "_access_email", ""),
+            access_enabled=self._access.enabled,
+        ))
+
+    def _handle_admin_post(self) -> None:
+        """审批页的表单动作：同意 / 拒绝 / 建邀请码 / 停用邀请码 / 改密码。"""
+        user = self._current_user()
+        if user is None or not getattr(user, "is_admin", False):
+            self._reject_unauthenticated("/admin")
+            return
+        if not self._access_ok():
+            self._send_html(web_pages.denied_page(
+                title="请通过 Cloudflare Access 访问",
+                message="此页面要求通过 Cloudflare Access 邮箱验证。",
+                username=user.username), HTTPStatus.FORBIDDEN)
+            return
+
+        form = self._read_form()
+        action = (form.get("action") or "").strip()
+        target = (form.get("username") or "").strip()
+        notice = ""
+        try:
+            if action == "approve":
+                self._auth.approve(target, by=user.username)
+                notice = f"已批准 {target}"
+            elif action == "reject":
+                self._auth.reject(target, by=user.username)
+                notice = f"已拒绝 {target}"
+            elif action == "new_invite":
+                try:
+                    max_uses = max(1, int(form.get("max_uses") or 1))
+                except ValueError:
+                    max_uses = 1
+                invite = self._auth.create_invite(created_by=user.username,
+                                                  max_uses=max_uses,
+                                                  note=form.get("note") or "")
+                notice = f"邀请码已生成：{invite['code']}"
+            elif action == "revoke_invite":
+                self._auth.revoke_invite(form.get("code") or "")
+                notice = "邀请码已停用"
+            elif action == "change_password":
+                self._auth.set_password(user.username, form.get("password") or "",
+                                        by=user.username)
+                # 改密后旧会话全部失效，需要重新登录一次。
+                self._send_redirect("/login?notice=" + quote("密码已更新，请重新登录"))
+                return
+            else:
+                error = "未知操作"
+                self._render_admin(user, error=error)
+                return
+        except AuthError as exc:
+            self._render_admin(user, error=str(exc))
+            return
+        self._render_admin(user, notice=notice)
+
+    # -- 鉴权 ----------------------------------------------------------
+    def _token_ok(self) -> bool:
+        expected = self.server.token  # type: ignore[attr-defined]
+        if not expected:
+            return True
+        supplied = self.headers.get("X-Yikou-Token", "")
+        if not supplied:
+            query = parse_qs(urlparse(self.path).query)
+            supplied = (query.get("token") or [""])[0]
+        # 常量时间比较；长度不同直接返回 False。
+        return bool(supplied) and secrets.compare_digest(supplied, expected)
+
+    def _require_token(self) -> bool:
+        if self._token_ok():
+            return True
+        self._send_error_json(
+            HTTPStatus.UNAUTHORIZED,
+            "缺少或错误的访问令牌：请在网址后加 ?token=<令牌> 打开页面",
+            "unauthorized",
+        )
+        return False
+
+    # -- 路由 ----------------------------------------------------------
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 要求的命名
+        self._body_read = False
+        route = urlparse(self.path).path
+        if route == "/healthz":
+            # 免鉴权的最小连通性探测：只回答「服务活着」，不泄露任何状态。
+            self._send_json({"ok": True})
+            return
+        if route == "/api/fs/list":
+            if not self._require_token():
+                return
+            self._handle_fs_list()
+            return
+        if route.startswith("/api/"):
+            self._send_error_json(HTTPStatus.METHOD_NOT_ALLOWED, "桥接方法请用 POST 调用", "use_post")
+            return
+        self._serve_static(route)
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        self.do_GET()
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._body_read = False
+        route = urlparse(self.path).path
+        if not route.startswith("/api/"):
+            self._send_error_json(HTTPStatus.NOT_FOUND, "未知路径", "not_found")
+            return
+        if not self._require_token():
+            return
+        name = route[len("/api/"):].strip("/")
+        if name == "fs/list":
+            self._handle_fs_list()
+            return
+        self._handle_bridge_call(name)
+
+    # -- 静态文件 ------------------------------------------------------
+    def _serve_static(self, route: str) -> None:
+        rel = unquote(route).lstrip("/") or "index.html"
+        dist = self._dist.resolve()
+        try:
+            candidate = (dist / rel).resolve()
+        except (OSError, RuntimeError):
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "非法路径", "bad_path")
+            return
+        # 目录穿越防护：解析后必须仍在 dist 之内。
+        if candidate != dist and dist not in candidate.parents:
+            self._send_error_json(HTTPStatus.FORBIDDEN, "越权路径", "forbidden")
+            return
+        if candidate.is_dir():
+            candidate = candidate / "index.html"
+        if not candidate.is_file():
+            self._send_error_json(HTTPStatus.NOT_FOUND, "文件不存在", "not_found")
+            return
+        try:
+            body = candidate.read_bytes()
+        except OSError as exc:
+            self._send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, f"读取失败：{exc}", "read_failed")
+            return
+        ctype = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+        if ctype.startswith("text/") or ctype in {"application/javascript", "application/json"}:
+            ctype += "; charset=utf-8"
+        # index.html 不缓存：重新构建前端后刷新即可生效。
+        cache = "no-store" if candidate.name == "index.html" else "public, max-age=300"
+        self._send_bytes(body, 200, ctype, {"Cache-Control": cache})
+
+    # -- 文件浏览器 ----------------------------------------------------
+    def _handle_fs_list(self) -> None:
+        """列出服务器（也就是跑任务那台手机）上的目录，供前端选择 Excel 路径。"""
+        query = parse_qs(urlparse(self.path).query)
+        raw = (query.get("path") or [""])[0].strip()
+        home = Path.home()
+        if not raw:
+            target = next((Path(p) for p in _BROWSE_ROOTS if Path(p).is_dir()), home)
+        else:
+            target = Path(os.path.expanduser(raw))
+        result = self._list_dir(target)
+        self._send_json(result)
+
+    @staticmethod
+    def _list_dir(target: Path) -> dict[str, Any]:
+        try:
+            target = target.resolve()
+        except (OSError, RuntimeError) as exc:
+            return {"path": str(target), "error": f"路径无效：{exc}", "entries": []}
+        if not target.is_dir():
+            return {"path": str(target), "error": "目录不存在或不是目录", "entries": []}
+
+        entries: list[dict[str, Any]] = []
+        try:
+            for child in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+                if child.name.startswith("."):
+                    continue
+                try:
+                    is_dir = child.is_dir()
+                    size = 0 if is_dir else child.stat().st_size
+                except OSError:
+                    # 单个条目不可读（权限/符号链接断开）时跳过，不让整页失败。
+                    continue
+                if not is_dir and child.suffix.lower() not in EXCEL_SUFFIXES:
+                    continue
+                entries.append({
+                    "name": child.name,
+                    "path": str(child),
+                    "is_dir": is_dir,
+                    "size": size,
+                })
+        except PermissionError:
+            # Android 11+ 未授权存储时 /sdcard 不可读，给出可执行的修复指引。
+            return {
+                "path": str(target),
+                "error": "没有权限读取该目录。若要访问手机存储，请先在 Termux 执行 "
+                         "termux-setup-storage 并允许权限。",
+                "entries": [],
+            }
+        except OSError as exc:
+            return {"path": str(target), "error": f"读取目录失败：{exc}", "entries": []}
+
+        home = Path.home()
+        shortcuts = [{"name": p, "path": p} for p in _BROWSE_ROOTS if Path(p).is_dir()]
+        if home.is_dir():
+            shortcuts.append({"name": "Termux 主目录", "path": str(home)})
+        return {
+            "path": str(target),
+            "parent": str(target.parent) if target.parent != target else "",
+            "entries": entries,
+            "shortcuts": shortcuts,
+            "error": "",
+        }
+
+    # -- 桥接分发 ------------------------------------------------------
+    def _handle_bridge_call(self, name: str) -> None:
+        bridge = self._bridge
+        method = None if (not name or name.startswith("_") or name in _NON_HTTP) else getattr(bridge, name, None)
+        if not callable(method):
+            self._send_error_json(HTTPStatus.NOT_FOUND, f"未知方法：{name}", "unknown_method")
+            return
+        args, kwargs = self._read_call_args()
+        if args is None or kwargs is None:
+            return
+        try:
+            result = method(*args, **kwargs)
+        except TypeError as exc:
+            # 参数不匹配是调用方的问题，400 比 500 更准确。
+            self._send_error_json(HTTPStatus.BAD_REQUEST, f"参数不匹配：{exc}", "bad_arguments")
+            return
+        except Exception as exc:  # noqa: BLE001 - 任何业务异常都要变成 JSON 而不是断连
+            self._send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR,
+                                 f"{type(exc).__name__}: {exc}", "call_failed")
+            return
+        self._send_json(result)
+
+    def _read_call_args(self) -> tuple[list[Any] | None, dict[str, Any] | None]:
+        """请求体为 JSON 数组时按位置传参，为对象时按关键字传参（对齐 Python 语义）。"""
+        self._body_read = True
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b""
+        if not raw.strip():
+            return [], {}
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, f"请求体不是合法 JSON：{exc}", "bad_json")
+            return None, None
+        if isinstance(payload, list):
+            return payload, {}
+        if isinstance(payload, dict):
+            return [], payload
+        # 标量请求体：当成单个位置参数，便于 echo_test("x") 这类调用。
+        return [payload], {}
+
+
+# ----------------------------------------------------------------------
+# 服务器
+# ----------------------------------------------------------------------
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, address: tuple[str, int], dist_dir: Path, bridge: Bridge, token: str,
+                 *, auth: AuthStore | None = None,
+                 access: AccessVerifier | None = None,
+                 auth_env: dict[str, str] | None = None) -> None:
+        super().__init__(address, _Handler)
+        self.dist_dir = dist_dir
+        self.bridge = bridge
+        self.token = token
+        #: 账号体系。为 None 时退化为纯令牌模式（仅测试/兼容旧行为）。
+        self.auth = auth if auth is not None else AuthStore(default_auth_dir())
+        #: Cloudflare Access 校验器（管理页的额外一层，未配置时为 disabled）。
+        self.access = access if access is not None else access_verifier_from_env()
+        #: 是否信任网关头。仅当确实经由 Cloudflare 隧道进来时才算。
+        self.auth_env = auth_env if auth_env is not None else os.environ
+
+
+def default_dist_dir() -> Path:
+    return Path(__file__).resolve().parent.parent / "frontend" / "dist"
+
+
+def build_bridge(on_destroy: Any = None, config_path: Any = None) -> Bridge:
+    """构造 Bridge 并挂上网页版窗口适配层。
+
+    ``config_path`` 仅供测试注入临时配置文件，生产环境走默认用户配置目录。
+    """
+    bridge = Bridge(config_path) if config_path is not None else Bridge()
+    bridge.attach(_WebWindow(on_destroy))
+    return bridge
+
+
+def serve(host: str = "0.0.0.0", port: int = DEFAULT_PORT, *, dist_dir: Path | None = None,
+          token: str = "", rotate_token: bool = False, announce: bool = True) -> int:
+    """启动网页版服务并阻塞到被关闭；返回进程退出码。"""
+    access_token = token or load_or_create_token(rotate=rotate_token)
+    httpd = create_server(host, port, dist_dir=dist_dir, token=access_token)
+
+    actual_port = httpd.server_address[1]
+    if announce:
+        _announce(host, actual_port, access_token)
+    try:
+        httpd.serve_forever(poll_interval=0.4)
+    except KeyboardInterrupt:
+        if announce:
+            print("\n收到中断，正在停止服务…", flush=True)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        # 任务线程都是 daemon，进程退出时不会挂住。
+    return 0
+
+
+def create_server(host: str, port: int, *, dist_dir: Path | None = None, token: str = "",
+                  on_destroy: Any = None, config_path: Any = None) -> ThreadingHTTPServer:
+    """构造（但不启动）网页版服务器。
+
+    单独拆出来便于测试与嵌用：调用方可以 ``serve_forever()`` 自己控制生命周期，
+    单元测试则用 ``port=0`` 拿一个临时端口，并用 ``config_path`` 隔离用户配置。
+    """
+    dist = Path(dist_dir) if dist_dir else default_dist_dir()
+    if not (dist / "index.html").is_file():
+        raise WebServerError(
+            f"未找到前端构建产物 {dist / 'index.html'}。\n"
+            "请先构建前端：cd frontend && pnpm install && pnpm build"
+        )
+    try:
+        return _Server((host, port), dist, build_bridge(on_destroy, config_path), token)
+    except OSError as exc:
+        raise WebServerError(
+            f"无法监听 {host}:{port}（{exc}）。端口可能已被占用，可用 --port 换一个。"
+        ) from exc
+
+
+def _announce(host: str, port: int, token: str) -> None:
+    """打印客户端可直接点开的网址、令牌与省电提示。"""
+    lines = [
+        "",
+        f"一口轻食 网页版 v{__version__} 已启动",
+        f"  本机访问：http://127.0.0.1:{port}/?token={token}",
+    ]
+    if host not in {"127.0.0.1", "localhost"}:
+        addresses = lan_addresses()
+        if addresses:
+            lines.append("  其它设备访问（按可用性排序，同一 WiFi 下用第一条）：")
+            for name, ip in addresses:
+                note = "（VPN 网卡，仅同 VPN 的设备可直连）" if name.startswith(("tun", "ppp")) else ""
+                lines.append(f"    http://{ip}:{port}/?token={token}  [{name}]{note}")
+        else:
+            lines.append(f"  其它设备访问：http://<手机IP>:{port}/?token={token}（未探测到网卡地址）")
+    lines += [
+        "",
+        "  令牌保存在用户配置目录的 web_token；用 --new-token 可轮换。",
+        "  手机端建议先执行：termux-wake-lock   （避免息屏后 Termux 被挂起）",
+        "",
+        "  按 Ctrl+C 停止服务。",
+        "",
+    ]
+    print("\n".join(lines), flush=True)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``python run.py --web [--host H] [--port P] [--new-token]`` 的实现。"""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    host = "0.0.0.0"
+    port = DEFAULT_PORT
+    rotate = "--new-token" in argv
+    if "--host" in argv:
+        host = argv[argv.index("--host") + 1]
+    if "--port" in argv:
+        try:
+            port = int(argv[argv.index("--port") + 1])
+        except (IndexError, ValueError):
+            print("--port 需要一个整数端口", file=sys.stderr)
+            return 2
+    try:
+        return serve(host=host, port=port, rotate_token=rotate)
+    except WebServerError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":  # pragma: no cover - 便于直接调试本模块
+    raise SystemExit(main())
