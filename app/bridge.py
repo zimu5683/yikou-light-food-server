@@ -109,7 +109,14 @@ class _PendingInteraction:
 class Bridge:
     """js_api 对象。公开方法（无下划线）均可被前端 Promise 调用。"""
 
-    def __init__(self, config_path: os.PathLike[str] | str | None = None) -> None:
+    def __init__(self, config_path: os.PathLike[str] | str | None = None, *,
+                 is_admin: bool = False) -> None:
+        """``is_admin`` 决定这个实例的权限级别。
+
+        **默认 False（非管理员）是刻意的**：任何忘记显式指定的地方都退化为「受限」，
+        而不是「全权」。网页版在每次请求时按会话账号重设（见 web_server），
+        桌面版与测试则以管理员身份构造。
+        """
         self._window: Any = None
         # config_path 供测试注入临时配置文件；生产环境沿用默认用户配置目录。
         self._config = AppConfig.load(config_path) if config_path else AppConfig.load()
@@ -134,6 +141,9 @@ class Bridge:
         self._decision_seq = 0
         self._decisions: dict[str, _PendingInteraction] = {}
         self._interaction_timeout_s = DEFAULT_INTERACTION_TIMEOUT_S
+        #: 当前请求者的角色。网页版每个请求都会重设（见 web_server 的分发逻辑），
+        #: 因此这里只是初值。
+        self.is_admin = bool(is_admin)
 
     # ------------------------------------------------------------------
     # 事件通道：保留窗口 + 前端 cursor 拉取
@@ -319,6 +329,72 @@ class Bridge:
         """带参调用诊断：验证 pywebview 6 GTK 的 js_api 参数序列化是否正常。"""
         return {"echo": message, "payload_keys": sorted(payload.keys()) if isinstance(payload, dict) else None}
 
+    #: 非管理员不可见（但任务仍按这些值运行）的配置字段。
+    #: 判据是「泄漏后能被用来做什么」：管理网址 + 手机号可用来接管下单目标、
+    #: Excel 路径暴露服务器目录结构、WPS 表格 ID 可直接改云端文档。
+    _ADMIN_ONLY_CONFIG = (
+        "target_url", "phone_number", "excel_path",
+        "sss_url", "sss_account", "sss_excel_path",
+        "wps_cli_path", "wps_drive_id", "wps_tables", "wps_test_tables",
+        "wps_test_file_id", "wps_test_drive_id",
+    )
+
+    def _visible_config(self, fields: dict[str, Any]) -> dict[str, Any]:
+        """按角色过滤配置字段。
+
+        非管理员这些字段**整体清空**（而不是保留真值）：界面隐藏挡不住任何人 ——
+        接口是公开可调的，真值一旦发出去就等于公开。
+        """
+        if self.is_admin:
+            return fields
+        for key in self._ADMIN_ONLY_CONFIG:
+            if key in fields:
+                current = fields[key]
+                fields[key] = type(current)() if isinstance(current, (dict, list)) else ""
+        return fields
+
+    def _forced_order_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """非管理员：下单目标一律取服务端预设，客户端传什么都不作数。
+
+        为什么必须在后端做：否则普通用户只要把 url/phone 指向自己的管理后台，
+        再点「开始处理」，就能让这台手机登录**别人的**平台并按其数据下单 ——
+        参数被隐藏毫无意义。
+
+        口令同样取自**服务端已保存的那份**（非管理员看不到密码输入框，
+        让他填既没意义也拦不住）——否则会卡在校验「请输入登录密码」而无法下单。
+        密钥环里没存过口令时仍会如实回报该错误，由管理员去「订单处理」里补一次，
+        这与原本的行为一致。``remember`` 强制 False：非管理员不该借下单
+        往密钥环写入或替换平台口令。
+        """
+        forced = dict(payload)
+        config = self._config
+        forced["url"] = config.target_url
+        forced["phone"] = config.phone_number
+        forced["excel"] = str(config.excel_path) if config.excel_path else ""
+        forced["password"] = (get_password(config.phone_number) or "") if config.phone_number else ""
+        forced["remember"] = False
+        forced.pop("api_mode", None)
+        return forced
+
+    def _forced_sss_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """非管理员：闪时送的账号/地址/Excel 同样强制取预设。
+
+        ``dry_run`` / ``preflight`` / ``product_name`` 保留 —— 它们是「怎么跑」，
+        不是「拿谁的账号、跑到哪个地址去」，属于受权范围内的操作选择。
+        """
+        forced = dict(payload)
+        config = self._config
+        forced["url"] = config.sss_url
+        forced["account"] = config.sss_account
+        forced["excel"] = str(config.sss_excel_path) if config.sss_excel_path else ""
+        forced["password"] = (get_sss_password(config.sss_account) or "") if config.sss_account else ""
+        forced["remember"] = False
+        forced.pop("api_mode", None)
+        for key in ("use_fixed_address", "fixed_lnt", "fixed_lat",
+                    "fixed_area_code", "fixed_address_detail", "common_address"):
+            forced.pop(key, None)
+        return forced
+
     def bridge_ready(self) -> dict[str, Any]:
         """前端装载完成后的握手。返回初始状态并冲积未发送事件。"""
         config = self._config
@@ -328,6 +404,9 @@ class Bridge:
             "frozen": bool(getattr(sys, "frozen", False)),
             # 前端据此识别 Python 进程重启，避免旧 cursor 与新的 sequence 冲突。
             "event_producer_id": self._event_producer_id,
+            #: 前端据此决定显示哪些表单字段。真正的拦截在后端（见 _ADMIN_ONLY_CONFIG
+            #: 与 web_server 的方法白名单），前端只是不显示。
+            "is_admin": bool(self.is_admin),
             "config": {
                 "target_url": config.target_url,
                 "phone_number": config.phone_number,
@@ -362,12 +441,17 @@ class Bridge:
                 "wps_target_hour_end": config.wps_target_hour_end,
                 "wps_marker_enabled": config.wps_marker_enabled,
             },
-            # 与旧 GUI 启动行为一致：按账号从系统凭据管理器读回密码。
+            # 密码只回给管理员：这是平台登录口令，拿到即可冒充管理员操作。
+            # 非管理员仍能下单 —— 服务端在 start_order/start_sss 里自己从密钥环取，
+            # 所以清空它不影响授权范围内的功能。
             "passwords": {
-                "order": get_password(config.phone_number) if config.phone_number else "",
-                "sss": get_sss_password(config.sss_account) if config.sss_account else "",
+                "order": (get_password(config.phone_number) if config.phone_number else "")
+                if self.is_admin else "",
+                "sss": (get_sss_password(config.sss_account) if config.sss_account else "")
+                if self.is_admin else "",
             },
         }
+        state["config"] = self._visible_config(state["config"])
         return state
 
     # ------------------------------------------------------------------
@@ -381,6 +465,8 @@ class Bridge:
         只有全部校验通过才就地更新订单侧配置、落盘、（``remember`` 为真时）保存密码，
         并把配置**深拷贝**交给运行线程。
         """
+        if not self.is_admin:
+            payload = self._forced_order_payload(payload)
         if self.worker_alive():
             return {"ok": False, "reason": "busy", "message": "已有任务正在运行，请先停止后再启动", "fields": {}}
         fields: dict[str, dict[str, str]] = {}
@@ -435,6 +521,8 @@ class Bridge:
         与 :meth:`start_order` 同一套路：校验失败只回 ``fields``，不动配置；
         已有任务时回 ``reason="busy"``；成功则就地更新闪时送侧配置后起线程。
         """
+        if not self.is_admin:
+            payload = self._forced_sss_payload(payload)
         if self.worker_alive():
             return {"ok": False, "reason": "busy", "message": "已有任务正在运行，请先停止后再启动", "fields": {}}
         fields = {}

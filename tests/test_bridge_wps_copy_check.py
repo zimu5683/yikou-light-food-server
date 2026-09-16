@@ -77,7 +77,7 @@ def _install(bridge: Bridge, monkeypatch, tables: dict[str, dict[str, str]],
 
 
 def _bridge(tmp_path) -> Bridge:
-    return Bridge(config_path=str(tmp_path / "config.json"))
+    return Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
 
 
 # 覆盖全部 5 种 status 分支的场景。语义提醒：``active`` 是**被核对的副本**

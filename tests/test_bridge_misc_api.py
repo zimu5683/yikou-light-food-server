@@ -23,7 +23,7 @@ from app.bridge import Bridge
 
 
 def _bridge(tmp_path) -> Bridge:
-    return Bridge(config_path=str(tmp_path / "config.json"))
+    return Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
 
 
 class _FakeWindow:

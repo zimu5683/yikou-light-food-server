@@ -169,6 +169,8 @@ export interface AppState {
   version: string
   status: StatusState
   frozen: boolean
+  /** 当前登录账号是否管理员。后端按会话判定，前端据此只做显示裁剪。 */
+  is_admin?: boolean
   /** Python 进程标识：用于识别重启后 sequence 归零，避免复用旧 cursor。 */
   event_producer_id?: string
   config: AppConfigState

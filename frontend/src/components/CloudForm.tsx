@@ -40,7 +40,7 @@ const addressTextareaClass = cn(
 )
 
 export function CloudForm() {
-  const { config } = useApp()
+  const { config, isAdmin } = useApp()
   const [status, setStatus] = useState<WpsStatus | null>(null)
   const [preview, setPreview] = useState<WpsResult | null>(null)
   const [busy, setBusy] = useState<'' | 'preview' | 'upload' | 'auth' | 'refresh' | 'check'>('')
@@ -277,6 +277,8 @@ export function CloudForm() {
         />
       </Field>
 
+      {/* 地址排序规则属于配置，仅管理员可见（后端 save 也会拦）。 */}
+      {isAdmin && (
       <div className="mb-3.5 rounded-md border px-3 py-2.5">
         <div className="flex items-center justify-between gap-3">
           <div>
@@ -361,6 +363,7 @@ export function CloudForm() {
           </div>
         ) : null}
       </div>
+      )}
 
       {status?.tables && status.tables.length > 0 ? (
         <div className="mb-3.5 rounded-md border px-3 py-2.5 text-[11px] text-muted-foreground">
@@ -414,9 +417,12 @@ export function CloudForm() {
         <Button variant="outline" size="sm" onClick={refresh} disabled={busy !== ''}>
           {busy === 'refresh' ? '刷新中…' : '刷新状态'}
         </Button>
-        <Button variant="outline" size="sm" onClick={onAuthorize} disabled={busy !== ''}>
-          {busy === 'auth' ? '授权中…' : '去授权'}
-        </Button>
+        {/* 授权需管理员权限；普通用户用管理员授权好的凭据直接预览/上传。 */}
+        {isAdmin && (
+          <Button variant="outline" size="sm" onClick={onAuthorize} disabled={busy !== ''}>
+            {busy === 'auth' ? '授权中…' : '去授权'}
+          </Button>
+        )}
         <Button variant="outline" size="sm" onClick={onCheckCopies} disabled={busy !== ''}>
           {busy === 'check' ? '核对中…' : '检查副本一致性'}
         </Button>

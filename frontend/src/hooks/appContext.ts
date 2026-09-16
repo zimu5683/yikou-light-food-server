@@ -42,6 +42,8 @@ export interface AppStateBundle {
   version: string
   status: StatusState
   frozen: boolean
+  /** 当前账号是否管理员；非管理员只看到基础功能（后端另有强制拦截）。 */
+  isAdmin: boolean
   config: AppState['config'] | null
   passwords: { order: string; sss: string }
   logs: LogRow[]

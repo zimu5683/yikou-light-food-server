@@ -26,7 +26,10 @@ from app.wps_cloud import SyncLedger, WpsCloudError
 
 
 def _bridge(tmp_path) -> Bridge:
-    return Bridge(config_path=str(tmp_path / "config.json"))
+    # 这些用例验证的是**管理员**的完整能力（js_api 表面）。
+    # Bridge 的默认角色是「非管理员」（安全默认），故此处显式以管理员构造；
+    # 角色相关的拦截由 tests/test_web_roles.py 专门覆盖。
+    return Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
 
 
 class _FakeWindow:

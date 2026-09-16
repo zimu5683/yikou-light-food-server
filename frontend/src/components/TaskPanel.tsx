@@ -120,7 +120,7 @@ function ModeTab({
 /* ------------------------------------------------------------------ */
 
 function OrderForm({ logToggle }: { logToggle?: LogToggleProps }) {
-  const { config, passwords, startOrder, workerAlive } = useApp()
+  const { config, passwords, startOrder, workerAlive, isAdmin } = useApp()
   const [url, setUrl] = useState(config?.target_url ?? '')
   const [phone, setPhone] = useState(config?.phone_number ?? '')
   const [password, setPassword] = useState(passwords.order ?? '')
@@ -210,6 +210,8 @@ function OrderForm({ logToggle }: { logToggle?: LogToggleProps }) {
           撑到底部，下方就露出滚动容器的空白（「更多」下面那块空缺）；滚动时
           表单内容又会从它后面滑过。做成页脚后这两种情况都不存在。 */}
       <div className="scroll-contain min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-1 sm:px-5">
+        {isAdmin && (
+          <>
         <Field label="管理网址" htmlFor="order-url" error={modeError(fields, 'url')} helper="用于登录管理后台">
           <TextInput
             id="order-url"
@@ -251,6 +253,15 @@ function OrderForm({ logToggle }: { logToggle?: LogToggleProps }) {
           </div>
         </Field>
 
+          </>
+        )}
+        {/* 非管理员：凭据与文件路径一律不显示 —— 任务按管理员预设的账号运行。
+            真正的拦截在后端（配置脱敏 + 方法白名单），这里只是不显示。 */}
+        {!isAdmin && (
+          <p className="mb-4 mt-1 rounded-[4px] border border-border bg-card px-3 py-2 text-[12px] text-muted-foreground">
+            本账号按管理员预设的账号与文件运行，无需填写管理网址/手机号/密码/Excel。
+          </p>
+        )}
         <Field label="目标日期" error={modeError(fields, 'date')} helper="留空默认今天；只允许选择今天或过去日期">
           <DateField value={date} onChange={setDate} invalid={Boolean(modeError(fields, 'date'))} />
         </Field>
@@ -294,7 +305,7 @@ function OrderForm({ logToggle }: { logToggle?: LogToggleProps }) {
 /* ------------------------------------------------------------------ */
 
 function SssForm({ logToggle }: { logToggle?: LogToggleProps }) {
-  const { config, passwords, startSss, workerAlive } = useApp()
+  const { config, passwords, startSss, workerAlive, isAdmin } = useApp()
   const [url, setUrl] = useState(config?.sss_url ?? '')
   const [account, setAccount] = useState(config?.sss_account ?? '')
   const [password, setPassword] = useState(passwords.sss ?? '')
@@ -452,6 +463,8 @@ function SssForm({ logToggle }: { logToggle?: LogToggleProps }) {
     <div className="flex min-h-0 flex-1 flex-col">
       {/* 与订单处理页签同构：字段区滚动 + 操作条做真页脚（不再 sticky） */}
       <div className="scroll-contain min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-1 sm:px-5">
+        {isAdmin && (
+          <>
         <Field label="闪时送网址" htmlFor="sss-url" error={modeError(fields, 'url')} helper="闪时送下单平台地址">
           <TextInput id="sss-url" value={url} onChange={(e) => setUrl(e.target.value)} />
         </Field>
@@ -469,6 +482,13 @@ function SssForm({ logToggle }: { logToggle?: LogToggleProps }) {
           />
         </Field>
 
+          </>
+        )}
+        {!isAdmin && (
+          <p className="mb-4 mt-1 rounded-[4px] border border-border bg-card px-3 py-2 text-[12px] text-muted-foreground">
+            本账号按管理员预设的闪时送账号与文件运行，无需填写网址/账号/密码。
+          </p>
+        )}
         <Field
           label="名单来源"
           helper={
@@ -735,8 +755,11 @@ export interface LogToggleProps {
 }
 
 function ToolsMenu({ mode }: { mode: TaskMode }) {
-  const { clearPassword, checkUpdates } = useApp()
+  const { clearPassword, checkUpdates, isAdmin } = useApp()
   const [confirmClear, setConfirmClear] = useState(false)
+
+  // 清密码与检查更新都需要管理员权限（后端也会拦），普通用户直接不显示入口。
+  if (!isAdmin) return null
 
   return (
     <>

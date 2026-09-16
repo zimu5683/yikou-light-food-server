@@ -50,6 +50,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [version, setVersion] = useState('')
   const [status, setStatus] = useState<StatusState>('ready')
   const [frozen, setFrozen] = useState(false)
+  // 默认 false（受限）：握手失败时退化为「看不到敏感项」，而不是「全都能看」
+  const [isAdmin, setIsAdmin] = useState(false)
   const [config, setConfig] = useState<AppState['config'] | null>(null)
   const [passwords, setPasswords] = useState({ order: '', sss: '' })
   const [logs, setLogs] = useState<LogRow[]>([])
@@ -77,6 +79,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setVersion(state.version)
       setStatus(state.status)
       setFrozen(state.frozen)
+      setIsAdmin(state.is_admin === true)
       setConfig(state.config)
       setPasswords(state.passwords)
       // 验收回传：自动化验收依赖本通道（evaluate_js 在新 WebKitGTK 上不可信）
@@ -295,6 +298,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       version,
       status,
       frozen,
+      isAdmin,
       config,
       passwords,
       logs,
@@ -321,7 +325,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       resolveCaptcha,
       resolveAddressInput,
     }),
-    [ready, mocked, transport, authError, version, status, frozen, config, passwords, logs,
+    [ready, mocked, transport, authError, version, status, frozen, isAdmin, config, passwords, logs,
       decision, updateProgress, mode, captcha, addressInput, startOrder, startSss, stopTask,
       chooseExcel, newTemplate, clearPassword, checkUpdates, installUpdate,
       openExternal, requestClose, setSplitRatio, clearLogs, resolveDecision, resolveCaptcha,

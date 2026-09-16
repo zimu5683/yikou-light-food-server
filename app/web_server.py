@@ -71,6 +71,29 @@ _ADMIN_PATHS = frozenset({"/admin"})
 #: 网关转发过来的请求会带这些头。用于区分「本地直连」与「公网入口」。
 _PROXY_HEADERS = ("cf-connecting-ip", "cf-ray", "x-forwarded-for", "x-forwarded-proto")
 
+#: 非管理员可以调用的桥接方法（白名单 —— 未列出的**一律 403**）。
+#:
+#: 采用白名单而不是黑名单：以后 `Bridge` 新增任何方法，默认都是「仅管理员」，
+#: 不会因为忘记登记而意外对普通用户开放。
+#:
+#: 放行判据：发起/停止任务、看进度日志、回应交互（验证码/决策/待确认地址），
+#: 以及 WPS 的**预览与上传**（按使用要求开放，注意上传会真的写云文档）。
+#: 被拦下的都是「能改服务器状态或泄漏数据」的：保存配置、文件浏览、清除密码、
+#: 检查更新/安装、窗口控制、授权 WPS 等。
+_NON_ADMIN_METHODS = frozenset({
+    # 任务控制
+    "start_order", "start_sss", "stop_task", "worker_alive",
+    # 握手与进度
+    "bridge_ready", "drain_events", "echo_test", "frontend_report", "pop_reports",
+    "status", "log",
+    # 交互回应（任务在等这些输入才能继续）
+    "resolve_decision", "resolve_captcha", "resolve_address_input",
+    # 云文档同步：预览 + 上传
+    "wps_status", "wps_preview", "wps_upload", "wps_check_copies",
+    # 闪时送每日订单查询（只读）
+    "sss_day_orders",
+})
+
 
 class _RecoveryUser:
     """本地旧令牌对应的身份：本机/局域网直连时可用，等价于管理员。
@@ -400,9 +423,14 @@ class _Handler(BaseHTTPRequestHandler):
         # 因为拒绝分支会调 _drain_body()，而它原本由 do_GET/do_POST 初始化。
         self._body_read = False
         path = urlparse(self.path).path
-        if path not in _PUBLIC_PATHS and self._current_user() is None:
-            self._reject_unauthenticated(path)
-            return False
+        if path not in _PUBLIC_PATHS:
+            user = self._current_user()
+            if user is None:
+                self._reject_unauthenticated(path)
+                return False
+            # 每个请求都按当次会话重设角色：Bridge 是长生命周期对象，
+            # 绝不能残留上一个请求者的权限。
+            self._bridge.is_admin = bool(getattr(user, "is_admin", False))
         return True
 
     def _reject_unauthenticated(self, path: str) -> None:
@@ -615,6 +643,30 @@ class _Handler(BaseHTTPRequestHandler):
         # 常量时间比较；长度不同直接返回 False。
         return bool(supplied) and secrets.compare_digest(supplied, expected)
 
+    def _method_allowed(self, name: str) -> bool:
+        """非管理员只能调用白名单里的桥接方法。"""
+        if self._bridge.is_admin or name in _NON_ADMIN_METHODS:
+            return True
+        self._send_error_json(
+            HTTPStatus.FORBIDDEN,
+            "该操作仅管理员可用",
+            "admin_only",
+        )
+        return False
+
+    def _require_fs_access(self) -> bool:
+        """服务器端文件浏览器：能列出这台手机的全部目录，仅管理员可用。"""
+        if not self._require_token():
+            return False
+        if not self._bridge.is_admin:
+            self._send_error_json(
+                HTTPStatus.FORBIDDEN,
+                "浏览服务器文件仅管理员可用",
+                "admin_only",
+            )
+            return False
+        return True
+
     def _require_token(self) -> bool:
         """``/api/*`` 的凭据闸门。
 
@@ -649,7 +701,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._serve_admin()
             return
         if route == "/api/fs/list":
-            if not self._require_token():
+            if not self._require_fs_access():
                 return
             self._handle_fs_list()
             return
@@ -680,7 +732,11 @@ class _Handler(BaseHTTPRequestHandler):
             return
         name = route[len("/api/"):].strip("/")
         if name == "fs/list":
+            if not self._require_fs_access():
+                return
             self._handle_fs_list()
+            return
+        if not self._method_allowed(name):
             return
         self._handle_bridge_call(name)
 

@@ -23,7 +23,7 @@ from app.wps_cloud import WpsCloudError
 
 
 def _bridge(tmp_path) -> Bridge:
-    bridge = Bridge(config_path=str(tmp_path / "config.json"))
+    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
     bridge._config.excel_path = tmp_path / "排单.xlsx"
     bridge._config.excel_path.write_bytes(b"x")
     return bridge
