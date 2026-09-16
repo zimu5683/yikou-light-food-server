@@ -183,12 +183,13 @@ function LogConsoleBody() {
   return (
     <section className="flex min-h-0 flex-1 flex-col px-3 pb-3 pt-4 sm:px-5 sm:pb-4">
       {/*
-        这一行原来是不换行的单行 flex，窄屏（手机）时会被挤爆：
-        「运行日志」没有 shrink-0，被压到近 0 宽后 CJK 字符只能逐个换行，
-        于是标题变成竖排；固定 w-44 的过滤框又和三个按钮抢空间。
-        改成 flex-wrap 分三行排：标题+状态 / 过滤框整行 / 工具按钮。
+        历史坑：这行原先是**不换行**的单行 flex，窄屏会被挤爆 —— 「运行日志」没有
+        shrink-0，被压到近 0 宽后 CJK 字符只能逐个换行，标题变成竖排。
+        现在用 flex-wrap 排两行：标题+状态 / （过滤框 + 工具按钮同排）。
+        过滤框在窄屏自适应收窄（flex-1），宽屏才固定 w-44 并靠右。
+        抽屉里头部越矮越好，因为收起时露出的就是这部分。
       */}
-      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-2">
+      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
         <h2 className="shrink-0 whitespace-nowrap font-serif text-base font-semibold tracking-[1px]">
           运行日志
         </h2>
@@ -201,13 +202,15 @@ function LogConsoleBody() {
           />
           {badgeLabel}
         </span>
-        <Input
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-          placeholder="过滤日志…"
-          className="h-8 w-full rounded-[4px] border-border bg-card text-xs sm:ml-auto sm:h-7 sm:w-44"
-        />
-        <div className="flex items-center gap-1.5">
+        {/* 过滤框与按钮同排：原来各占一行，在手机上头部会撑到约 110px，
+            放进抽屉后显得很占地方。窄屏下过滤框自适应收窄。 */}
+        <div className="flex w-full min-w-0 items-center gap-1.5 sm:ml-auto sm:w-auto">
+          <Input
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            placeholder="过滤日志…"
+            className="h-8 min-w-0 flex-1 rounded-[4px] border-border bg-card text-xs sm:h-7 sm:w-44 sm:flex-none"
+          />
           <ToolButton onClick={copyAll} label="复制日志">
             <Copy className="size-3.5" />
             <span className="hidden sm:inline">复制</span>
@@ -227,7 +230,7 @@ function LogConsoleBody() {
         </div>
       </div>
 
-      <div className="receipt mt-3.5 flex min-h-0 flex-1 flex-col">
+      <div className="receipt mt-2 flex min-h-0 flex-1 flex-col sm:mt-3.5">
         <div className="receipt-tear" />
         <div
           ref={paperRef}
