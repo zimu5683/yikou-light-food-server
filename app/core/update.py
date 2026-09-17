@@ -94,6 +94,10 @@ def fetch_latest_release(*, repository: str = WEB_REPOSITORY,
     except HTTPError as exc:
         if exc.code == 404:
             raise ReleaseCheckError("仓库还没有发布任何 Release") from exc
+        if exc.code == 403:
+            raise ReleaseCheckError(
+                "检查更新失败：GitHub 接口拒绝/限流（匿名 API 每小时 60 次），"
+                "请稍后再试或在服务器设置 GITHUB_TOKEN") from exc
         raise ReleaseCheckError(f"检查更新失败（HTTP {exc.code}）") from exc
     except (URLError, TimeoutError, OSError) as exc:
         raise ReleaseCheckError(f"检查更新失败（网络不通）：{exc}") from exc

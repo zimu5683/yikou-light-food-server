@@ -30,7 +30,7 @@ app/integrations/  外部 HTTP 客户端（requests）
 | `app/core/config.py` | `AppConfig` 原子持久化、WPS 映射与地址排序默认值 |
 | `app/core/credentials.py` | keyring 密码读写（管理后台/闪时送双命名空间） |
 | `app/core/models.py` | `MealInfo` / `OrderInfo` 纯数据模型 |
-| `app/core/update.py` | 只读 GitHub Release，提示新版本，不做自动安装 |
+| `app/core/update.py` | 双轨道：网页版 Release 才提示更新；桌面版 Release 只做独立提示 |
 | `app/integrations/api_client.py` | 管理后台与闪时送 HTTP 会话、登录、错误映射 |
 | `app/order/parsing.py` | 订单文本解析、Excel 列写入、备份等纯函数 |
 | `app/order/runner.py` | 管理后台订单抓取、合并、退款过滤、写排单表 |

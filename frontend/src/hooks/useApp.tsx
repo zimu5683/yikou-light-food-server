@@ -15,6 +15,7 @@ import {
   type ReactNode,
 } from 'react'
 import { toast } from 'sonner'
+import { shouldAutoCheckUpdates } from '@/lib/updateCheck'
 import {
   api,
   connectBridge,
@@ -84,11 +85,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
           .frontend_report({ kind: 'ready', version: state.version, status: state.status })
           .catch(() => {})
       }
-      // 旧版行为：启动 700ms 后静默检查更新
+      // 启动 700ms 后静默检查更新；自动检查每 6 小时最多一次，避免撞
+      // GitHub 匿名 API 限流（手动“检查更新”仍不受此限制）。
       if (!mocked) {
-        setTimeout(() => {
-          api().check_updates(false).catch(() => {})
-        }, 700)
+        let shouldCheck = true
+        try {
+          shouldCheck = shouldAutoCheckUpdates(window.localStorage)
+        } catch {
+          shouldCheck = true
+        }
+        if (shouldCheck) {
+          setTimeout(() => {
+            api().check_updates(false).catch(() => {})
+          }, 700)
+        }
       }
     })
     return () => {
