@@ -153,6 +153,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          gh release create "$tag" dist/* --title "$tag" --generate-notes \
-            || gh release upload "$tag" dist/* --clobber
+          # release job 没有 checkout，必须显式 -R owner/repo；否则 gh 会尝试访问 .git。
+          gh release create "$tag" dist/* -R "$GITHUB_REPOSITORY" \
+            --title "$tag" --generate-notes \
+            || gh release upload "$tag" dist/* -R "$GITHUB_REPOSITORY" --clobber
