@@ -62,3 +62,17 @@ vendor/kdocs-cli/*.zip
 
 # 生成的交互式结构导航图（project-structure-viewer skill 产物，可随时重建）
 docs/project-structure.html
+
+# Android / APK 构建产物（生成脚本负责下载或编译，不入库）
+android/.gradle/
+android/local.properties
+android/app/build/
+android/app/src/main/jniLibs/
+android/app/src/main/assets/dist/
+android/app/src/main/assets/runtime/cacert.pem
+android/app/src/main/assets/runtime/runtime-manifest.json
+*.apk
+*.aab
+*.jks
+*.keystore
+keystore.properties

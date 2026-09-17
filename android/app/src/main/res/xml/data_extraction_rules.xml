@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- allowBackup=false；这里再显式排除私密配置/token/WPS home，双保险。 -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="config/" />
+        <exclude domain="file" path="wps/" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="config/" />
+        <exclude domain="file" path="wps/" />
+    </device-transfer>
+</data-extraction-rules>

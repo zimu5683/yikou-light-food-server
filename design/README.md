@@ -6,6 +6,9 @@
 
 ## 方案与规则（仍然有效）
 
+- `APK-PLAN.md` — Android APK 内置 kdocs-cli 的实施计划
+- `APK-STATUS.md` — APK 转型的代码/验证状态与待确认事项
+
 - `WPS-CLOUD-SYNC-PLAN.md` — WPS 云同步总体方案、列定位与地址排序规则
 - `SSS-云端名单导入.md` — 闪时送云端名单的日期口径、地址过滤与拒绝语义
 - `DESIGN-WEB.md` — 网页版界面设计说明

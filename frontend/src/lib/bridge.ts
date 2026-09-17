@@ -375,6 +375,7 @@ interface BackendApi {
   wps_preview(): Promise<WpsResult>
   wps_upload(): Promise<WpsResult>
   wps_authorize(): Promise<{ ok: boolean; reason?: string; hint?: string }>
+  wps_logout(): Promise<{ ok: boolean; reason?: string }>
   wps_check_copies(): Promise<WpsCopyCheck>
   save_wps_config(payload: WpsConfigPayload): Promise<{ ok: boolean; reason?: string }>
   clear_password(mode: 'order' | 'sss'): Promise<{ ok: boolean }>

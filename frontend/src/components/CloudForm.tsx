@@ -194,6 +194,18 @@ export function CloudForm() {
     }
   }, [busy])
 
+  const onLogout = useCallback(async () => {
+    if (!isApiReady() || busy) return
+    setBusy('auth')
+    try {
+      const result = await api().wps_logout()
+      setMessage(result.ok ? '已退出 WPS 授权' : result.reason ?? '退出授权失败')
+      await refresh()
+    } finally {
+      setBusy('')
+    }
+  }, [busy, refresh])
+
   const summary = preview?.summary
   const pending = summary ? summary.to_update + summary.to_append : 0
   /** 地址清单非空（= 已手工指定顺序）的子表数量；空清单表示按地址升序。 */
@@ -392,6 +404,9 @@ export function CloudForm() {
             通讯记号：<b>{status?.weekday_number ?? '—'}</b>
           </span>
         </div>
+        {status?.reason ? (
+          <p className="mt-1 text-destructive">运行状态：{status.reason}</p>
+        ) : null}
         {status?.excel_path ? (
           <p className="mt-1 truncate text-muted-foreground" title={status.excel_path}>
             排单表：{status.excel_path}
@@ -421,6 +436,11 @@ export function CloudForm() {
         {isAdmin && (
           <Button variant="outline" size="sm" onClick={onAuthorize} disabled={busy !== ''}>
             {busy === 'auth' ? '授权中…' : '去授权'}
+          </Button>
+        )}
+        {isAdmin && status?.authenticated && (
+          <Button variant="outline" size="sm" onClick={onLogout} disabled={busy !== ''}>
+            退出授权
           </Button>
         )}
         <Button variant="outline" size="sm" onClick={onCheckCopies} disabled={busy !== ''}>

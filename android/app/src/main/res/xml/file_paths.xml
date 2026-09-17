@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- AppUpdater 下载的 APK 安装包。 -->
+    <cache-path name="updates" path="updates/" />
+    <files-path name="diagnostics" path="diagnostics/" />
+</paths>

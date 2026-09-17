@@ -10,7 +10,8 @@
 ## 打包时怎么用
 
 `yikou-light-food.spec` 会把当前平台的二进制放进产物根目录。
-按平台取哪个包见 `checksums.txt` 的命名规则：
+按平台取哪个包见 `checksums.txt` 的命名规则；Android APK 构建在 x86_64 runner 上执行，
+必须用 ``python scripts/fetch_kdocs_cli.py --platform linux-arm64`` 强制取 arm64 包：
 
 | 平台 | 包名 |
 |---|---|

@@ -23,13 +23,20 @@ from app.wps.common import (
     _is_transient,
 )
 from app.wps.errors import WpsCloudError
+from app.wps import android_runtime
 
 CLI_NAME = "kdocs-cli"
 
 CLI_NAME_WIN = "kdocs-cli.exe"
 
 def find_cli(explicit: str | os.PathLike[str] | None = None) -> str:
-    """按优先级查找 kdocs-cli：显式配置 → 打包内置 → 仓库 vendor → 程序同目录 → PATH。"""
+    """按优先级查找 kdocs-cli：显式配置 → 打包内置 → 仓库 vendor → 程序同目录 → PATH。
+
+    APK 内置模式下没有真实可执行文件路径，返回 :data:`android_runtime.RUNTIME_MARKER`；
+    真正的 ``proot + kdocs-cli`` 由 Kotlin ``WpsRuntime`` 托管。
+    """
+    if android_runtime.is_android():
+        return android_runtime.RUNTIME_MARKER
     candidates: list[Path] = []
     if explicit:
         candidates.append(Path(explicit).expanduser())
@@ -156,6 +163,19 @@ class KdocsCli:
         raise last_error
 
     def _run_once(self, *args: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        # APK 内置模式：命令行、proot、DNS/CA、保留 token 都由 Kotlin 处理。
+        if android_runtime.is_android():
+            try:
+                result = android_runtime.run_cli(
+                    args, params, timeout_ms=max(1, int(self.timeout)) * 1000)
+            except android_runtime.AndroidRuntimeError as exc:
+                raise WpsCloudError(
+                    f"Android 运行时不可用（{exc.error_code}）：{exc}") from exc
+            return self._parse_cli_output(
+                result.stdout, result.stderr, args,
+                exit_code=result.exit_code, timed_out=result.timed_out,
+                error_code=result.error_code)
+
         # Termux/Android 需要 proot 绑 resolv.conf + SSL_CERT_FILE；桌面端两项都为空。
         prefix, extra_env = termux_cli_runtime()
         cmd = [*prefix, self.path, *args]
@@ -183,7 +203,17 @@ class KdocsCli:
                 except OSError:
                     pass
 
-        raw = (proc.stdout or "").strip()
+        return self._parse_cli_output(
+            proc.stdout or "", proc.stderr or "", args,
+            exit_code=proc.returncode, timed_out=False, error_code=None)
+
+    def _parse_cli_output(self, stdout: str, stderr: str, args: tuple[str, ...], *,
+                          exit_code: int, timed_out: bool = False,
+                          error_code: str | None = None) -> dict[str, Any]:
+        """解析 kdocs-cli 的 JSON 输出；桌面与 Android 两条路径共用。"""
+        if timed_out:
+            raise WpsCloudError(f"kdocs-cli 超时（{self.timeout}s）：{' '.join(args)}")
+        raw = (stdout or "").strip()
         payload: dict[str, Any] | None = None
         if raw.startswith("{"):
             try:
@@ -191,8 +221,10 @@ class KdocsCli:
             except json.JSONDecodeError:
                 payload = None
         if payload is None:
-            hint = (proc.stderr or raw or "").strip()[:300]
-            raise WpsCloudError(f"kdocs-cli 无有效输出（exit {proc.returncode}）：{hint}")
+            hint = (stderr or raw or "").strip()[:300]
+            if error_code:
+                hint = f"{error_code}: {hint}".strip(": ")
+            raise WpsCloudError(f"kdocs-cli 无有效输出（exit {exit_code}）：{hint}")
         # 注意：CLI 在接口报错时退出码仍可能是 0，必须看 code 字段
         code = payload.get("code")
         if code in RATE_LIMIT_CODES:
@@ -222,6 +254,12 @@ class KdocsCli:
 
     def authenticated(self) -> bool:
         """kdocs-cli 是否已授权（跑 ``auth status``）；命令缺失或超时按未授权处理。"""
+        if android_runtime.is_android():
+            try:
+                return android_runtime.auth_status()
+            except android_runtime.AndroidRuntimeError as exc:
+                raise WpsCloudError(
+                    f"Android 运行时不可用（{exc.error_code}）：{exc}") from exc
         try:
             proc = subprocess.run([self.path, "auth", "status"],
                                   capture_output=True, text=True, timeout=60)
@@ -238,14 +276,34 @@ class KdocsCli:
         在 Termux/Android 上会带上 ``proot`` 前缀：``auth login`` 原本会因 Android
         seccomp 拦截 ``faccessat2`` 而以 ``SIGSYS: bad system call`` 崩溃，
         proot 接管系统调用后即可正常走完 OAuth 流程。
+
+        APK 内置模式不走这里：授权由 Kotlin ``WpsRuntime.authorize`` 拉起浏览器。
         """
+        if android_runtime.is_android():
+            raise WpsCloudError(
+                "APK 内置模式的 WPS 授权请调用 WpsRuntime.authorize()")
         prefix, _ = termux_cli_runtime()
         return [*prefix, self.path, "auth", "login"]
 
     def login_env(self) -> dict[str, str] | None:
         """授权命令需要的环境变量（Termux 下需要 ``SSL_CERT_FILE``），无需时返回 None。"""
+        if android_runtime.is_android():
+            return None
         _, extra_env = termux_cli_runtime()
         return {**os.environ, **extra_env} if extra_env else None
+
+    def logout(self) -> bool:
+        """退出授权；成功返回 True。Android 模式走 Kotlin WpsRuntime.logout。"""
+        if android_runtime.is_android():
+            return android_runtime.logout().ok
+        prefix, extra_env = termux_cli_runtime()
+        try:
+            proc = subprocess.run([*prefix, self.path, "auth", "logout"],
+                                  capture_output=True, text=True, timeout=60,
+                                  env={**os.environ, **extra_env} if extra_env else None)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return proc.returncode == 0
 
     # ---- 表格读写 ----
 

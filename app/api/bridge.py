@@ -55,6 +55,7 @@ from app.core.update import (
 from app.wps.sync import (KdocsCli, SyncLedger, WpsCloudError, apply_plan,
                         build_plan, effective_tables, format_plan,
                         read_local_orders, summarize_plan, target_date_for)
+from app.wps import android_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -810,7 +811,25 @@ class Bridge:
         if timed_out:
             shown = default or "取消"
             self.log(f"交互请求 {interaction_id} 等待超时或窗口关闭，自动按「{shown}」处理", "WARN")
+            self._clear_android_interaction_notification()
         return entry.holder[0] if entry.holder else default
+
+    def _notify_android_interaction(self, kind: str) -> None:
+        """APK 模式下把等待交互同步到前台通知；失败不影响任务。"""
+        if not android_runtime.is_android():
+            return
+        try:
+            android_runtime.notify_interaction(kind)
+        except android_runtime.AndroidRuntimeError:
+            pass
+
+    def _clear_android_interaction_notification(self) -> None:
+        if not android_runtime.is_android():
+            return
+        try:
+            android_runtime.clear_interaction_notifications()
+        except android_runtime.AndroidRuntimeError:
+            pass
 
     def _cancel_pending_interactions(self, reason: str,
                                      except_kinds: frozenset[str] = frozenset()) -> int:
@@ -829,6 +848,7 @@ class Bridge:
             entry.event.set()
         if entries:
             self.log(f"已取消 {len(entries)} 个等待中的交互请求（{reason}）", "WARN")
+            self._clear_android_interaction_notification()
         return len(entries)
 
     def _request_decision(self, kind: str, title: str, message: str,
@@ -867,6 +887,7 @@ class Bridge:
         captcha_id, entry = self._register_interaction("captcha")
         image_b64 = base64.b64encode(image_bytes).decode("ascii")
         self._emit_event("captcha", {"id": captcha_id, "image": image_b64})
+        self._notify_android_interaction("captcha")
         code = self._wait_interaction(captcha_id, entry, default="")
         if not str(code).strip():
             raise _InteractionCancelled("验证码输入已取消或超时")
@@ -882,6 +903,8 @@ class Bridge:
             if entry is not None:
                 entry.holder.append(str(code))
                 entry.event.set()
+        if entry is not None:
+            self._clear_android_interaction_notification()
         return {"ok": entry is not None}
 
     def _request_address_input(self, items: list[dict[str, Any]]) -> dict[str, str]:
@@ -893,6 +916,7 @@ class Bridge:
             "message": "以下地址无法自动识别，请输入要写入表格的最终地址；留空则保持原待确认流程。",
             "items": items,
         })
+        self._notify_android_interaction("address")
         result = self._wait_interaction(request_id, entry,
                                         default=self._interaction_default("address_input"))
         values: Any = result
@@ -917,6 +941,8 @@ class Bridge:
             if entry is not None:
                 entry.holder.append(entries)
                 entry.event.set()
+        if entry is not None:
+            self._clear_android_interaction_notification()
         return {"ok": entry is not None}
 
     def _pending_address_input(self, items: list[dict[str, Any]]) -> dict[str, str]:
@@ -1345,6 +1371,33 @@ class Bridge:
         return {"ok": True, "hint": "已启动授权，请按日志里的提示在浏览器中确认"}
 
     def _wps_authorize_worker(self, cli: KdocsCli) -> None:
+        if android_runtime.is_android():
+            self._wps_authorize_worker_android()
+        else:
+            self._wps_authorize_worker_desktop(cli)
+        self._emit_event("wps:status", self.wps_status())
+
+    def wps_logout(self) -> dict[str, Any]:
+        """退出 WPS 授权（管理员操作），成功后前端刷新 wps_status。"""
+        try:
+            if android_runtime.is_android():
+                android_runtime.cancel_authorization()
+                result = android_runtime.logout()
+                ok = result.ok
+                reason = result.error_code or result.stderr
+            else:
+                cli = self._wps_cli()
+                ok = cli.logout()
+                reason = "" if ok else "kdocs-cli auth logout 执行失败"
+        except (WpsCloudError, android_runtime.AndroidRuntimeError) as exc:
+            return {"ok": False, "reason": str(exc)}
+        if ok:
+            self.log("[云文档授权] 已退出 WPS 授权", "WARN")
+        else:
+            self.log(f"[云文档授权] 退出授权失败：{reason or '未知错误'}", "WARN")
+        return {"ok": ok, "reason": reason}
+
+    def _wps_authorize_worker_desktop(self, cli: KdocsCli) -> None:
         import subprocess
         try:
             proc = subprocess.run(cli.login_argv(), capture_output=True, text=True,
@@ -1359,8 +1412,24 @@ class Bridge:
                 self.log("[云文档授权] 未检测到有效授权，请重试", "WARN")
         except Exception as exc:  # noqa: BLE001
             self.log(f"[云文档授权] 失败：{type(exc).__name__}: {exc}", "ERROR")
-        finally:
-            self._emit_event("wps:status", self.wps_status())
+
+    def _wps_authorize_worker_android(self) -> None:
+        """APK 内置模式：Kotlin 负责 proot/kdocs-cli/Custom Tabs，Python 只写日志。"""
+        def on_url(url: str) -> None:
+            # 授权 URL 只包含 client_id / state，用户需要看到链接或自动拉起浏览器；
+            # 这里不打印 code，token 更不会出现在日志里。
+            self.log(f"[云文档授权] 已请求系统浏览器打开授权页：{url}")
+
+        try:
+            result = android_runtime.authorize(timeout_ms=330_000, on_url=on_url)
+            if result.ok:
+                self.log("[云文档授权] 授权成功", "OK")
+            else:
+                detail = result.message or "未检测到有效授权，请重试"
+                code = f"（{result.error_code}）" if result.error_code else ""
+                self.log(f"[云文档授权] 失败{code}：{detail}", "WARN")
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"[云文档授权] 失败：{type(exc).__name__}: {exc}", "ERROR")
 
     def clear_password(self, mode: str = "order") -> dict[str, Any]:
         """删除本机密钥链里保存的密码。
@@ -1441,6 +1510,8 @@ class Bridge:
         恒返回 ``{"ok": True}``。
         """
         if isinstance(url, str) and url.startswith(("https://", "http://")):
+            if android_runtime.is_android():
+                return {"ok": android_runtime.open_external(url)}
             webbrowser.open(url)
         return {"ok": True}
 

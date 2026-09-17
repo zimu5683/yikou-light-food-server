@@ -161,7 +161,21 @@ def clamp_split_ratio(value: object) -> float:
 
 
 def user_data_dir() -> Path:
-    """Return a per-user writable directory, independent of the repository."""
+    """Return a per-user writable directory, independent of the repository.
+
+    Android APK 通过 ``YIKOU_DATA_DIR`` 指向 ``context.filesDir`` 内的目录；
+    未显式给出时退到 ``XDG_CONFIG_HOME`` / 平台惯例，桌面与 Termux 完全不变。
+    """
+    override = os.environ.get("YIKOU_DATA_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    app_mode = os.environ.get("YIKOU_APP_MODE", "").strip().lower()
+    if app_mode == "android":
+        # Kotlin 应在 configure() 里同时写入 YIKOU_DATA_DIR 与 XDG_CONFIG_HOME；
+        # 只写后者的旧实现也能正确落到 App 私有目录。
+        root = Path(os.environ.get("XDG_CONFIG_HOME")
+                    or (Path.home() / ".config"))
+        return root / APP_NAME
     if os.name == "nt":
         root = os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")
     elif sys.platform == "darwin":

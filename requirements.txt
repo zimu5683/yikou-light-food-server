@@ -1,4 +1,5 @@
-# 运行时依赖（网页版专用）
+# 运行时依赖（网页版 / Android APK 共用；APK 的 Chaquopy pip 锁定在
+# android/app/build.gradle.kts，升级时应与这里同步）
 # 本项目只跑网页版：桌面原生窗口（pywebview）与浏览器自动化（Playwright）
 # 已随浏览器模式一起移除，详见 README「网页版」一节。
 openpyxl>=3.1,<4

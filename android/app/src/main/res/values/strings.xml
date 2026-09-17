@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">一口轻食</string>
+    <string name="notification_channel_tasks">任务运行中</string>
+    <string name="notification_channel_captcha">等待验证码</string>
+    <string name="notification_channel_address">等待地址确认</string>
+    <string name="notification_task_running">一口轻食任务运行中</string>
+    <string name="notification_task_starting">正在启动本地服务…</string>
+    <string name="notification_task_error">本地服务启动失败，点击查看诊断</string>
+</resources>

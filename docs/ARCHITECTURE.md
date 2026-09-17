@@ -28,7 +28,8 @@ app/integrations/  外部 HTTP 客户端（requests）
 |---|---|
 | `app/main.py` | CLI 入口：`--web` / `--self-check` / `--wps-check` / `--sss-import-check` |
 | `app/core/config.py` | `AppConfig` 原子持久化、WPS 映射与地址排序默认值 |
-| `app/core/credentials.py` | keyring 密码读写（管理后台/闪时送双命名空间） |
+| `app/core/credentials.py` | 密码读写：桌面/Termux 用 keyring，Android 用 Keystore（双命名空间） |
+| `app/wps/android_runtime.py` | Python ↔ Kotlin `WpsRuntime` 的唯一桥；仅 `YIKOU_APP_MODE=android` 生效 |
 | `app/core/models.py` | `MealInfo` / `OrderInfo` 纯数据模型 |
 | `app/core/update.py` | 双轨道：网页版 Release 才提示更新；桌面版 Release 只做独立提示 |
 | `app/integrations/api_client.py` | 管理后台与闪时送 HTTP 会话、登录、错误映射 |
@@ -44,6 +45,28 @@ app/integrations/  外部 HTTP 客户端（requests）
 | `app/web/server.py` | ThreadingHTTPServer、统一鉴权、路由、静态资源、文件浏览器 |
 | `app/web/auth.py` | 账号/PBKDF2/会话/邀请码/Cloudflare Access JWT |
 | `app/web/pages.py` | 登录、拒绝、管理员审批页的 HTML 模板 |
+
+## Android APK 运行形态
+
+APK 复用同一套 `app/` 代码和 HTTP 协议，只在进程外多一层 Kotlin 原生兼容层：
+
+```
+MainActivity(WebView)
+   │  http://127.0.0.1:<随机端口>/?token=...
+   ▼
+android_bootstrap.py  →  app/web/server.py + Bridge（Chaquopy 进程内）
+   ▲
+TaskService（前台 Service dataSync）
+   ▲
+WpsRuntime（Kotlin）→ proot → kdocs-cli     SecureStore（Keystore）
+```
+
+- Python 源集仍是仓库根 `app/`；Gradle 构建时只 Sync 到 `build/generated/`，不改源码。
+- `app/wps/cli.py` 在 Android 模式下把 `subprocess.run` 换成
+  `android_runtime.run_cli`，领域 planner/executor 完全不知道运行形态。
+- DNS 用 `ConnectivityManager` 读系统 DNS 写 `resolv.conf`；CA 用 Mozilla bundle
+  通过 `SSL_CERT_FILE` 注入；token 落在 App 私有目录，卸载即清。
+- 完整接口、里程碑与真机验收矩阵见 `design/APK-PLAN.md` / `design/APK-STATUS.md`。
 
 ## 一次前端请求怎么走
 

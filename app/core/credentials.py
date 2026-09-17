@@ -14,6 +14,15 @@ SSS_SERVICE_NAME = "yikou-light-food-sss"
 
 
 def _backend():
+    """返回密码后端：Android APK 用 Keystore，桌面/Termux 用 keyring。
+
+    Android 模式下刻意不回退 keyring：APK 内通常没有可用的 keyring 后端，
+    回退只会触发无意义的 D-Bus/DBus/SecretService 异常。
+    """
+    from app.core import android_store
+
+    if android_store.is_android():
+        return android_store.backend()
     try:
         import keyring  # type: ignore
         return keyring

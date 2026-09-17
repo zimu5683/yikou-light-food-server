@@ -56,8 +56,20 @@ def platform_key() -> tuple[str, str]:
     return sys.platform, platform.machine()
 
 
-def resolve() -> tuple[str, str, str]:
+def resolve(platform_name: str | None = None) -> tuple[str, str, str]:
+    """解析目标平台。
+
+    Android APK 构建在 x86_64 runner 上执行，但需要装入 **linux-arm64**
+    的 kdocs-cli，因此支持 ``--platform linux-arm64`` 显式指定，避免把 runner
+    自己平台的 amd64 二进制塞进 APK。
+    """
     key = platform_key()
+    if platform_name:
+        for value in PLATFORMS.values():
+            if value[0] == platform_name:
+                return value
+        raise SystemExit(
+            f"未知平台名：{platform_name}。可用：{sorted(v[0] for v in PLATFORMS.values())}")
     if key not in PLATFORMS:
         raise SystemExit(
             f"暂不支持的平台：{key[0]}/{key[1]}。"
@@ -119,8 +131,8 @@ def extract(archive: Path, fmt: str, exe_name: str, dest_dir: Path) -> Path:
         return dest
 
 
-def check() -> int:
-    _, _, exe_name = resolve()
+def check(platform_name: str | None = None) -> int:
+    _, _, exe_name = resolve(platform_name)
     target = VENDOR / exe_name
     if target.is_file():
         print(f"✅ 组件就绪：{target}（{target.stat().st_size} 字节）")
@@ -133,12 +145,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="下载并校验 kdocs-cli")
     parser.add_argument("--check", action="store_true", help="只检查本地是否就绪")
     parser.add_argument("--force", action="store_true", help="已存在也重新下载")
+    parser.add_argument(
+        "--platform",
+        help="强制目标平台名（如 linux-arm64）；Android APK 构建必须使用。")
     args = parser.parse_args()
     if args.check:
-        return check()
+        return check(args.platform)
 
     VENDOR.mkdir(parents=True, exist_ok=True)
-    plat_name, fmt, exe_name = resolve()
+    plat_name, fmt, exe_name = resolve(args.platform)
     target = VENDOR / exe_name
     archive_name = f"kdocs-cli-{VERSION}-{plat_name}.{fmt}"
 

@@ -29,6 +29,13 @@ SKIP_DIRS = {
     # 历史 Chromium 载荷目录（如果本机还有残留），逐文件扫描没有意义。
     "browser",
 }
+
+#: 由 APK 构建脚本生成的目录/文件，内容不入库；--working-tree 扫描时跳过。
+GENERATED_ANDROID_PATHS = (
+    "android/app/src/main/jniLibs/",
+    "android/app/src/main/assets/runtime/",
+    "android/app/src/main/assets/dist/",
+)
 SECRET_PATTERNS = (
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     re.compile(r"\bghp_[A-Za-z0-9]{30,}\b"),
@@ -49,10 +56,13 @@ def tracked_files() -> list[Path]:
 def working_tree_files(root: Path) -> list[Path]:
     files: list[Path] = []
     for path in root.rglob("*"):
-        if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
+        relative = path.relative_to(root)
+        if any(part in SKIP_DIRS for part in relative.parts):
+            continue
+        if relative.as_posix().startswith(GENERATED_ANDROID_PATHS):
             continue
         if path.is_file():
-            files.append(path.relative_to(root))
+            files.append(relative)
     return files
 
 

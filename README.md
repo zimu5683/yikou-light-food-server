@@ -1,9 +1,12 @@
-# 一口轻食（网页版）
+# 一口轻食（网页版 / Android APK）
 
-这是一个**网页版专用**的订单处理服务：Python 提供 HTTP 接口 + React/TypeScript/Tailwind 前端，
-可跑在手机（Termux）上当服务器，其他人用浏览器访问。账号密码不会写入源码；运行主机上的
-密码通过系统密钥环（`keyring`：Windows Credential Manager / macOS Keychain /
-Linux SecretService）保存，没有可用密钥环时退化为每次运行手动输入。
+这是一个订单处理服务：Python 提供 HTTP 接口 + React/TypeScript/Tailwind 前端。
+既可以在手机（Termux）上当服务器、其他设备用浏览器访问，也支持打成
+**一个自带最小 kdocs-cli 运行环境的 arm64 APK**，无需安装 Termux。
+
+账号密码不会写入源码；Android 上使用 Android Keystore + AES-GCM 保存，
+Termux/桌面继续使用系统密钥环（`keyring`：Windows Credential Manager /
+macOS Keychain / Linux SecretService），没有可用密钥环时退化为每次运行手动输入。
 
 > **架构说明**：本项目原先同时提供桌面原生窗口版（pywebview）与浏览器自动化备用模式
 > （Playwright）。两者已**全部移除**，只保留纯接口模式：
@@ -35,6 +38,7 @@ app/
   api/                  前端唯一 API 表面 Bridge
   web/                  HTTP 服务器、鉴权、登录/管理员页面
 frontend/               React + TypeScript 前端（构建产物在 frontend/dist/）
+android/                Android APK 工程（Chaquopy + WpsRuntime 兼容层）
 tests/                  pytest 与前端契约测试
 scripts/                运维/构建脚本      tools/  一次性诊断探针
 docs/                   当前架构说明、桌面版功能对比（DESKTOP-PARITY.md）
@@ -44,6 +48,30 @@ design/                历史方案与验证资料（见 design/README.md）
 依赖方向：`web → api → 领域包（order / ordering / wps）→ core / integrations`，
 由 `tests/test_architecture_boundaries.py` 静态约束。详见
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
+
+## Android APK（arm64 独立安装）
+
+目标是把「Python 后端 + React 前端 + kdocs-cli + Termux」收敛成一个可覆盖安装的
+arm64 APK：WebView 加载现有前端，Chaquopy 在 App 进程内跑现有 `app/` 业务代码，
+Kotlin `WpsRuntime` 负责 `proot + kdocs-cli`、DNS/CA 适配和 Custom Tabs 授权。
+完整方案、接口与验收矩阵见 [`design/APK-PLAN.md`](design/APK-PLAN.md)。
+
+本地构建（需要 JDK 17 / Android SDK 35 / NDK，打 APK 前先构建前端）：
+
+```bash
+python scripts/fetch_kdocs_cli.py --platform linux-arm64
+python scripts/fetch_android_runtime.py          # 下载 proot/依赖 + NDK 编译 xdg shim
+cd frontend && pnpm install --frozen-lockfile && pnpm build
+cd ../android && ./gradlew assembleRelease
+```
+
+CI 工作流：[`.github/workflows/android.yml`](.github/workflows/android.yml)。它使用
+x86_64 runner 下载 **linux-arm64** kdocs-cli、Termux proot 依赖与 Mozilla CA，并用
+patchelf 把 RUNPATH 改成 `$ORIGIN` 后由 Chaquopy/AGP 打包。正式分发必须在 GitHub
+Secrets 配置 `YIKOU_KEYSTORE_FILE` / `YIKOU_KEYSTORE_PASSWORD` / `YIKOU_KEY_ALIAS` /
+`YIKOU_KEY_PASSWORD`；缺失时会退化为 debug 签名，只能做 M0/M1 可行性验证。
+第一次在真机跑 M0 时，建议先验证 `WpsRuntime` 诊断页输出的 `version` / `auth status`，
+再把真机结果填入 [`design/APK-STATUS.md`](design/APK-STATUS.md)。
 
 ## 网页版（手机 / 服务器当主机）
 

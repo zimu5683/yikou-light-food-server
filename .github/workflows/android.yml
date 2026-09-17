@@ -1,0 +1,158 @@
+name: Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "app/**"
+      - "frontend/**"
+      - "scripts/**"
+      - "android/**"
+      - ".github/workflows/android.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: arm64 debug/release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install Android SDK / NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: >-
+            platforms;android-35
+            build-tools;35.0.0
+            ndk;27.0.12077973
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y patchelf
+
+      - name: Python test baseline
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pytest -q
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Fetch kdocs-cli (linux-arm64) and Android runtime
+        run: |
+          python scripts/fetch_kdocs_cli.py --platform linux-arm64
+          python scripts/fetch_android_runtime.py
+
+      - name: Verify runtime components
+        run: python scripts/fetch_android_runtime.py --check
+
+      - name: Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          # CI 直接使用 action 提供官方 Gradle，避免 wrapper 在部分网络下下载超时；
+          # 本地 ./gradlew 仍固定 8.11.1 + sha256，可用 Tencent 镜像。
+          gradle-version: "8.11.1"
+
+      - name: Prepare release keystore (optional)
+        env:
+          YIKOU_KEYSTORE_BASE64: ${{ secrets.YIKOU_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$YIKOU_KEYSTORE_BASE64" ]; then
+            echo "$YIKOU_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/yikou-release.jks"
+            echo "YIKOU_KEYSTORE_FILE=$RUNNER_TEMP/yikou-release.jks" >> "$GITHUB_ENV"
+            echo "release keystore 已从 YIKOU_KEYSTORE_BASE64 还原"
+          else
+            echo "未配置 release keystore，本次 release 构建将回退 debug 签名（仅 M0/M1 可用）"
+          fi
+
+      - name: Assemble release APK
+        working-directory: android
+        env:
+          YIKOU_KEYSTORE_PASSWORD: ${{ secrets.YIKOU_KEYSTORE_PASSWORD }}
+          YIKOU_KEY_ALIAS: ${{ secrets.YIKOU_KEY_ALIAS }}
+          YIKOU_KEY_PASSWORD: ${{ secrets.YIKOU_KEY_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          gradle --no-daemon assembleRelease --stacktrace
+
+      - name: Collect artifact
+        id: artifact
+        run: |
+          set -euo pipefail
+          version=$(grep '^versionName=' android/version.properties | cut -d= -f2)
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [ "$tag_version" != "$version" ]; then
+              echo "tag $GITHUB_REF_NAME 与 android/version.properties ($version) 不一致" >&2
+              exit 1
+            fi
+          fi
+          source_apk="android/app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "$source_apk" ]; then
+            source_apk="android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          fi
+          target="$RUNNER_TEMP/yikou-light-food-${version}-arm64.apk"
+          cp "$source_apk" "$target"
+          sha256sum "$target" | tee "${target}.sha256"
+          echo "path=$target" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK + sha256
+        uses: actions/upload-artifact@v4
+        with:
+          name: yikou-light-food-${{ steps.artifact.outputs.version }}-arm64
+          path: |
+            ${{ steps.artifact.outputs.path }}
+            ${{ steps.artifact.outputs.path }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: yikou-light-food-*-arm64
+          merge-multiple: true
+          path: dist
+
+      - name: Upload APK + sha256 to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          gh release create "$tag" dist/* --title "$tag" --generate-notes \
+            || gh release upload "$tag" dist/* --clobber

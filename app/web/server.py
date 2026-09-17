@@ -805,6 +805,14 @@ class _Server(ThreadingHTTPServer):
 
 
 def default_dist_dir() -> Path:
+    """前端构建产物目录。
+
+    Android APK 通过 ``YIKOU_DIST_DIR`` 指向从 assets 解出的 ``dist/``；
+    桌面与 Termux 未设置时保持仓库内的 ``frontend/dist``。
+    """
+    override = os.environ.get("YIKOU_DIST_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
     return Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
 
