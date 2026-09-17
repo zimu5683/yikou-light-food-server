@@ -8,530 +8,80 @@ from __future__ import annotations
 
 import datetime as _dt
 
-import re
 import shutil
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable
 
-from app.core.models import MealInfo, OrderInfo
-from app.order.parsing import (
-    clear_campus_sub_sheets,
-    get_address_base_sheet_name,
-    get_yijin_address_from_product_note,
-    sort_campus_sub_sheets,
+from app.core.models import OrderInfo
+from app.order.parsing import clear_campus_sub_sheets, parse_meal_rows, sort_campus_sub_sheets
+from app.order.fetching import (
+    ORDER_STATE_REFUND_APPLIED, ORDER_STATE_REFUND_DONE, _api_list_waimai_orders,
+    _filter_rows_by_date, _group_orders_by_pick, _order_detail_by_id,
+    _order_from_api_data, _order_numbers_for_date, _prefetch_order_details,
+    parse_order_created_date, parse_target_date, split_refund_orders,
+)
+from app.order.excel_io import (
+    HISTORICAL_SHEET_HEADERS, PENDING_ADDRESS_HEADERS, SHEET_MEAL_SUFFIX, WEEKDAYS,
+    _MANUAL_CAMPUS_TO_BASE, _historical_sheet_name, _load_order_workbook,
+    _manual_address_base_sheet, _pending_report_items, _prepare_order_address,
+    _save_workbook_with_retry, _write_historical_order, _write_order, _write_unrouted_order,
+)
+from app.order.formatting import (
+    _format_address_change, _format_order_meals, _format_order_summary,
 )
 
 from app.integrations.api_client import AdminApiClient
+from app.order.common import _emit
 from app.order.aliases import aliases_path, load_aliases, write_pending
-from app.order.delivery import DEFAULT_ALIASES, normalize_delivery_point
+from app.order.delivery import DEFAULT_ALIASES
 
-REG_MEAL_COUNT = re.compile(r"x\s*(\d+)", re.I)
-REG_MEAL_SPLIT = re.compile(r"（午餐）|（晚餐）")
-SHEET_MEAL_SUFFIX = {"午餐": "中餐", "晚餐": "晚餐"}
-WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
-HISTORICAL_SHEET_HEADERS = (
-    "取单号", "姓名", "地址", "电话", *WEEKDAYS, "餐别", "经济/豪华", "总餐次",
-)
-PENDING_ADDRESS_HEADERS = (
-    "取单号", "姓名", "地址", "电话", "餐别", "餐种", "餐次",
-    "校区", "置信度", "原因", "候选点",
-)
 
 # 订单列表接口 state 取值（2026-09-11 抓包确认）：state=8 为已退款（同意后退款
 # 成功），state=7 为「用户申请退款」即退款待审批（商家还没同意，对应界面上的
 # 「退款详情/申请退款」）。这两种订单都不应写入排班表格。
-ORDER_STATE_REFUND_DONE = 8
-ORDER_STATE_REFUND_APPLIED = 7
-
-
-def parse_target_date(value: object = None, *, today: _dt.date | None = None) -> _dt.date:
-    """Parse a target date, defaulting to the local current date."""
-    current = today or _dt.date.today()
-    if value is None:
-        return current
-    if isinstance(value, _dt.datetime):
-        result = value.date()
-    elif isinstance(value, _dt.date):
-        result = value
-    else:
-        text = str(value).strip()
-        if not text:
-            return current
-        try:
-            result = _dt.date.fromisoformat(text)
-        except ValueError as exc:
-            raise ValueError("目标日期格式必须为 YYYY-MM-DD") from exc
-    if result > current:
-        raise ValueError("目标日期不能晚于今天")
-    return result
-
-
-def parse_order_created_date(value: object) -> _dt.date | None:
-    """Normalize common API date strings and Unix timestamps to a local date."""
-    if value in (None, ""):
-        return None
-    if isinstance(value, _dt.datetime):
-        return value.date()
-    if isinstance(value, _dt.date):
-        return value
-    if isinstance(value, (int, float)):
-        try:
-            timestamp = float(value)
-            if timestamp > 10_000_000_000:
-                timestamp /= 1000
-            return _dt.datetime.fromtimestamp(timestamp).date()
-        except (OverflowError, OSError, ValueError):
-            return None
-    text = str(value).strip()
-    if not text:
-        return None
-    if text.isdigit():
-        try:
-            return parse_order_created_date(int(text))
-        except ValueError:
-            return None
-    match = re.search(r"(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})", text)
-    if match:
-        try:
-            return _dt.date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
-        except ValueError:
-            return None
-    return None
-
-
-def _emit(callback: Callable[[str], Any] | None, message: str) -> None:
-    if callback:
-        callback(message)
-
-
-def parse_meal_rows(rows: Iterable[dict[str, str]], meal_type: str) -> list[MealInfo]:
-    """把订单表格里的「商品名 + 数量」解析成 MealInfo 列表。"""
-    result: list[MealInfo] = []
-    for row in rows:
-        product = str(row.get("product", ""))
-        quantity = str(row.get("qty", ""))
-        segments = REG_MEAL_SPLIT.split(product)
-        labels = REG_MEAL_SPLIT.findall(product)
-        for index, segment in enumerate(segments[:-1]):
-            current = "午餐" if labels[index] == "（午餐）" else "晚餐"
-            if current != meal_type or not segment.strip():
-                continue
-            count_match = REG_MEAL_COUNT.search(quantity)
-            result.append(MealInfo(
-                total_meals=6 if "六餐" in segment else 1 if "单点" in segment else None,
-                grade="经济" if "经济" in segment else "豪华" if "豪华" in segment else None,
-                count=int(count_match.group(1)) if count_match else 1,
-                meal_type=meal_type,
-            ))
-    return result
-
-
-def _historical_sheet_name(target_date: _dt.date) -> str:
-    return f"{target_date.year}年{target_date.month}月{target_date.day}日 {WEEKDAYS[target_date.weekday()]}"
-
-
-def _write_historical_order(wb: Any, order: OrderInfo, meal: MealInfo, meal_type: str,
-                            target_date: _dt.date) -> None:
-    """Append an old order to its dedicated date sheet instead of today's plan."""
-    sheet_name = _historical_sheet_name(target_date)
-    sheet = wb[sheet_name] if sheet_name in wb.sheetnames else wb.create_sheet(sheet_name)
-    if sheet.max_row == 1 and all(sheet.cell(1, index).value in (None, "")
-                              for index in range(1, len(HISTORICAL_SHEET_HEADERS) + 1)):
-        for index, title in enumerate(HISTORICAL_SHEET_HEADERS, 1):
-            sheet.cell(1, index).value = title
-    row = max(2, sheet.max_row + 1)
-    while sheet.cell(row, 1).value not in (None, ""):
-        row += 1
-    weekday = WEEKDAYS[target_date.weekday()]
-    values = [
-        order.order_no, order.name, order.address, order.phone,
-        *[1 if day == weekday else "" for day in WEEKDAYS],
-        meal_type, meal.grade or "", meal.total_meals or "",
-    ]
-    for index, value in enumerate(values, 1):
-        sheet.cell(row, index).value = value
-
-
-def _write_order(wb: Any, order: OrderInfo, meal: MealInfo, meal_type: str,
-                 target_date: _dt.date | None = None, today: _dt.date | None = None) -> None:
-    """Write today's plan normally, or archive a selected historical date."""
-    target_date = target_date or _dt.date.today()
-    today = today or _dt.date.today()
-    if target_date < today:
-        _write_historical_order(wb, order, meal, meal_type, target_date)
-        return
-    base = order.address_base_sheet
-    if not base:
-        return
-    weekday = WEEKDAYS[(today.weekday() + 1) % 7]
-    weekday_sheet = wb[weekday] if weekday in wb.sheetnames else wb.create_sheet(weekday)
-    target_name = f"{base}{SHEET_MEAL_SUFFIX.get(meal_type, meal_type)}"
-    target = wb[target_name] if target_name in wb.sheetnames else wb.create_sheet(target_name)
-    columns = ("A", "B", "C", "D", "E", "F") if meal_type == "午餐" else ("G", "H", "I", "J", "K", "L")
-    # 中餐/晚餐两栏各自从第 3 行起连续填充：只找本栏首列（A 或 G）的空行，
-    # 不再以整表 max_row 定位——否则两栏互相把对方顶到下一行，形成对角错位。
-    row = 3
-    while weekday_sheet[f"{columns[0]}{row}"].value not in (None, ""):
-        row += 1
-    values = (order.order_no, order.name, order.address, order.phone, meal.grade or "", meal.total_meals or "")
-    for col, value in zip(columns, values):
-        weekday_sheet[f"{col}{row}"] = value
-    # 总餐区（N~S）逐条汇总当天每一餐：与两栏一样从第 3 行起连续向下。
-    total_columns = ("N", "O", "P", "Q", "R", "S")
-    total_row = 3
-    while weekday_sheet[f"{total_columns[0]}{total_row}"].value not in (None, ""):
-        total_row += 1
-    for col, value in zip(total_columns, values):
-        weekday_sheet[f"{col}{total_row}"] = value
-    row2 = max(3, target.max_row + 1)
-    while target[f"A{row2}"].value not in (None, ""):
-        row2 += 1
-    # 「类型」列沿用表名后缀（中餐/晚餐），与工作簿里手工维护的行保持一致；
-    # 例如写入「衣锦中餐」表时类型填「中餐」，而不是接口分类「午餐」。
-    type_label = SHEET_MEAL_SUFFIX.get(meal_type, meal_type)
-    vals = [order.order_no, order.name, order.address, order.phone] + [1 if d == weekday else "" for d in WEEKDAYS] + [type_label, meal.grade or "", meal.total_meals or ""]
-    for idx, value in enumerate(vals, 1):
-        target.cell(row2, idx).value = value
-
-
-def _write_unrouted_order(wb: Any, order: OrderInfo, meal: MealInfo, meal_type: str) -> None:
-    """Write an order whose campus is unknown to a dedicated review sheet."""
-    sheet = wb["待确认地址"] if "待确认地址" in wb.sheetnames else wb.create_sheet("待确认地址")
-    if sheet.max_row == 1 and all(sheet.cell(1, i).value in (None, "")
-                                  for i in range(1, len(PENDING_ADDRESS_HEADERS) + 1)):
-        for i, title in enumerate(PENDING_ADDRESS_HEADERS, 1):
-            sheet.cell(1, i).value = title
-    row = max(2, sheet.max_row + 1)
-    while sheet.cell(row, 1).value not in (None, ""):
-        row += 1
-    dp = order.metadata.get("delivery_point") or {}
-    values = [
-        order.order_no, order.name, order.delivery_address or order.address, order.phone,
-        meal_type, meal.grade or "", meal.total_meals or "", dp.get("campus", "未知"),
-        dp.get("confidence", "unknown"), dp.get("reason", ""),
-        "、".join((dp.get("candidates") or {}).keys()),
-    ]
-    for i, value in enumerate(values, 1):
-        sheet.cell(row, i).value = value
-
-
-def _prepare_order_address(order: OrderInfo, aliases: dict[str, str]) -> dict[str, Any]:
-    """Apply canonical address rules while retaining the platform address."""
-    raw = order.delivery_address or order.address or ""
-    result = normalize_delivery_point(raw, aliases=aliases)
-    campus = result.get("campus")
-    base = order.address_base_sheet
-    if campus == "东湖农林":
-        base = "东湖"
-    elif campus == "医学院":
-        base = "医学院"
-    elif campus == "衣锦联建":
-        base = "衣锦"
-    order.delivery_address = raw
-    order.address_base_sheet = base
-    if campus == "衣锦联建":
-        point = order.address or "校门口"
-        result = {
-            **result, "point": point, "confidence": "high",
-            "reason": "衣锦沿用商品备注规则", "candidates": {point: 1},
-        }
-    order.metadata["delivery_point"] = result
-    if campus in {"东湖农林", "医学院"}:
-        order.address = result.get("point") or raw
-    elif campus == "衣锦联建":
-        order.address = order.address or "校门口"
-    else:
-        order.address = raw
-    return result
-
-
-def _pending_report_items(orders: list[OrderInfo]) -> list[dict[str, Any]]:
-    """Deduplicate pending addresses while retaining every affected order."""
-    grouped: dict[str, dict[str, Any]] = {}
-    for order in orders:
-        dp = order.metadata.get("delivery_point") or {}
-        raw = order.delivery_address or order.address or ""
-        item = grouped.setdefault(raw, {
-            "order_numbers": [], "campus": dp.get("campus", "未知"),
-            "raw_address": raw, "confidence": dp.get("confidence", "unknown"),
-            "reason": dp.get("reason", ""), "candidates": dp.get("candidates") or {},
-            "suggested_point": dp.get("point") or "",
-        })
-        if order.order_no not in item["order_numbers"]:
-            item["order_numbers"].append(order.order_no)
-    return list(grouped.values())
-
-
-_MANUAL_CAMPUS_TO_BASE = {
-    "东湖农林": "东湖", "医学院": "医学院", "衣锦联建": "衣锦",
-}
-
-def _manual_address_base_sheet(order: OrderInfo, value: str) -> str:
-    """手动填写的地址优先按自身校区/点位判断，其次沿用订单原校区。"""
-    detected = get_address_base_sheet_name(value)
-    if detected:
-        return detected
-    if order.address_base_sheet:
-        return order.address_base_sheet
-    dp = order.metadata.get("delivery_point") or {}
-    base = _MANUAL_CAMPUS_TO_BASE.get(str(dp.get("campus") or ""), "")
-    if base:
-        return base
-    # 用户直接输入排单短名时，按点位自身推断校区。
-    compact = re.sub(r"\s+", "", value)
-    if re.fullmatch(r"[A-Da-d]\d{1,2}", compact):
-        return "东湖"
-    if re.fullmatch(r"医\d+号", compact):
-        return "医学院"
-    return ""
-
-
-def _load_order_workbook(excel_path: Path, loader: Callable[..., Any] | None = None) -> Any:
-    if loader is None:
-        from openpyxl import load_workbook
-        loader = load_workbook
-    return loader(excel_path, keep_vba=excel_path.suffix.lower() == ".xlsm")
-
-
-def _order_from_api_data(code: str, data: dict[str, Any]) -> OrderInfo | None:
-    """把 /channel/order/{id} 的 data 字段解析为订单；字段全空时返回 None。
-
-    字段映射与页面渲染一致：address.contact=收货人、address.mobile=电话、
-    address.address+description=配送地址、goods[].name/num=商品与数量
-    （名称自带（午餐）/（晚餐）标签）、attrData.matal=商品备注。
-    """
-    address_info = data.get("address") or {}
-    raw_address = " ".join(
-        str(address_info.get(k) or "").strip() for k in ("address", "description")
-    ).strip()
-    address = raw_address
-    name = str(address_info.get("contact") or "").strip()
-    phone = str(address_info.get("mobile") or data.get("mobile") or "").strip()
-    if not name:
-        name = str((data.get("user") or {}).get("nickname") or "").strip()
-    rows = [{"product": str(g.get("name") or ""), "qty": f"x {g.get('num') or 1}"}
-            for g in (data.get("goods") or []) if g.get("name")]
-    notes: list[str] = []
-    for goods in data.get("goods") or []:
-        attr = goods.get("attrData") or {}
-        if attr.get("matal"):
-            notes.append(str(attr["matal"]))
-        for material in attr.get("material") or []:
-            if isinstance(material, dict) and material.get("name"):
-                notes.append(str(material["name"]))
-    base = get_address_base_sheet_name(address)
-    if base == "衣锦":
-        address = get_yijin_address_from_product_note(" ".join(notes))
-    metadata = {
-        "order_id": str(data.get("id") or ""),
-        "created_at": next((data.get(key) for key in
-                             ("created_at", "createdAt", "create_time", "createTime", "order_time", "orderTime")
-                             if data.get(key) not in (None, "")), None),
-    }
-    candidate = OrderInfo(
-        code, name, phone, address, base, delivery_address=raw_address, metadata=metadata
-    )
-    candidate.lunch = parse_meal_rows(rows, "午餐")
-    candidate.dinner = parse_meal_rows(rows, "晚餐")
-    if not (name or phone or address or candidate.lunch or candidate.dinner):
-        return None
-    return candidate
-
-
-def _api_list_waimai_orders(api_get: Callable[[str], dict[str, Any]],
-                            selected_date: _dt.date,
-                            callback: Callable[[str], Any] | None = None,
-                            page_size: int = 200, max_pages: int = 200,
-                            concurrent_pages: bool = False) -> list[dict[str, Any]]:
-    """分页拉取外送订单（scene=1，新单在前）。
-
-    实测 m.icall.me 的 ``/channel/order`` GET 接口不支持 ``startTime/endTime``
-    服务端过滤，只能整表分页拉取后由本程序按目标日期筛选。因此这里直接
-    并发拉取全部分页，并使用较大的 ``pageSize=200`` 减少请求次数。
-
-    ``concurrent_pages=True`` 时剩余分页并发拉取（HTTP 客户端每次调用独立，
-    不会像浏览器会话那样受单页并发限制）。
-    """
-    def parse_batch(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        for item in batch:
-            created = item.get("created_at")
-            out.append({
-                "order_id": str(item.get("id") or ""),
-                "pick_no": str(item.get("pickNo") or "").strip(),
-                "store_id": str(item.get("storeId") or ""),
-                "created_at": created,
-                "date": parse_order_created_date(created),
-                # 退款状态字段：state=8 已退款 / state=7 用户申请退款（待审批）。
-                # 列表接口完整响应里直接携带，详情页反而没有统一字段，故在此保留。
-                "state": item.get("state"),
-            })
-        return out
-
-    def fetch_page(page_no: int, page_size_arg: int,
-                   start_time: str = "", end_time: str = "") -> tuple[list[dict[str, Any]], int | None]:
-        payload = api_get(
-            "/channel/order?scene=1&storeId=&orderSn=&userKeyword=&state=&payType=&source="
-            f"&pageNo={page_no}&pageSize={page_size_arg}&startTime={start_time}&endTime={end_time}",
-        )
-        data = payload.get("data") or {}
-        batch = data.get("list") or []
-        total = data.get("total")
-        return parse_batch(batch), (int(total) if isinstance(total, int) else None)
-
-    def fetch_serial(page_size_arg: int, start_time: str = "", end_time: str = "") -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        for page_no in range(1, max_pages + 1):
-            batch, total = fetch_page(page_no, page_size_arg, start_time, end_time)
-            if not batch:
-                break
-            rows.extend(batch)
-            if total is not None and page_no * page_size_arg >= total:
-                break
-        return rows
-
-    def fetch_concurrent(page_size_arg: int, start_time: str = "", end_time: str = "") -> list[dict[str, Any]]:
-        first_batch, total = fetch_page(1, page_size_arg, start_time, end_time)
-        if not first_batch:
-            return []
-        rows = list(first_batch)
-        effective = len(first_batch)
-        if total is None or total <= len(rows) or effective <= 0:
-            return rows
-        total_pages = (total + effective - 1) // effective
-        remaining = list(range(2, min(total_pages, max_pages) + 1))
-        if not remaining:
-            return rows
-
-        def load(page_no: int) -> list[dict[str, Any]]:
-            batch, _ = fetch_page(page_no, page_size_arg, start_time, end_time)
-            return batch
-
-        # 实测 pageSize=200 + 10 并发时，6150 条订单约 3~4 秒拉完。
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            for batch in executor.map(load, remaining):
-                rows.extend(batch)
-        return rows
-
-    def fetch_safe(page_size_arg: int) -> list[dict[str, Any]]:
-        try:
-            if concurrent_pages:
-                return fetch_concurrent(page_size_arg)
-            return fetch_serial(page_size_arg)
-        except Exception:
-            # 大 pageSize 不被支持时逐级回退，优先保证能完成任务。
-            for fallback in (100, 50):
-                if page_size_arg > fallback:
-                    try:
-                        return fetch_serial(fallback)
-                    except Exception:
-                        continue
-            raise
-
-    return fetch_safe(page_size)
 
 
 
-def _group_orders_by_pick(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """按取单号分组（保持接口的新单在前顺序）；无取单号的忽略。"""
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for row in rows:
-        pick = str(row.get("pick_no") or "").strip()
-        if pick:
-            grouped.setdefault(pick, []).append(row)
-    return grouped
 
 
-def _filter_rows_by_date(rows: list[dict[str, Any]], selected_date: _dt.date) -> list[dict[str, Any]]:
-    """先按目标日期筛选订单，避免在遍历 W 编号时再逐单判断日期。"""
-    return [row for row in rows if row.get("date") == selected_date]
 
 
-def _order_numbers_for_date(rows_by_pick: dict[str, list[dict[str, Any]]],
-                            order_count: int | None = None) -> list[int]:
-    """返回需要处理的 W 编号列表（从大到小）。
-
-    ``order_count`` 为空时返回目标日期全部存在的 W 编号；
-    有值时只返回不超过 ``order_count`` 且当天实际存在的编号。
-    """
-    numbers = sorted(
-        (int(code[1:]) for code in rows_by_pick
-         if code.startswith("W") and code[1:].isdigit()),
-        reverse=True,
-    )
-    if order_count:
-        numbers = [n for n in numbers if n <= order_count]
-    return numbers
 
 
-def split_refund_orders(rows_by_pick: dict[str, list[dict[str, Any]]],
-                        numbers: list[int]) -> tuple[list[int], list[int], list[int]]:
-    """把待处理编号按退款状态分成三类：(正常, 退款成功, 申请退款中)。
-
-    每行来自已按目标日期过滤的列表接口记录，携带 ``state`` 字段：
-    state=8 已退款（同意后退款成功）、state=7 用户申请退款（待审批）。
-    一个取单号若含多条记录，任一记录命中退款状态即归入对应退款类，
-    且从正常列表剔除（后续不再拉详情/写表）。返回的编号均为从大到小。
-    """
-    refunded: list[int] = []
-    applied: list[int] = []
-    normal: list[int] = []
-    for number in numbers:
-        code = f"W{number}"
-        rows = rows_by_pick.get(code, [])
-        if any(int(r.get("state") or 0) == ORDER_STATE_REFUND_DONE for r in rows):
-            refunded.append(number)
-        elif any(int(r.get("state") or 0) == ORDER_STATE_REFUND_APPLIED for r in rows):
-            applied.append(number)
-        else:
-            normal.append(number)
-    # 保持原有从大到小顺序。
-    return (normal, refunded, applied)
 
 
-def _order_detail_by_id(api_get: Callable[[str], dict[str, Any]],
-                         code: str, order_id: str, store_id: str) -> OrderInfo | None:
-    """直接从详情接口读取订单，偶发失败自动重试一次。"""
-    for attempt in range(2):
-        try:
-            payload = api_get(f"/channel/order/{order_id}?storeId={store_id}")
-            data = payload.get("data")
-        except Exception:
-            data = None
-        if isinstance(data, dict):
-            order = _order_from_api_data(code, data)
-            if order is not None:
-                order.metadata["order_id"] = order_id
-                return order
-        if attempt == 0:
-            time.sleep(1)
-    return None
 
 
-def _prefetch_order_details(api_get: Callable[[str], dict[str, Any]],
-                            rows_by_pick: dict[str, list[dict[str, Any]]],
-                            numbers: list[int], max_workers: int = 5) -> dict[int, OrderInfo]:
-    """并发预取订单详情（纯接口模式），返回 {W编号: 订单}，失败项不包含在内。
 
-    成功项在串行写表时直接复用；失败项仍走原有串行重试/决策流程。
-    """
-    tasks = []
-    for number in numbers:
-        candidates = rows_by_pick.get(f"W{number}", [])
-        if candidates:
-            tasks.append((number, candidates[0]))
 
-    def fetch(task: tuple[int, dict[str, Any]]) -> tuple[int, OrderInfo | None]:
-        number, entry = task
-        order = _order_detail_by_id(
-            api_get, f"W{number}", entry["order_id"], entry["store_id"])
-        return number, order
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        results = executor.map(fetch, tasks)
-    return {number: order for number, order in results if order is not None}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def run_job(config: Any, order_count: int | None, stop_event: Any, progress_callback: Callable[[str], Any] | None = None, password: str | None = None,
@@ -809,55 +359,45 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
             "address_pending": len(pending_numbers),
             "address_pending_orders": pending_numbers}
 
-
-def _save_workbook_with_retry(workbook: Any, excel_path: Path,
-                              decision_callback: Callable[[str], str] | None = None) -> None:
-    """Save an Excel workbook, allowing the user to close a locked file and retry."""
-    while True:
-        try:
-            workbook.save(str(excel_path))
-            return
-        except PermissionError as exc:
-            if decision_callback is None:
-                raise
-            decision = decision_callback(str(exc)).strip().lower()
-            if decision not in {"retry", "重试", "再次保存"}:
-                raise PermissionError(f"已取消保存 Excel 文件：{excel_path}") from exc
-
-
-def _format_order_meals(order: OrderInfo) -> str:
-    parts: list[str] = []
-    for meal_type, meals in (("午餐", order.lunch), ("晚餐", order.dinner)):
-        for meal in meals:
-            grade = meal.grade or "未标注"
-            total = f"{meal.total_meals}餐" if meal.total_meals else "餐品"
-            parts.append(f"{meal_type}{grade}{total} x{meal.count}")
-    return "、".join(parts) if parts else "未识别"
-
-
-def _format_address_change(order: OrderInfo) -> str:
-    """Platform address rewritten into the sheet point, joined by an arrow.
-
-    订单摘要里需要一眼看出「平台原地址被改成了排单用的哪个取餐点」：
-    原地址与写入地址一致时（未改动或待确认）只显示原地址；有改动时
-    显示 ``原地址 → 取餐点``，方便人工在日志里复核改写是否合理。
-    """
-    raw = (order.delivery_address or "").strip()
-    point = (order.address or "").strip()
-    if raw and point and raw != point:
-        return f"{raw} → {point}"
-    return point or raw or "未填写"
-
-
-def _format_order_summary(order: OrderInfo, meal_text: str | None = None) -> str:
-    """Render one compact, user-facing line for a successfully read order."""
-    meals = meal_text if meal_text is not None else _format_order_meals(order)
-    return "｜".join((
-        order.order_no or "未知订单",
-        order.name or "未填写",
-        order.phone or "未填写",
-        _format_address_change(order),
-        meals,
-    ))
-
-
+__all__ = [
+    "AdminApiClient",
+    "DEFAULT_ALIASES",
+    "HISTORICAL_SHEET_HEADERS",
+    "ORDER_STATE_REFUND_APPLIED",
+    "ORDER_STATE_REFUND_DONE",
+    "OrderInfo",
+    "PENDING_ADDRESS_HEADERS",
+    "SHEET_MEAL_SUFFIX",
+    "WEEKDAYS",
+    "_MANUAL_CAMPUS_TO_BASE",
+    "_api_list_waimai_orders",
+    "_emit",
+    "_filter_rows_by_date",
+    "_format_address_change",
+    "_format_order_meals",
+    "_format_order_summary",
+    "_group_orders_by_pick",
+    "_historical_sheet_name",
+    "_load_order_workbook",
+    "_manual_address_base_sheet",
+    "_order_detail_by_id",
+    "_order_from_api_data",
+    "_order_numbers_for_date",
+    "_pending_report_items",
+    "_prefetch_order_details",
+    "_prepare_order_address",
+    "_save_workbook_with_retry",
+    "_write_historical_order",
+    "_write_order",
+    "_write_unrouted_order",
+    "aliases_path",
+    "clear_campus_sub_sheets",
+    "load_aliases",
+    "parse_meal_rows",
+    "parse_order_created_date",
+    "parse_target_date",
+    "run_job",
+    "sort_campus_sub_sheets",
+    "split_refund_orders",
+    "write_pending",
+]

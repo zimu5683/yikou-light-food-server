@@ -8,7 +8,7 @@ import datetime as _dt
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple
 
 from app.core.models import MealInfo, OrderInfo
 
@@ -342,3 +342,28 @@ def sort_campus_sub_sheets(workbook: Any, log: Callable[[str], Any] | None = Non
         log(f"{title}：已按地址整理（{len(rows)} 行）")
 
     return sorted_sheets
+
+REG_MEAL_COUNT = re.compile(r"x\s*(\d+)", re.I)
+
+REG_MEAL_SPLIT = re.compile(r"（午餐）|（晚餐）")
+
+def parse_meal_rows(rows: Iterable[dict[str, str]], meal_type: str) -> list[MealInfo]:
+    """把订单表格里的「商品名 + 数量」解析成 MealInfo 列表。"""
+    result: list[MealInfo] = []
+    for row in rows:
+        product = str(row.get("product", ""))
+        quantity = str(row.get("qty", ""))
+        segments = REG_MEAL_SPLIT.split(product)
+        labels = REG_MEAL_SPLIT.findall(product)
+        for index, segment in enumerate(segments[:-1]):
+            current = "午餐" if labels[index] == "（午餐）" else "晚餐"
+            if current != meal_type or not segment.strip():
+                continue
+            count_match = REG_MEAL_COUNT.search(quantity)
+            result.append(MealInfo(
+                total_meals=6 if "六餐" in segment else 1 if "单点" in segment else None,
+                grade="经济" if "经济" in segment else "豪华" if "豪华" in segment else None,
+                count=int(count_match.group(1)) if count_match else 1,
+                meal_type=meal_type,
+            ))
+    return result

@@ -78,14 +78,14 @@ app/integrations/  外部 HTTP 客户端（requests）
 
 - `app/wps/sync.py` → `errors / models / common / cli / ledger / reader / planner / executor`
 - `app/ordering/sss.py` → `constants / common / records / workbook / models / fingerprint / payload / reconcile / submission / runner`
+- `app/order/runner.py` → `common / fetching / excel_io / formatting`
 
 以下文件仍偏大，建议继续按“每次移动一个模块、保持 public API 与测试绿”拆分：
 
 1. `app/api/bridge.py`（约 1560 行）→ `events.py` / `interactions.py` /
    `services/wps.py` / `tasks.py`，`Bridge` 用组合拼起来。
 2. `app/web/server.py`（约 1070 行）→ `routing.py` / `static.py` / `fs_browser.py`。
-3. `app/order/runner.py`（约 860 行）→ 把抓单分页、详情预取、Excel 写入拆开。
-4. `app/ordering/cloud_import.py`（约 520 行）→ `roster.py` / `archive.py`。
+3. `app/ordering/cloud_import.py`（约 520 行）→ `roster.py` / `archive.py`。
 
 拆分前先用 rope 的 `move-module`/`rename-module` 做机械化移动（见
 `.zcode/skills/python-rope-refactor`），再改行为；`tests/test_architecture_boundaries.py`

@@ -11,7 +11,7 @@ from collections import Counter
 from urllib.parse import urlencode
 from typing import Any, Callable
 
-from app.order.runner import _emit
+from app.order.common import _emit
 from app.ordering.common import _trace
 from app.ordering.constants import (
     _INACTIVE_ORDER_STATUS,

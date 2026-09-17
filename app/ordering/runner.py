@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.integrations.api_client import SssApiClient
-from app.order.runner import _emit
+from app.order.common import _emit
 from app.ordering.cloud_import import prepare_day_orders
 from app.ordering.constants import (
     DEFAULT_SSS_URL,

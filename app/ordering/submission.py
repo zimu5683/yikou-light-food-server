@@ -12,7 +12,7 @@ from app.integrations.api_client import (
     ApiError, SssApiClient, SssTransportError,
     auth_error_message, is_auth_expired_payload,
 )
-from app.order.runner import _emit
+from app.order.common import _emit
 from app.ordering.common import _trace
 from app.ordering.constants import (
     _ACCOUNT_PATH,

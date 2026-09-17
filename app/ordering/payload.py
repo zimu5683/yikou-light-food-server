@@ -8,7 +8,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
-from app.order.runner import _emit
+from app.order.common import _emit
 from app.ordering.constants import (
     DEFAULT_SHEETS,
     _DRY_RUN_PREVIEW_N,
