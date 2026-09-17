@@ -80,12 +80,14 @@ app/integrations/  外部 HTTP 客户端（requests）
 - `app/ordering/sss.py` → `constants / common / records / workbook / models / fingerprint / payload / reconcile / submission / runner`
 - `app/order/runner.py` → `common / fetching / excel_io / formatting`
 - `app/ordering/cloud_import.py` → `import_models / roster / archive / service`
+- `app/web/server.py` 的静态文件与文件浏览 → `static_files.py` / `fs_browser.py`
 
 以下文件仍偏大，建议继续按“每次移动一个模块、保持 public API 与测试绿”拆分：
 
 1. `app/api/bridge.py`（约 1560 行）→ `events.py` / `interactions.py` /
    `services/wps.py` / `tasks.py`，`Bridge` 用组合拼起来。
-2. `app/web/server.py`（约 1070 行）→ `routing.py` / `static.py` / `fs_browser.py`。
+2. `app/web/server.py`（约 990 行）→ 继续抽 `routing.py` / `session_auth.py`
+   （静态资源与文件浏览已拆出）。
 
 拆分前先用 rope 的 `move-module`/`rename-module` 做机械化移动（见
 `.zcode/skills/python-rope-refactor`），再改行为；`tests/test_architecture_boundaries.py`

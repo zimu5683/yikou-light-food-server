@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import json
-import mimetypes
 import os
 import secrets
 import socket
@@ -31,7 +30,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from app import __version__
 from app.api.bridge import Bridge
@@ -47,16 +46,12 @@ DEFAULT_PORT = 8756
 #: 不通过 HTTP 暴露的方法：attach 由服务端启动时内部调用，走 HTTP 没有意义。
 _NON_HTTP = frozenset({"attach"})
 
-#: 文件浏览器默认展示的根目录候选（按存在与否过滤）。
-_BROWSE_ROOTS = (
-    "/sdcard",
-    "/storage/emulated/0",
-    "/storage/emulated/0/Download",
-    "/storage/emulated/0/Documents",
-)
+# 兼容旧导入：文件浏览器常量仍可从 app.web.server 取。
+from app.web.fs_browser import EXCEL_SUFFIXES as _EXCEL_SUFFIXES, browse_root, list_dir
+from app.web.static_files import StaticFileError, read_static
 
-#: Excel 相关后缀，供文件浏览器过滤。
-EXCEL_SUFFIXES = frozenset({".xlsx", ".xlsm", ".xls"})
+#: 兼容旧导入：文件浏览器过滤后缀。
+EXCEL_SUFFIXES = _EXCEL_SUFFIXES
 
 #: 会话 Cookie 名。HttpOnly 由服务端设置，前端不需要（也不能）读取它。
 SESSION_COOKIE = "yikou_session"
@@ -727,32 +722,11 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- 静态文件 ------------------------------------------------------
     def _serve_static(self, route: str) -> None:
-        rel = unquote(route).lstrip("/") or "index.html"
-        dist = self._dist.resolve()
         try:
-            candidate = (dist / rel).resolve()
-        except (OSError, RuntimeError):
-            self._send_error_json(HTTPStatus.BAD_REQUEST, "非法路径", "bad_path")
+            body, ctype, cache = read_static(route, self._dist)
+        except StaticFileError as exc:
+            self._send_error_json(exc.status, exc.message, exc.code)
             return
-        # 目录穿越防护：解析后必须仍在 dist 之内。
-        if candidate != dist and dist not in candidate.parents:
-            self._send_error_json(HTTPStatus.FORBIDDEN, "越权路径", "forbidden")
-            return
-        if candidate.is_dir():
-            candidate = candidate / "index.html"
-        if not candidate.is_file():
-            self._send_error_json(HTTPStatus.NOT_FOUND, "文件不存在", "not_found")
-            return
-        try:
-            body = candidate.read_bytes()
-        except OSError as exc:
-            self._send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, f"读取失败：{exc}", "read_failed")
-            return
-        ctype = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
-        if ctype.startswith("text/") or ctype in {"application/javascript", "application/json"}:
-            ctype += "; charset=utf-8"
-        # index.html 不缓存：重新构建前端后刷新即可生效。
-        cache = "no-store" if candidate.name == "index.html" else "public, max-age=300"
         self._send_bytes(body, 200, ctype, {"Cache-Control": cache})
 
     # -- 文件浏览器 ----------------------------------------------------
@@ -760,64 +734,7 @@ class _Handler(BaseHTTPRequestHandler):
         """列出服务器（也就是跑任务那台手机）上的目录，供前端选择 Excel 路径。"""
         query = parse_qs(urlparse(self.path).query)
         raw = (query.get("path") or [""])[0].strip()
-        home = Path.home()
-        if not raw:
-            target = next((Path(p) for p in _BROWSE_ROOTS if Path(p).is_dir()), home)
-        else:
-            target = Path(os.path.expanduser(raw))
-        result = self._list_dir(target)
-        self._send_json(result)
-
-    @staticmethod
-    def _list_dir(target: Path) -> dict[str, Any]:
-        try:
-            target = target.resolve()
-        except (OSError, RuntimeError) as exc:
-            return {"path": str(target), "error": f"路径无效：{exc}", "entries": []}
-        if not target.is_dir():
-            return {"path": str(target), "error": "目录不存在或不是目录", "entries": []}
-
-        entries: list[dict[str, Any]] = []
-        try:
-            for child in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
-                if child.name.startswith("."):
-                    continue
-                try:
-                    is_dir = child.is_dir()
-                    size = 0 if is_dir else child.stat().st_size
-                except OSError:
-                    # 单个条目不可读（权限/符号链接断开）时跳过，不让整页失败。
-                    continue
-                if not is_dir and child.suffix.lower() not in EXCEL_SUFFIXES:
-                    continue
-                entries.append({
-                    "name": child.name,
-                    "path": str(child),
-                    "is_dir": is_dir,
-                    "size": size,
-                })
-        except PermissionError:
-            # Android 11+ 未授权存储时 /sdcard 不可读，给出可执行的修复指引。
-            return {
-                "path": str(target),
-                "error": "没有权限读取该目录。若要访问手机存储，请先在 Termux 执行 "
-                         "termux-setup-storage 并允许权限。",
-                "entries": [],
-            }
-        except OSError as exc:
-            return {"path": str(target), "error": f"读取目录失败：{exc}", "entries": []}
-
-        home = Path.home()
-        shortcuts = [{"name": p, "path": p} for p in _BROWSE_ROOTS if Path(p).is_dir()]
-        if home.is_dir():
-            shortcuts.append({"name": "Termux 主目录", "path": str(home)})
-        return {
-            "path": str(target),
-            "parent": str(target.parent) if target.parent != target else "",
-            "entries": entries,
-            "shortcuts": shortcuts,
-            "error": "",
-        }
+        self._send_json(list_dir(browse_root(raw)))
 
     # -- 桥接分发 ------------------------------------------------------
     def _handle_bridge_call(self, name: str) -> None:
