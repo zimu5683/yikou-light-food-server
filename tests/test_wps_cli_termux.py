@@ -33,13 +33,19 @@ def termux(tmp_path, monkeypatch):
 
 def _hide_system_resolv(monkeypatch, exists: bool):
     real_exists = wps_cli.Path.exists
+    system_resolv = wps_cli.Path("/etc/resolv.conf")
 
     def fake_exists(self):
-        if str(self) == "/etc/resolv.conf":
+        if self == system_resolv:
             return exists
         return real_exists(self)
 
     monkeypatch.setattr(wps_cli.Path, "exists", fake_exists)
+
+
+def _resolv_bind(termux) -> str:
+    """Termux proot 的 resolv.conf bind 参数；Windows 上必须沿用 Path 的渲染格式。"""
+    return f"{termux / 'etc' / 'resolv.conf'}:/etc/resolv.conf"
 
 
 def test_non_termux_environment_is_untouched(monkeypatch):
@@ -56,8 +62,7 @@ def test_prefix_without_termux_marker_is_ignored(monkeypatch, tmp_path):
 def test_termux_binds_resolv_conf_and_points_ca_bundle(termux, monkeypatch):
     _hide_system_resolv(monkeypatch, exists=False)
     prefix, env = termux_cli_runtime()
-    assert prefix[:3] == ["/fake/bin/proot", "-b",
-                          f"{termux}/etc/resolv.conf:/etc/resolv.conf"]
+    assert prefix[:3] == ["/fake/bin/proot", "-b", _resolv_bind(termux)]
     assert env["SSL_CERT_FILE"] == str(termux / "etc" / "tls" / "cert.pem")
 
 
@@ -82,8 +87,7 @@ def test_login_argv_carries_the_proot_prefix(termux, monkeypatch):
     monkeypatch.setattr(wps_cli, "find_cli", lambda _=None: "/fake/kdocs-cli")
     cli = KdocsCli(None)
     argv = cli.login_argv()
-    assert argv[:3] == ["/fake/bin/proot", "-b",
-                        f"{termux}/etc/resolv.conf:/etc/resolv.conf"]
+    assert argv[:3] == ["/fake/bin/proot", "-b", _resolv_bind(termux)]
     assert argv[-2:] == ["auth", "login"]
     # auth login 需要联网轮询授权状态，所以也必须带上 CA 环境。
     assert cli.login_env()["SSL_CERT_FILE"]
@@ -115,8 +119,7 @@ def test_run_once_passes_prefix_and_env_to_subprocess(termux, monkeypatch):
     KdocsCli(None)._run_once("sheet", "get-sheets-info", params={"file_id": "x"})
 
     cmd = captured["cmd"]
-    assert cmd[:3] == ["/fake/bin/proot", "-b",
-                       f"{termux}/etc/resolv.conf:/etc/resolv.conf"]
+    assert cmd[:3] == ["/fake/bin/proot", "-b", _resolv_bind(termux)]
     assert cmd[3] == "/fake/kdocs-cli"
     assert cmd[-2] == "--file"
     env = captured["env"]
