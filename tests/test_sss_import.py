@@ -12,6 +12,7 @@ import pytest
 
 from app.wps.sync import WpsCloudError
 from app.ordering import cloud_import as si, sss
+from app.ordering import runner as sss_runner
 
 LUNCH_FILE = "F_LUNCH"
 DINNER_FILE = "F_DINNER"
@@ -428,12 +429,12 @@ def test_run_sss_job_wps_source_refuses_before_login(monkeypatch):
         def __init__(self, *args, **kwargs):
             created.append("client")
 
-    monkeypatch.setattr(sss, "SssApiClient", BoomClient)
+    monkeypatch.setattr(sss_runner, "SssApiClient", BoomClient)
 
     def refuse(config, **kwargs):
         raise si.ImportRefused("云端读取失败：额度用尽")
 
-    monkeypatch.setattr(sss, "prepare_day_orders", refuse)
+    monkeypatch.setattr(sss_runner, "prepare_day_orders", refuse)
     config = make_config(sss_dry_run=False, sss_account="18758187837")
     with pytest.raises(si.ImportRefused, match="额度用尽"):
         sss.run_sss_job(config, _Stop(), lambda message: None, password="x")
@@ -448,7 +449,7 @@ def test_run_sss_job_wps_source_uses_memory_orders(monkeypatch, tmp_path):
         "晚餐": [{"row": 15, "name": "云端晚餐", "door": "C3", "phone": "13800000002"}],
     }
     day = si.DayOrders(target_date=TARGET, orders_by_sheet=orders)
-    monkeypatch.setattr(sss, "prepare_day_orders", lambda config, **kwargs: day)
+    monkeypatch.setattr(sss_runner, "prepare_day_orders", lambda config, **kwargs: day)
 
     logs: list[str] = []
     config = make_config(tmp_path, sss_dry_run=True)
@@ -464,7 +465,7 @@ def test_run_sss_job_wps_source_uses_memory_orders(monkeypatch, tmp_path):
 
 def test_run_sss_job_wps_source_no_orders_returns_status(monkeypatch):
     day = si.DayOrders(target_date=TARGET, orders_by_sheet={"午餐": [], "晚餐": []})
-    monkeypatch.setattr(sss, "prepare_day_orders", lambda config, **kwargs: day)
+    monkeypatch.setattr(sss_runner, "prepare_day_orders", lambda config, **kwargs: day)
     logs: list[str] = []
     result = sss.run_sss_job(make_config(sss_dry_run=True), _Stop(), logs.append,
                              password="x")

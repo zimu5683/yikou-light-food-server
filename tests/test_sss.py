@@ -6,6 +6,9 @@ import datetime as dt
 import pytest
 
 from app.ordering import sss
+from app.ordering import reconcile as sss_reconcile
+from app.ordering import runner as sss_runner
+from app.ordering import submission as sss_submission
 
 
 def test_compute_delivery_time_lunch_before_16():
@@ -610,7 +613,7 @@ def test_reconcile_tasks_forwards_prefilter():
 
 def test_safe_reconcile_falls_back_to_full_scan_when_prefilter_misses(monkeypatch):
     """预筛窗口漏单时必须用全量扫描复核，绝不能据此误判缺失。"""
-    monkeypatch.setattr(sss, "_SSS_SERVER_PREFILTER", True)
+    monkeypatch.setattr(sss_reconcile, "_SSS_SERVER_PREFILTER", True)
     task = _task()
     calls = []
 
@@ -630,7 +633,7 @@ def test_safe_reconcile_falls_back_to_full_scan_when_prefilter_misses(monkeypatc
 
 def test_safe_reconcile_zero_window_retry_recovers_without_full_scan(monkeypatch):
     """预筛窗口 0 条但重查即命中时，只多花一次重查，不应退化成全量扫描。"""
-    monkeypatch.setattr(sss, "_SSS_SERVER_PREFILTER", True)
+    monkeypatch.setattr(sss_reconcile, "_SSS_SERVER_PREFILTER", True)
     task = _task()
     calls = []
 
@@ -650,7 +653,7 @@ def test_safe_reconcile_zero_window_retry_recovers_without_full_scan(monkeypatch
 
 
 def test_safe_reconcile_skips_full_scan_when_prefilter_matches(monkeypatch):
-    monkeypatch.setattr(sss, "_SSS_SERVER_PREFILTER", True)
+    monkeypatch.setattr(sss_reconcile, "_SSS_SERVER_PREFILTER", True)
     task = _task()
     calls = []
 
@@ -666,7 +669,7 @@ def test_safe_reconcile_skips_full_scan_when_prefilter_matches(monkeypatch):
 
 def test_safe_reconcile_uses_full_scan_when_prefilter_request_fails(monkeypatch):
     """预筛请求报错时仍然降级全量扫描，而不是直接判对账失败。"""
-    monkeypatch.setattr(sss, "_SSS_SERVER_PREFILTER", True)
+    monkeypatch.setattr(sss_reconcile, "_SSS_SERVER_PREFILTER", True)
     task = _task()
     calls = []
 
@@ -682,7 +685,7 @@ def test_safe_reconcile_uses_full_scan_when_prefilter_request_fails(monkeypatch)
 
 
 def test_safe_reconcile_without_prefilter_never_scans_twice(monkeypatch):
-    monkeypatch.setattr(sss, "_SSS_SERVER_PREFILTER", False)
+    monkeypatch.setattr(sss_reconcile, "_SSS_SERVER_PREFILTER", False)
     task = _task()
     calls = []
 
@@ -1019,8 +1022,8 @@ def test_reconcile_delay_polls_without_duplicate_post(monkeypatch):
         def set(self):
             raise AssertionError("对账延迟不应停止任务")
 
-    monkeypatch.setattr(sss, "_RECONCILE_POLL_INTERVAL_S", 0)
-    monkeypatch.setattr(sss, "_PREFILTER_ZERO_RETRY_DELAY_S", 0)
+    monkeypatch.setattr(sss_reconcile, "_RECONCILE_POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(sss_submission, "_PREFILTER_ZERO_RETRY_DELAY_S", 0)
     final, reconciled = sss._run_reconciled_submission(
         [task], factory, fetch, Stop(), None, None, max_workers=1)
     assert reconciled is True
@@ -1246,7 +1249,7 @@ def test_preflight_reads_but_never_submits(monkeypatch, tmp_path):
         def close(self):
             pass
 
-    monkeypatch.setattr(sss, "SssApiClient", FakeClient)
+    monkeypatch.setattr(sss_runner, "SssApiClient", FakeClient)
 
     cfg = SimpleNamespace(
         sss_excel_path=str(path), sss_order_source="excel", sss_account="18758187837",
@@ -1323,7 +1326,7 @@ def test_preflight_succeeds_when_station_has_no_orders(monkeypatch, tmp_path):
         def close(self):
             pass
 
-    monkeypatch.setattr(sss, "SssApiClient", FakeClient)
+    monkeypatch.setattr(sss_runner, "SssApiClient", FakeClient)
 
     cfg = SimpleNamespace(
         sss_excel_path=str(path), sss_order_source="excel", sss_account="18758187837",
@@ -1399,7 +1402,7 @@ def test_preflight_stops_when_order_list_is_unreadable(monkeypatch, tmp_path):
         def close(self):
             pass
 
-    monkeypatch.setattr(sss, "SssApiClient", FakeClient)
+    monkeypatch.setattr(sss_runner, "SssApiClient", FakeClient)
 
     cfg = SimpleNamespace(
         sss_excel_path=str(path), sss_order_source="excel", sss_account="18758187837",
@@ -1472,7 +1475,7 @@ def test_balance_guard_stops_before_any_submit(monkeypatch, tmp_path):
         def close(self):
             pass
 
-    monkeypatch.setattr(sss, "SssApiClient", FakeClient)
+    monkeypatch.setattr(sss_runner, "SssApiClient", FakeClient)
 
     cfg = SimpleNamespace(
         sss_excel_path=str(path), sss_order_source="excel", sss_account="18758187837",

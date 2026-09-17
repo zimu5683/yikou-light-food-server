@@ -73,17 +73,19 @@ app/integrations/  外部 HTTP 客户端（requests）
 
 ## 后续可选拆分（当前已知技术债）
 
-第一轮重构先把「顶层大杂烩」拆成领域包并清掉桌面/浏览器残留；以下文件仍偏大，
-建议后续按“每次移动一个模块、保持 public API 与测试绿”为原则继续拆：
+第一轮重构先把「顶层大杂烩」拆成领域包并清掉桌面/浏览器残留。
+第二轮已完成两个最大单文件的深水拆分：
 
-1. `app/wps/sync.py`（最大）→ `cli.py` / `planner.py` / `executor.py` / `ledger.py`，
-   由 `sync.py` 做门面、只 re-export，测试改到新模块路径。
-2. `app/ordering/sss.py` → `models.py` / `fingerprint.py` / `reconcile.py` /
-   `submission.py` / `runner.py`；`run_sss_job` 只保留流程编排。
-3. `app/api/bridge.py` → `events.py` / `interactions.py` / `services/wps.py` /
-   `tasks.py`，`Bridge` 用组合而非继承拼起来。
-4. `app/web/server.py` → `routing.py` / `static.py` / `fs_browser.py`，
-   鉴权中间件留在 `auth.py`。
+- `app/wps/sync.py` → `errors / models / common / cli / ledger / reader / planner / executor`
+- `app/ordering/sss.py` → `constants / common / records / workbook / models / fingerprint / payload / reconcile / submission / runner`
+
+以下文件仍偏大，建议继续按“每次移动一个模块、保持 public API 与测试绿”拆分：
+
+1. `app/api/bridge.py`（约 1560 行）→ `events.py` / `interactions.py` /
+   `services/wps.py` / `tasks.py`，`Bridge` 用组合拼起来。
+2. `app/web/server.py`（约 1070 行）→ `routing.py` / `static.py` / `fs_browser.py`。
+3. `app/order/runner.py`（约 860 行）→ 把抓单分页、详情预取、Excel 写入拆开。
+4. `app/ordering/cloud_import.py`（约 520 行）→ `roster.py` / `archive.py`。
 
 拆分前先用 rope 的 `move-module`/`rename-module` 做机械化移动（见
 `.zcode/skills/python-rope-refactor`），再改行为；`tests/test_architecture_boundaries.py`
