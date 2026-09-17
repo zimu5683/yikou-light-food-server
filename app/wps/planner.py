@@ -30,6 +30,8 @@ from app.wps.common import (
     _as_int,
     _find_column,
     build_address_ranks,
+    content_last_col,
+    effective_last_col,
     canonical_address,
     column_name,
     date_headers,
@@ -91,9 +93,6 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
         plan.warnings.append("云端文件不可读或不是在线表格")
         return plan
     worksheet_id = int(infos[0].get("sheetId") or 1)
-    # 真实的「最后使用列」（1-based）——排序辅助列要放在它右边，不能用被
-    # MAX_SCAN_COL 截断过的读取范围。
-    real_col_to = int(infos[0].get("colTo") or 0) + 1
     row_to, col_to = scan_bounds(infos[0])
     grid = cli.read_grid(plan.file_id, worksheet_id, 0, row_to, 0, col_to)
     plan.append_row = max(plan.append_row, 0)
@@ -303,13 +302,25 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
     sort_on = bool(sort_enabled and new_count and data_rows)
     helper_col = 0
     if sort_on:
+        # 宽度必须以**接口报的 used range** 为准，不能只看读到的内容：内容右侧的
+        # 边框/底色即使没有文字也属于“表格内容”，辅助列插在那里会把它们推走。
+        reported_last = max(1, int(infos[0].get("colTo") or 0) + 1)
+        real_last_col = max(effective_last_col(reported_last),
+                            content_last_col(grid, col_to + 1))
         helper_col = sort_key_column(
-            sheet_col_to=real_col_to,
+            sheet_col_to=real_last_col,
             extra_cols=[plan.marker_col, plan.columns.get("remark") or 0])
         if helper_col > MAX_SORT_COL:
+            # used range 报得离谱（整列污染）或表真的过宽：宁可不排序，也不排错位。
             plan.warnings.append(
-                f"表格宽度异常（最后使用列 {real_col_to}，辅助列 {helper_col}），本次跳过排序")
+                f"表格宽度异常（接口报最后使用列 {reported_last}，辅助列 {helper_col}），"
+                "本次跳过排序：新客户会留在表格最上面")
             sort_on = False
+    elif new_count and not sort_enabled:
+        plan.warnings.append(
+            "已按设置关闭排序：新客户留在表格最上面，不会按地址归位")
+    elif new_count and not data_rows:
+        plan.warnings.append("表里还没有数据行，本次只写入新客户，无需排序")
 
     # 预测排序结果（稳定排序：等键保持源顺序，与云端 range-sort 的承诺一致）。
     # 排序前的物理顺序 = 新行（第 4 行起）+ 已有行（原有先后）。

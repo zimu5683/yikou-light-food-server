@@ -102,6 +102,8 @@ class SheetPlan:
     sort_key_col: int = 0
     # 排序区域，形如 ``A3:GS142``
     sort_range: str = ""
+    # 排序区实际覆盖到的最后一列（1-based）；probe_sort_area 的探测起点
+    sort_probe_col: int = 0
     # 每个数据行的排序键：{(排序前不能用的) 行号: 键值}
     row_keys: dict[int, int] = field(default_factory=dict)
     # 预测的排序后行号：{(姓名, 电话): 行号}

@@ -37,7 +37,8 @@ app/
 frontend/               React + TypeScript 前端（构建产物在 frontend/dist/）
 tests/                  pytest 与前端契约测试
 scripts/                运维/构建脚本      tools/  一次性诊断探针
-docs/                   当前架构说明       design/ 历史方案与验证资料（见 design/README.md）
+docs/                   当前架构说明、桌面版功能对比（DESKTOP-PARITY.md）
+design/                历史方案与验证资料（见 design/README.md）
 ```
 
 依赖方向：`web → api → 领域包（order / ordering / wps）→ core / integrations`，

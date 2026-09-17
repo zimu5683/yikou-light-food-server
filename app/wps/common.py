@@ -11,6 +11,8 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
+from app.wps.errors import WpsCloudError
+
 
 HEADER_NAME = ("名字", "姓名")
 
@@ -61,6 +63,10 @@ STRUCT_COLUMN_KEYS = ("type", "kind", "total", "served", "left", "remark")
 
 
 MAX_SORT_COL = 1000
+# 排序前的“右侧边界探测”宽度（列数）。辅助列放在「已扫描到的最后一个有内容的列」
+# 右边，这一带必须为空，否则说明有内容落在 MAX_SCAN_COL 之外 —— 那样排序区覆盖不到它，
+# 排序后行与列就会错位，必须拒绝排序而不是硬排。
+SORT_PROBE_WIDTH = 40
 
 
 SORT_KEY_WIDTH = 4
@@ -351,6 +357,59 @@ def scan_bounds(info: Mapping[str, Any] | None, *,
     if cols > 0:
         row_to = min(row_to, max(0, budget // cols - 1))
     return row_to, col_to
+
+
+def effective_last_col(reported: int, *,
+                       scan_width: int = MAX_SCAN_COL) -> int:
+    """把 ``sheetsInfo.colTo`` 换算成可用的「最后使用列」（1-based）。
+
+    不能无条件相信它：那是 WPS 记的 used range 右下角，一旦表格被“整列/到最右列”
+    的操作碰过（本程序自己就会用 ``col_to: 16383`` 删行），它就会停在网格最右列。
+    实测东湖中餐返回 16383，而真实内容只到第 22 列；据此算出的辅助列超过
+    ``MAX_SORT_COL``，排序会被静默跳过 —— 这正是“东湖中餐排不了序”的根因。
+
+    规则：报出来的宽度没超过我们真正读过的范围时照用；超过则退回读取宽度，
+    边界再由 :func:`probe_sort_area` 兜底。
+    """
+    reported = max(1, int(reported or 0))
+    return reported if reported <= max(1, int(scan_width)) else max(1, int(scan_width))
+
+
+def content_last_col(grid: Mapping[tuple[int, int], Any], fallback: int) -> int:
+    """已读到的内容里最后一个有内容的列（1-based）；没有内容时用 ``fallback``。"""
+    last = 0
+    for _row, col in grid:
+        try:
+            column = int(col) + 1
+        except (TypeError, ValueError):
+            continue
+        if column > last:
+            last = column
+    return max(int(fallback or 0), last, 1)
+
+
+def probe_sort_area(cli: Any, plan: Any, worksheet_id: int, *,
+                    col_from: int, row_to: int,
+                    width: int = SORT_PROBE_WIDTH) -> tuple[bool, str]:
+    """确认「辅助列右边的这一带」是空的 —— 排序区必须覆盖到表里所有内容。
+
+    ``col_from`` 必须从辅助列 + 1 开始，避免把辅助列自己的排序键误判成右侧内容。
+    只读一次；``read_grid`` 的键是 0-based 坐标。
+    """
+    col_to = min(MAX_SORT_COL, int(plan.sort_key_col) + max(0, int(width) - 1), 16383)
+    if col_to <= int(col_from):
+        return True, ""
+    try:
+        grid = cli.read_grid(plan.file_id, worksheet_id, FIRST_DATA_ROW - 1,
+                             int(row_to), int(col_from) - 1, col_to)
+    except WpsCloudError:
+        # 探测本身失败不阻断排序：按“没探到”处理（旧行为），只留提示机会。
+        return True, ""
+    if not grid:
+        return True, ""
+    row, col = min(grid, key=lambda key: (int(key[1]), int(key[0])))
+    return False, (f"{column_name(int(col) + 1)}{int(row) + 1}「"
+                   f"{str(grid[(row, col)])[:12]}」")
 
 
 def _argb_to_int(hexcolor: str) -> int:

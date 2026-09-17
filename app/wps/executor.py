@@ -20,6 +20,7 @@ from app.wps.common import (
     column_name,
     format_sort_key,
     person_key,
+    probe_sort_area,
 )
 from app.wps.errors import WpsCloudError
 from app.wps.ledger import SyncLedger
@@ -184,6 +185,22 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
 
         # 4) 排序：写排序键（辅助列，在该表所有内容列右侧）→ 云端原地排序 → 删辅助列。
         if plan.sort_key_col and plan.row_keys:
+            # 4a) 排序区必须覆盖表里**所有**内容列：辅助列右边若还有内容，说明它在
+            #     读取范围（MAX_SCAN_COL）之外，排序会让行与那些列错位。此时拒绝排序并
+            #     回滚插入 —— 宁可不排序，也不能把表排坏。
+            safe, found_at = probe_sort_area(
+                cli, plan, worksheet_id, col_from=plan.sort_key_col + 1,
+                row_to=max(plan.last_data_row, FIRST_DATA_ROW))
+            if not safe:
+                _rollback_inserts(cli, plan, worksheet_id, inserted, emit)
+                reason = (f"第 {plan.sort_key_col} 列右侧（{found_at}）还有内容，"
+                          "排序区覆盖不到它，已放弃排序以免行与列错位")
+                emit(f"[云同步] {plan.sheet}：{reason}；新客户行已回滚，"
+                     "请先清理该列内容后重新上传", "ERROR")
+                result["sheets"].append({"sheet": plan.sheet, "status": "failed",
+                                         "reason": reason})
+                result["failed"] += 1
+                continue
             key_cells = [{"row": row, "col": plan.sort_key_col,
                           "value": format_sort_key(key)}
                          for row, key in sorted(plan.row_keys.items())]
@@ -202,6 +219,19 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
                 continue
             emit(f"[云同步] {plan.sheet}：已按地址顺序重排第 {FIRST_DATA_ROW}~"
                  f"{plan.last_data_row} 行")
+            # 4b) 排序后复查一次：确实错位了就不要继续往这些行写数据。
+            safe, found_at = probe_sort_area(
+                cli, plan, worksheet_id, col_from=plan.sort_key_col + 1,
+                row_to=max(plan.last_data_row, FIRST_DATA_ROW))
+            if not safe:
+                emit(f"[云同步] {plan.sheet}：排序后第 {plan.sort_key_col} 列右侧出现内容"
+                     f"（{found_at}），说明排序区未覆盖全部列，已停止写入后续数据。"
+                     "表已重排，请重新上传（重复执行安全）", "ERROR")
+                result["sheets"].append({
+                    "sheet": plan.sheet, "status": "failed",
+                    "reason": f"排序区未覆盖全部列（右侧有内容：{found_at}）"})
+                result["failed"] += 1
+                continue
             try:
                 cli.delete_columns(plan.file_id, worksheet_id,
                                    column=plan.sort_key_col, rows=plan.last_data_row)
