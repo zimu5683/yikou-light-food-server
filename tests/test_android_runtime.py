@@ -12,8 +12,6 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -343,7 +341,6 @@ def test_bridge_android_authorize_worker_reports_url_and_status(fake_runtime, mo
 
 
 def test_bridge_android_authorize_dispatch(monkeypatch, android):
-    from app.api import bridge as bridge_mod
     from app.api.bridge import Bridge
 
     calls: list[str] = []

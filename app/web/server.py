@@ -38,6 +38,8 @@ from app.core.config import user_data_dir
 from app.web.auth import (SESSION_TTL_SECONDS, STATUS_PENDING, AccessVerifier,
                        AuthError, AuthStore, access_verifier_from_env,
                        default_auth_dir)
+from app.web.fs_browser import EXCEL_SUFFIXES as _EXCEL_SUFFIXES, browse_root, list_dir
+from app.web.static_files import StaticFileError, read_static
 import app.web.pages
 
 #: 默认端口。选一个不常用的高位端口，避免和 Termux 里其它服务撞车。
@@ -45,10 +47,6 @@ DEFAULT_PORT = 8756
 
 #: 不通过 HTTP 暴露的方法：attach 由服务端启动时内部调用，走 HTTP 没有意义。
 _NON_HTTP = frozenset({"attach"})
-
-# 兼容旧导入：文件浏览器常量仍可从 app.web.server 取。
-from app.web.fs_browser import EXCEL_SUFFIXES as _EXCEL_SUFFIXES, browse_root, list_dir
-from app.web.static_files import StaticFileError, read_static
 
 #: 兼容旧导入：文件浏览器过滤后缀。
 EXCEL_SUFFIXES = _EXCEL_SUFFIXES
