@@ -17,6 +17,7 @@ from app.wps.sync import (
     person_key, summarize_plan, target_date_for, weekday_number,
 )
 from app.wps import sync as wc
+from app.wps import cli as wps_cli
 
 # ----------------------------------------------------------------------
 # 测试替身
@@ -987,10 +988,10 @@ def test_find_cli_prefers_explicit(tmp_path: Path):
 
 
 def test_find_cli_reports_missing(monkeypatch, tmp_path: Path):
-    monkeypatch.setattr(wc.shutil, "which", lambda _name: None)
-    monkeypatch.setattr(wc, "__file__", str(tmp_path / "app" / "wps_cloud.py"))
-    monkeypatch.setattr(wc.sys, "executable", str(tmp_path / "python"))
-    monkeypatch.delattr(wc.sys, "_MEIPASS", raising=False)
+    monkeypatch.setattr(wps_cli.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(wps_cli, "__file__", str(tmp_path / "app" / "wps" / "cli.py"))
+    monkeypatch.setattr(wps_cli.sys, "executable", str(tmp_path / "python"))
+    monkeypatch.delattr(wps_cli.sys, "_MEIPASS", raising=False)
     with pytest.raises(WpsCloudError):
         find_cli()
 

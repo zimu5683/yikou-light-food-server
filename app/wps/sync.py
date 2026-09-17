@@ -17,85 +17,202 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import os
-import re
-import shutil
-import subprocess
-import sys
 import tempfile
-import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
+from app.wps.common import (
+    ADDRESS_ALIASES,
+    CELL_MARK,
+    DATE_RE,
+    FILL_GOLD,
+    FILL_LUXURY,
+    FIRST_DATA_ROW,
+    FONT_SIZE_TO_TWIP,
+    HEADER_ADDRESS,
+    HEADER_KIND,
+    HEADER_LEFT,
+    HEADER_NAME,
+    HEADER_PHONE,
+    HEADER_REMARK,
+    HEADER_ROW,
+    HEADER_SERVED,
+    HEADER_TOTAL,
+    HEADER_TYPE,
+    MARKER_OFFSET,
+    MARKER_VALUES,
+    MAX_READ_CELLS,
+    MAX_SCAN_COL,
+    MAX_SCAN_ROW,
+    MAX_SORT_COL,
+    RATE_LIMIT_CODES,
+    SORT_FLAG_BLANK,
+    SORT_FLAG_EXISTING,
+    SORT_FLAG_NEW,
+    SORT_KEY_WIDTH,
+    STRUCT_COLUMN_KEYS,
+    TITLE_ROW,
+    WPS_PLAN_WORKERS,
+    WRITE_BATCH_CELLS,
+    _ALIGN_H,
+    _ALIGN_V,
+    _NATURAL_CHUNK,
+    _TRANSIENT_HINTS,
+    _address_key,
+    _argb_to_int,
+    _as_int,
+    _find_column,
+    _is_transient,
+    build_address_ranks,
+    canonical_address,
+    column_name,
+    date_headers,
+    date_region,
+    find_marker_column,
+    find_target_column,
+    format_sort_key,
+    natural_key,
+    normalize_phone,
+    parse_date_header,
+    person_key,
+    scan_bounds,
+    sort_key_column,
+    sort_key_value,
+    target_date_for,
+    weekday_number,
+)
+from app.wps.errors import WpsCloudError
+from app.wps.models import Change, CloudOrder, InsertBlock, SheetPlan
+from app.wps.cli import (
+    CLI_NAME,
+    CLI_NAME_WIN,
+    KdocsCli,
+    effective_tables,
+    find_cli,
+    termux_cli_runtime,
+)
+
+__all__ = [
+    "ADDRESS_ALIASES",
+    "CELL_MARK",
+    "CLI_NAME",
+    "CLI_NAME_WIN",
+    "Change",
+    "CloudOrder",
+    "DATE_RE",
+    "FILL_GOLD",
+    "FILL_LUXURY",
+    "FIRST_DATA_ROW",
+    "FONT_SIZE_TO_TWIP",
+    "HEADER_ADDRESS",
+    "HEADER_KIND",
+    "HEADER_LEFT",
+    "HEADER_NAME",
+    "HEADER_PHONE",
+    "HEADER_REMARK",
+    "HEADER_ROW",
+    "HEADER_SERVED",
+    "HEADER_TOTAL",
+    "HEADER_TYPE",
+    "InsertBlock",
+    "KdocsCli",
+    "LOCAL_COL",
+    "LOCAL_SHEETS",
+    "MARKER_OFFSET",
+    "MARKER_VALUES",
+    "MAX_READ_CELLS",
+    "MAX_SCAN_COL",
+    "MAX_SCAN_ROW",
+    "MAX_SORT_COL",
+    "RATE_LIMIT_CODES",
+    "SORT_FLAG_BLANK",
+    "SORT_FLAG_EXISTING",
+    "SORT_FLAG_NEW",
+    "SORT_KEY_WIDTH",
+    "STRUCT_COLUMN_KEYS",
+    "SheetPlan",
+    "SyncLedger",
+    "TITLE_ROW",
+    "WPS_PLAN_WORKERS",
+    "WRITE_BATCH_CELLS",
+    "WpsCloudError",
+    "_ALIGN_H",
+    "_ALIGN_V",
+    "_NATURAL_CHUNK",
+    "_TRANSIENT_HINTS",
+    "__all__",
+    "_address_key",
+    "_argb_to_int",
+    "_as_int",
+    "_build_sheet_plan",
+    "_find_column",
+    "_is_transient",
+    "_rollback_inserts",
+    "apply_plan",
+    "build_address_ranks",
+    "build_format_ops",
+    "build_plan",
+    "canonical_address",
+    "column_name",
+    "date_headers",
+    "date_region",
+    "default_state_path",
+    "effective_tables",
+    "find_cli",
+    "find_marker_column",
+    "find_target_column",
+    "format_plan",
+    "format_sort_key",
+    "formula_cells_for_new_rows",
+    "learn_row_format",
+    "natural_key",
+    "normalize_phone",
+    "parse_date_header",
+    "person_key",
+    "read_local_orders",
+    "read_person_rows",
+    "scan_bounds",
+    "sort_key_column",
+    "sort_key_value",
+    "summarize_plan",
+    "target_date_for",
+    "termux_cli_runtime",
+    "weekday_number",
+]
 
 # ----------------------------------------------------------------------
 # 常量
 # ----------------------------------------------------------------------
 
-CLI_NAME = "kdocs-cli"
-CLI_NAME_WIN = "kdocs-cli.exe"
 
 # 云端表里可能出现的工作列表头（不同表写法不同，统一按名字找列）
-HEADER_NAME = ("名字", "姓名")
-HEADER_ADDRESS = ("地址",)
-HEADER_PHONE = ("电话",)
-HEADER_TYPE = ("类型",)
-HEADER_KIND = ("餐种",)
-HEADER_TOTAL = ("总餐次", "总餐数")
-HEADER_SERVED = ("已出餐", "出餐")
-HEADER_LEFT = ("剩余餐", "剩余")
-HEADER_REMARK = ("备注",)
 
 # 目标日期格与通讯记号写入的值
-CELL_MARK = "1"
 # 数据从第 3 行开始（第 1 行标题、第 2 行表头）
-FIRST_DATA_ROW = 3
-HEADER_ROW = 2
-TITLE_ROW = 1
 # 通讯记号默认偏移：备注列右边第 3 列。
 # （备注+2 实测被协作者的「9.14 周一」日期标记占用，兜底位置必须让开）
-MARKER_OFFSET = 3
 # 通讯记号的合法数字（周几：周日=1 … 周六=7）。用于在表头行里认出记号位。
-MARKER_VALUES = range(1, 8)
 # 结构列（除姓名/地址/电话/日期以外的固定列）。
 # **日期列只允许出现在「电话列」与「第一个结构列」之间** —— 备注右侧是协作者
 # 写日期标记的区域（实测 6 张表都在备注+2），绝不能当成日期列：
 # 否则新行的「已出餐」公式会把它统计进去，甚至把目标日期的 1 写进协作者的格子。
-STRUCT_COLUMN_KEYS = ("type", "kind", "total", "served", "left", "remark")
 # 排序辅助列的列号上限：真实排单表最宽也就 200 多列，异常宽说明 used range 有问题，
 # 此时宁可不排序，也不要对几万列的区域发排序请求。
-MAX_SORT_COL = 1000
 # 排序键零填充宽度：接口可能把数字按文本比较（"10" < "2"），补零后字典序即数值序。
-SORT_KEY_WIDTH = 4
 # 同一个地址组内：已有行在前（+0），本次新增行在后（+1），空行垫底（+2）。
-SORT_FLAG_EXISTING = 0
-SORT_FLAG_NEW = 1
-SORT_FLAG_BLANK = 2
 # 本地排单路线名 -> 云端地址组的写法（协作者习惯，实测 2026-09-12 目标表）。
 # 命中别名时：插入到云端组的末尾，且地址格按云端写法落表。
-ADDRESS_ALIASES = {"小西": "小"}
 # 云端单次读取的行/列上限
-MAX_SCAN_ROW = 400
-MAX_SCAN_COL = 200
 # 接口单次读取的格数上限（实测 5 万）。扫描区域必须按"行×列"控制，
 # 否则会撞 `range 选区过大（N 行 × M 列 = X 格）`。留 10% 余量。
-MAX_READ_CELLS = 45000
 
 # 单次 update-range-data 允许的最大单元格数（实测上限 100，留余量）。
-WRITE_BATCH_CELLS = 80
 # 字号 -> twip（1 磅 = 20 twip），接口的 font.dyHeight 用 twip。
-FONT_SIZE_TO_TWIP = 20
 # 颜色常量（ARGB 整数，接口用整数传色）
-FILL_LUXURY = 0xFFFFC000        # 豪华餐整行底色：金黄（与"总餐次"列同色）
-FILL_GOLD = 0xFFFFC000          # 总餐次/已出餐/剩余餐 的既有底色
 # 接口读回来的对齐是字符串枚举，写回去要整数（alcH/alcV）。
-_ALIGN_H = {"haGeneral": 0, "haLeft": 1, "haCenter": 2, "haRight": 3,
-            "haFill": 4, "haJustify": 5, "haCenterContinuous": 6}
-_ALIGN_V = {"vaTop": 0, "vaCenter": 1, "vaBottom": 2, "vaJustify": 3}
 
 # 金山接口的限流错误码：当日额度用尽 / 短时频繁触发（均次日 08:00 恢复）。
 # 金山接口的限流错误码：当日额度用尽 / 短时频繁触发（均次日 08:00 恢复）。
-RATE_LIMIT_CODES = {429001, 429002}
 
 # ``build_plan`` 的并发度：每张子表 3 次只读往返，6 张表串行最多 18 次。
 # 并发只改变往返的重叠方式，**调用次数与参数完全不变**，不额外消耗每日额度。
@@ -103,296 +220,56 @@ RATE_LIMIT_CODES = {429001, 429002}
 # 为什么是 2 而不是 6：429002「短时间频繁触发」不在 ``_TRANSIENT_HINTS`` 里，
 # ``_run`` 不会重试它，突发触发会让该子表直接报错。取 2 只把瞬时速率翻倍，
 # 与 ``bridge.WPS_COPY_CHECK_WORKERS`` 保持同一口径。
-WPS_PLAN_WORKERS = 2
-
-DATE_RE = re.compile(r"^\s*(\d{1,2})\s*[.．]\s*(\d{1,2})\s*(?:周|星期|礼拜)?\s*([一二三四五六日天])?")
 
 
-class WpsCloudError(RuntimeError):
-    """云文档同步过程中的可预期错误（调用方据此提示用户）。"""
+
 
 
 # ----------------------------------------------------------------------
 # 数据结构
 # ----------------------------------------------------------------------
 
-@dataclass
-class CloudOrder:
-    """本地排单表里的一行订单。"""
-
-    sheet: str
-    name: str
-    address: str
-    phone: str
-    meal_type: str          # 中餐 / 晚餐
-    meal_kind: str          # 经济 / 豪华
-    meals: int              # 「餐次」列
-    row: int = 0            # 本地行号，便于报错定位
 
 
-@dataclass
-class Change:
-    """一条待写入云端的变更。"""
-
-    kind: str               # existing / new
-    name: str
-    phone: str
-    row: int                # 云端行号（排序后要写入的行号）
-    delta: int              # 总餐次差值（want - before），0 表示已一致
-    target_col: int         # 目标日期列（1-based）
-    total_before: int = 0
-    total_after: int = 0
-    target_ok: bool = False  # 目标日期格是否已经是 1
-    # 新客户追加行需要一并写入的字段（来自本地排单表）
-    address: str = ""
-    meal_type: str = ""     # 类型：中餐 / 晚餐
-    meal_kind: str = ""     # 餐种：经济 / 豪华
-    detail: str = ""
-    # 补全标记：云端这些格子目前是空的，本次要补上（防止上次中断留下半成品行）
-    fill_type: bool = False
-    fill_kind: bool = False
-    fill_formula: bool = False
-    # 新客户**排序前**所在的物理行号：排序前要写的东西（姓名/地址/电话/类型/餐种、
-    # 底色）必须写在这里，否则会覆盖掉别人（排序后行号在那时还属于其他人）。
-    # 放在最后，避免影响按位置构造 Change 的老代码。
-    insert_row: int = 0
-
-    @property
-    def needs_write(self) -> bool:
-        """这条变更是否真的需要写云端（目标格已是目标状态且无需补格式时为 ``False``）。"""
-        return ((not self.target_ok) or self.total_after != self.total_before
-                or self.fill_type or self.fill_kind or self.fill_formula)
 
 
-@dataclass
-class InsertBlock:
-    """一批要插入云端的新客户行。
-
-    2026-09-15 起流程改为：**所有新客户合成一块，统一插到第 3 行与第 4 行之间**，
-    再按列B 的地址顺序把整张表重排（见 ``SheetPlan.sort_*``）。
-    ``position`` 是「插到这一行之前」（固定 = 4）；``append_only`` 表示表里本来
-    就没有数据行，直接写第 4 行起即可，不需要调用插入行接口。
-    """
-
-    position: int
-    count: int
-    first_row: int
-    address: str = ""
-    append_only: bool = False
 
 
-@dataclass
-class SheetPlan:
-    """单张表的写入计划。"""
-
-    sheet: str
-    file_id: str
-    drive_id: str = ""
-    target_date: _dt.date | None = None
-    target_col: int = 0
-    target_header: str = ""
-    weekday_number: int = 0
-    changes: list[Change] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
-    append_row: int = 0
-    columns: dict[str, int] = field(default_factory=dict)
-    # 供"学格式"参考的已有数据行号（1-based）
-    format_rows: list[int] = field(default_factory=list)
-    # 参考行的逐列底色 {1-based 列: "#AARRGGBB"}（build_plan 里一次性读好并缓存）
-    format_fills: dict[int, str] = field(default_factory=dict)
-    # 新客户插入块（统一一块：插到第 4 行之前）；老客户行号已计入排序结果
-    insert_blocks: list[InsertBlock] = field(default_factory=list)
-    # 协作者通讯记号列（1-based）；0 = 没找到
-    marker_col: int = 0
-    date_cols: list[int] = field(default_factory=list)
-    # ---- 排序（新增客户时按列B 的地址顺序重排整张表）----
-    # 本次是否真的执行了「插到第 4 行 + 整表重排」
-    sort_enabled: bool = False
-    # 排序键辅助列（1-based）；0 = 本次不排序
-    sort_key_col: int = 0
-    # 排序区域，形如 ``A3:GS142``
-    sort_range: str = ""
-    # 每个数据行的排序键：{(排序前不能用的) 行号: 键值}
-    row_keys: dict[int, int] = field(default_factory=dict)
-    # 预测的排序后行号：{(姓名, 电话): 行号}
-    final_rows: dict[tuple[str, str], int] = field(default_factory=dict)
-    # 实际排序结果与预测不一致（真机 sort_range 行为异常）
-    sort_mismatch: bool = False
-    # 排序后数据区的最后一行（1-based）
-    last_data_row: int = 0
-    # 不在地址清单里的地址（预览里提示"会排到表尾"）
-    unknown_addresses: list[str] = field(default_factory=list)
-
-    @property
-    def applied(self) -> bool:
-        """本次计划是否包含任何变更。"""
-        return bool(self.changes)
 
 
 # ----------------------------------------------------------------------
 # 小工具
 # ----------------------------------------------------------------------
 
-def target_date_for(now: _dt.datetime | None = None, *,
-                    start_hour: int = 20, end_hour: int = 10) -> _dt.date:
-    """按"晚上跑算次日"的规则算目标日期。
-
-    窗口为 [start_hour, 24) ∪ [0, end_hour)：落在窗口内则 +1 天。
-    """
-    now = now or _dt.datetime.now()
-    if now.hour >= start_hour or now.hour < end_hour:
-        return (now + _dt.timedelta(days=1)).date()
-    return now.date()
 
 
-def weekday_number(day: _dt.date) -> int:
-    """通讯记号数字：周日=1、周一=2 … 周六=7。"""
-    return 1 if day.weekday() == 6 else day.weekday() + 2
 
 
-def parse_date_header(text: Any) -> tuple[int, int] | None:
-    """从表头文字解析 (月, 日)；只认月.日，忽略星期。"""
-    if text is None:
-        return None
-    m = DATE_RE.match(str(text))
-    if not m:
-        return None
-    month, day = int(m.group(1)), int(m.group(2))
-    if not (1 <= month <= 12 and 1 <= day <= 31):
-        return None
-    return month, day
 
 
-def person_key(name: Any, phone: Any) -> tuple[str, str]:
-    """客户匹配键：名字 + 电话（都归一化：去空白、电话去小数点与非数字尾巴）。"""
-    n = str(name or "").strip()
-    p = str(phone or "").strip()
-    if p.endswith(".0"):
-        p = p[:-2]
-    p = re.sub(r"\D", "", p)
-    return n, p
 
 
-def normalize_phone(value: Any) -> str:
-    """把手机号规范化成「11 位 ASCII 数字」形式（与 :func:`person_key` 口径一致）。"""
-    return person_key("", value)[1]
 
 
-def _address_key(text: Any) -> str:
-    """地址组匹配键：去空白 + 忽略大小写（云端「b2」和本地「B2」是同一组）。"""
-    return re.sub(r"\s+", "", str(text or "")).casefold()
 
 
-def canonical_address(raw: Any, order: Sequence[str] = ()) -> str:
-    """落表时用的地址写法：先过别名（本地「小西」= 云端「小」），
-    再按清单里的标准写法统一（本地写「B5」→ 落「b5」；匹配忽略大小写与空格）。"""
-    text = str(raw or "").strip()
-    text = ADDRESS_ALIASES.get(text, text)
-    key = _address_key(text)
-    for item in order:
-        if _address_key(item) == key:
-            return str(item).strip()
-    return text
 
 
-_NATURAL_CHUNK = re.compile(r"(\d+)")
-
-def natural_key(text: Any) -> tuple:
-    """自然序排序键：「医2号」排在「医10号」之前（数字按数值比，不按字典序）。
-
-    返回可比较的元组：文本块用 (0, 文本)，数字块用 (1, 数值)。
-    """
-    chunks: list[tuple[int, Any]] = []
-    for piece in _NATURAL_CHUNK.split(str(text or "")):
-        if not piece:
-            continue
-        if piece.isdigit():
-            chunks.append((1, int(piece)))
-        else:
-            chunks.append((0, piece.casefold()))
-    return tuple(chunks)
 
 
-def build_address_ranks(order: Sequence[str],
-                        addresses: Iterable[str]) -> tuple[dict[str, int], int]:
-    """算出「归一化地址 -> 名次」，名次越小越靠前。
-
-    ``order`` 非空：按清单顺序排名，清单里没有的一律 ``len(order)``（排表尾）；
-    ``order`` 为空：对出现过的地址按**自然序**升序排名（医学院用这种）。
-    返回 ``(名次表, 表尾名次)``。
-    """
-    normalized = [_address_key(addr) for addr in order if str(addr).strip()]
-    if normalized:
-        ranks = {addr: idx for idx, addr in enumerate(normalized)}
-        return ranks, len(normalized)
-    distinct = sorted({_address_key(a) for a in addresses if _address_key(a)}, key=natural_key)
-    return {addr: idx for idx, addr in enumerate(distinct)}, len(distinct)
 
 
-def sort_key_value(rank: int, flag: int) -> int:
-    """复合排序键：地址名次为主，同组内已有行（0）在前、新增行（1）在后。"""
-    return rank * 10 + flag
 
 
-def format_sort_key(value: int) -> str:
-    """零填充成定宽字符串 —— 接口若按文本排序，字典序也必须等于数值序。"""
-    return f"{value:0{SORT_KEY_WIDTH}d}"
 
 
-def sort_key_column(*, sheet_col_to: int, extra_cols: Iterable[int] = ()) -> int:
-    """选排序辅助列：一定落在该表**所有内容列右侧**。
-
-    排序范围必须覆盖所有有内容的列，否则右侧那些列不会跟着行一起移动，
-    行与列就错位了。放在最后使用列的右边一格，天然满足这个条件。
-    """
-    last = max([int(sheet_col_to or 0), 1, *[int(c or 0) for c in extra_cols]])
-    return last + 1
 
 
-def date_region(columns: Mapping[str, int],
-                *, fallback_hi: int = MAX_SCAN_COL) -> tuple[int, int]:
-    """日期列允许出现的区间 ``(lo, hi)``（1-based 闭区间）。
-
-    规则：从**电话列的右一列**开始，到**第一个结构列（类型/餐种/总餐次/已出餐/
-    剩余餐/备注）的左一列**结束。备注右侧是协作者写「9.14 周一」标记的区域，
-    把它排除掉才不会把标记列当成日期列。
-    """
-    lo = int(columns.get("phone") or 3) + 1
-    struct = [int(columns[key]) for key in STRUCT_COLUMN_KEYS if columns.get(key)]
-    hi = (min(struct) - 1) if struct else int(fallback_hi)
-    if hi < lo:
-        hi = lo - 1
-    return lo, hi
 
 
-def date_headers(header: Mapping[int, str], lo: int, hi: int) -> list[tuple[int, str]]:
-    """表头里落在日期区间内的日期样式格，返回 ``[(1-based 列, 原文)]``。"""
-    found: list[tuple[int, str]] = []
-    for col in sorted(header):
-        column = int(col) + 1
-        if lo <= column <= hi and parse_date_header(header[col]):
-            found.append((column, str(header[col])))
-    return found
 
 
-def find_marker_column(header: Mapping[int, str], remark_col: int) -> int:
-    """定位协作者通讯记号列（返回 1-based 列号，找不到用兜底位置）。
 
-    优先：备注列右侧第一个内容为 1~7 整数的格子 —— 那是协作者**正在用**的
-    记号位（实测它会随协作方式变化，不能写死偏移）。
-    兜底：备注列右边第 3 列（备注+2 已被协作者的日期标记占用）。
-    **护栏**：找到的格子若本身是「9.14 周一」这类日期样式，说明那是协作者的
-    标记列，宁可不用也不覆盖 —— 此时返回兜底位置。
-    """
-    for col in sorted(header):
-        if col + 1 <= remark_col:
-            continue
-        text = str(header[col]).strip()
-        if parse_date_header(text):
-            continue
-        if text.isdigit() and int(text) in MARKER_VALUES:
-            return col + 1
-    return remark_col + MARKER_OFFSET
 
 
 # ----------------------------------------------------------------------
@@ -551,451 +428,22 @@ class SyncLedger:
 # kdocs-cli 调用
 # ----------------------------------------------------------------------
 
-def find_cli(explicit: str | os.PathLike[str] | None = None) -> str:
-    """按优先级查找 kdocs-cli：显式配置 → 打包内置 → 仓库 vendor → 程序同目录 → PATH。"""
-    candidates: list[Path] = []
-    if explicit:
-        candidates.append(Path(explicit).expanduser())
-    names = [CLI_NAME_WIN, CLI_NAME] if os.name == "nt" else [CLI_NAME]
-    bundle = getattr(sys, "_MEIPASS", None)
-    if bundle:
-        for name in names:
-            candidates.append(Path(bundle) / name)
-    # 源码运行：仓库内的 vendor/kdocs-cli/
-    repo_vendor = Path(__file__).resolve().parent.parent / "vendor" / "kdocs-cli"
-    for name in names:
-        candidates.append(repo_vendor / name)
-    exe_dir = Path(sys.executable).parent
-    for name in names:
-        candidates.append(exe_dir / name)
-    for name in names:
-        found = shutil.which(name)
-        if found:
-            candidates.append(Path(found))
-    for cand in candidates:
-        if cand.is_file():
-            return str(cand)
-    raise WpsCloudError(
-        "找不到 kdocs-cli 组件。请确认程序完整安装，或在「云文档同步」里手动指定路径。")
 
 
-def effective_tables(config: Any) -> dict[str, dict[str, str]]:
-    """返回当前实际生效的云端目标表，并拒绝过期或越权目标。
-
-    测试模式一律写测试副本（且副本 ID 不能是正式表、也不能是已废弃的试验田）；
-    正式模式只允许写正式表 ID。「闪时送下单」的云端名单读取同样走这里，
-    这样测试模式下读的也是副本，不会拿正式表的数据做实验。
-    """
-    production = {sheet: conf.get("file_id", "") for sheet, conf in
-                  (getattr(config, "wps_production_tables", None) or {}).items()}
-    legacy_test_ids = {
-        "H8vzKoTJVrMP7mA9QG591xqS9W8Bg57iG",
-        "qFBgqf13GxM7vPUbTSJmxxsrgopD4DnpA",
-        "p9P2p2NFfxMZjLXGZ1fyxxrFTBf9s81Kn",
-        "RBLtXB8x3rMcQhCp6zp11xGBN7Wey2xCD",
-        "afnJ5h5Di1M3U9VwX3rvxx9jpTn8EUw9o",
-        "rxYTF8Juk9MBbhkbfjE9Bx1dQ3vGeZ3zr",
-    }
-    if bool(getattr(config, "wps_test_mode", False)):
-        test = {sheet: str(fid).strip() for sheet, fid in
-                (getattr(config, "wps_test_tables", None) or {}).items()
-                if str(fid).strip()}
-        if not test:
-            raise WpsCloudError("测试模式未配置新的测试副本，拒绝写入；请先从正式表创建副本")
-        # 注意：必须比对正式表的 **file_id 值**，而不是 dict 的键（键是子表名）。
-        stale = {fid for fid in test.values() if fid in set(production.values())}
-        if stale:
-            raise WpsCloudError("测试副本配置包含正式表 ID，拒绝写入")
-        if set(test.values()) & legacy_test_ids:
-            raise WpsCloudError("测试副本配置包含已过期试验田 ID，拒绝写入")
-        return {sheet: {"file_id": fid} for sheet, fid in test.items()}
-    active = {sheet: dict(conf) for sheet, conf in
-              (getattr(config, "wps_tables", None) or {}).items()}
-    active_ids = {conf.get("file_id", "") for conf in active.values()}
-    if active_ids - set(production.values()):
-        raise WpsCloudError("正式模式目标包含非正式表 ID，拒绝写入")
-    return active
 
 
-def termux_cli_runtime() -> tuple[list[str], dict[str, str]]:
-    """Termux/Android 上运行 kdocs-cli 需要的 (命令前缀, 额外环境变量)。
-
-    kdocs-cli 是**静态链接**的 linux/arm64 Go 程序，不经过 Termux 对绝对路径的
-    重写（那套机制依赖动态链接器），因此在 Android 上会遇到两个必然失败的问题：
-
-    1. 读不到 ``/etc/resolv.conf``。Android 的 ``/etc`` 是指向只读 ``/system/etc``
-       的符号链接，里面没有 resolv.conf；纯 Go 解析器因此退化成只查本机 DNS，
-       所有请求都以 ``lookup ... connection refused`` 失败。
-       用 ``proot`` 把 Termux 的 resolv.conf 绑定到 ``/etc/resolv.conf`` 解决。
-    2. 读不到 ``/etc/ssl/certs/ca-certificates.crt``（Termux 的 CA 包在
-       ``$PREFIX/etc/tls/cert.pem``），证书池为空，每个 HTTPS 请求都报
-       ``x509: certificate signed by unknown authority``。
-       用 ``SSL_CERT_FILE`` 指过去解决。
-
-    非 Termux 环境返回空前缀与空环境变量，桌面端行为完全不变。
-    """
-    prefix = os.environ.get("PREFIX", "")
-    if "com.termux" not in prefix:
-        return [], {}
-    extra_env: dict[str, str] = {}
-    ca_bundle = Path(prefix) / "etc" / "tls" / "cert.pem"
-    if ca_bundle.is_file():
-        extra_env["SSL_CERT_FILE"] = str(ca_bundle)
-    resolv_conf = Path(prefix) / "etc" / "resolv.conf"
-    proot = shutil.which("proot")
-    # 只有当系统真的缺 /etc/resolv.conf 时才套 proot（有则无需付出开销）。
-    if proot and resolv_conf.is_file() and not Path("/etc/resolv.conf").exists():
-        return [proot, "-b", f"{resolv_conf}:/etc/resolv.conf"], extra_env
-    return [], extra_env
 
 
-class KdocsCli:
-    """kdocs-cli 的最小封装。"""
-
-    def __init__(self, cli_path: str | os.PathLike[str] | None = None,
-                 *, timeout: int = 300, token: str | None = None) -> None:
-        self.path = find_cli(cli_path)
-        self.timeout = timeout
-        self.token = token or os.environ.get("KINGSOFT_DOCS_TOKEN")
-
-    # ---- 底层 ----
-
-    def _run(self, *args: str, params: Mapping[str, Any] | None = None,
-             retries: int = 2) -> dict[str, Any]:
-        """调用 kdocs-cli 并解析 JSON。
-
-        网络抖动（TLS handshake timeout / connection reset）会重试 ``retries`` 次 ——
-        实测写入过程中偶发 TLS 超时，一次失败就让整张表判定失败代价太大。
-        接口业务错误（code != 0）不重试。
-        """
-        last_error: WpsCloudError | None = None
-        for attempt in range(retries + 1):
-            try:
-                return self._run_once(*args, params=params)
-            except WpsCloudError as exc:
-                if not _is_transient(exc):
-                    raise
-                last_error = exc
-                if attempt < retries:
-                    time.sleep(1.5 * (attempt + 1))
-        assert last_error is not None
-        raise last_error
-
-    def _run_once(self, *args: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        # Termux/Android 需要 proot 绑 resolv.conf + SSL_CERT_FILE；桌面端两项都为空。
-        prefix, extra_env = termux_cli_runtime()
-        cmd = [*prefix, self.path, *args]
-        if self.token:
-            cmd += ["--token", self.token]
-        tmp: str | None = None
-        if params is not None:
-            # 关键：参数走临时文件，避免命令行长度上限（约 128 KiB）
-            fd, tmp = tempfile.mkstemp(prefix="kdocs-", suffix=".json")
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(params, fh, ensure_ascii=False)
-            cmd += ["--file", tmp]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=self.timeout,
-                                  env={**os.environ, **extra_env} if extra_env else None)
-        except FileNotFoundError as exc:
-            raise WpsCloudError(f"无法执行 kdocs-cli：{exc}") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise WpsCloudError(f"kdocs-cli 超时（{self.timeout}s）：{' '.join(args)}") from exc
-        finally:
-            if tmp:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-
-        raw = (proc.stdout or "").strip()
-        payload: dict[str, Any] | None = None
-        if raw.startswith("{"):
-            try:
-                payload, _ = json.JSONDecoder().raw_decode(raw)
-            except json.JSONDecodeError:
-                payload = None
-        if payload is None:
-            hint = (proc.stderr or raw or "").strip()[:300]
-            raise WpsCloudError(f"kdocs-cli 无有效输出（exit {proc.returncode}）：{hint}")
-        # 注意：CLI 在接口报错时退出码仍可能是 0，必须看 code 字段
-        code = payload.get("code")
-        if code in RATE_LIMIT_CODES:
-            # 429001 = 当日总量用尽；429002 = 短时间频繁触发，均次日 08:00 恢复。
-            # 接口返回的 reset_at 时区口径不稳定（实测与提示文案差 8 小时），
-            # 因此只显示"还有多久"，不显示具体时点，避免误导。
-            detail = payload.get("data") or {}
-            when = ""
-            reset_at = detail.get("reset_at")
-            if isinstance(reset_at, (int, float)) and reset_at > 0:
-                remain = reset_at - _dt.datetime.now().timestamp()
-                if remain > 0:
-                    hours, minutes = divmod(int(remain // 60), 60)
-                    when = f"，约 {hours} 小时 {minutes} 分钟后恢复"
-            elif detail.get("retry_after"):
-                when = f"，约 {int(detail['retry_after']) // 60} 分钟后可再试"
-            raise WpsCloudError(
-                "今日云文档调用额度已用尽（金山接口限流）"
-                f"{when}。这不是程序故障：读表、写表、搜索都会受限，"
-                "本地排单任务不受影响。")
-        if code not in (0, None):
-            raise WpsCloudError(
-                f"云文档接口返回 code={code}：{payload.get('message') or payload.get('msg')}")
-        data = payload.get("data", payload)
-        return data if isinstance(data, dict) else {"data": data}
-    # ---- 认证 ----
-
-    def authenticated(self) -> bool:
-        """kdocs-cli 是否已授权（跑 ``auth status``）；命令缺失或超时按未授权处理。"""
-        try:
-            proc = subprocess.run([self.path, "auth", "status"],
-                                  capture_output=True, text=True, timeout=60)
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        try:
-            return bool(json.loads(proc.stdout.strip()).get("authenticated"))
-        except (json.JSONDecodeError, AttributeError):
-            return False
-
-    def login_argv(self) -> list[str]:
-        """返回可交给调用方在终端/新窗口里执行的授权命令。
-
-        在 Termux/Android 上会带上 ``proot`` 前缀：``auth login`` 原本会因 Android
-        seccomp 拦截 ``faccessat2`` 而以 ``SIGSYS: bad system call`` 崩溃，
-        proot 接管系统调用后即可正常走完 OAuth 流程。
-        """
-        prefix, _ = termux_cli_runtime()
-        return [*prefix, self.path, "auth", "login"]
-
-    def login_env(self) -> dict[str, str] | None:
-        """授权命令需要的环境变量（Termux 下需要 ``SSL_CERT_FILE``），无需时返回 None。"""
-        _, extra_env = termux_cli_runtime()
-        return {**os.environ, **extra_env} if extra_env else None
-
-    # ---- 表格读写 ----
-
-    def sheets_info(self, file_id: str) -> list[dict[str, Any]]:
-        """读取在线表格的子表信息列表（``sheetsInfo``）；读不到返回空列表。"""
-        data = self._run("sheet", "get-sheets-info", params={"file_id": file_id})
-        detail = data.get("detail") or {}
-        return detail.get("sheetsInfo") or []
-
-    def read_grid(self, file_id: str, worksheet_id: int,
-                  row_from: int, row_to: int,
-                  col_from: int, col_to: int,
-                  *, with_format: bool = False) -> dict[tuple[int, int], str]:
-        """读取矩形区域，返回 {(0-based 行, 0-based 列): cellText}。
-
-        接口返回里没有 ``detail`` 说明这张表读不了（例如是二进制 xlsx 而非在线
-        表格），此时抛错而不是返回空结果 —— 否则调用方会把"读不了"误判成"表是空的"。
-        """
-        data = self._run("sheet", "get-range-data", params={
-            "file_id": file_id, "worksheet_id": worksheet_id,
-            "range": {"rowFrom": row_from, "rowTo": row_to,
-                      "colFrom": col_from, "colTo": col_to}})
-        if not isinstance(data, dict) or not isinstance(data.get("detail"), dict):
-            raise WpsCloudError(
-                f"表格内容读取失败（file_id={file_id}）：{str(data)[:200]}")
-        cells = data["detail"].get("rangeData") or []
-        grid: dict[tuple[int, int], str] = {}
-        for cell in cells:
-            if not isinstance(cell, dict):
-                continue
-            text = cell.get("cellText")
-            if text in (None, ""):
-                continue
-            if with_format:
-                key = (int(cell.get("originRow", 0)), int(cell.get("originCol", 0)))
-                grid[key] = {"text": str(text),
-                             "fill": (cell.get("cell_background_color")
-                                      or cell.get("fill") or "")}
-                continue
-            grid[(int(cell.get("originRow", 0)), int(cell.get("originCol", 0)))] = str(text)
-        return grid
-
-    def read_row(self, file_id: str, worksheet_id: int, row: int,
-                 col_from: int = 0, col_to: int = MAX_SCAN_COL - 1) -> dict[int, str]:
-        """读一整行，返回 {0-based 列号: 文本}（表头解析用，避免坐标元组混淆）。
-
-        ``row`` 为 **1-based** 行号（与 Excel 一致）。
-        """
-        grid = self.read_grid(file_id, worksheet_id, row - 1, row - 1, col_from, col_to)
-        return {col: text for (_r, col), text in grid.items()}
-
-    def find_column(self, file_id: str, worksheet_id: int, names: Sequence[str],
-                    row: int = HEADER_ROW) -> int | None:
-        """按表头文字找列，返回 **1-based** 列号；找不到返回 None。"""
-        return _find_column(self.read_row(file_id, worksheet_id, row), names)
-
-    def write_cells(self, file_id: str, worksheet_id: int,
-                    cells: Sequence[Mapping[str, Any]]) -> None:
-        """写入多个单元格，自动按接口上限分批。
-
-        cells 每项：{"row": 1-based 行, "col": 1-based 列, "value": str}
-
-        实测：``update-range-data`` 单次 ``rangeData`` 最多 **100** 项，超出返回
-        ``400001 rangeData length N exceeds limit 100``。排单表追加新客户时
-        单元格数很容易过百（东湖中餐一次 25 人 ≈ 175 格），因此这里必须分批。
-        """
-        if not cells:
-            return
-        pending = list(cells)
-        for start in range(0, len(pending), WRITE_BATCH_CELLS):
-            batch = pending[start:start + WRITE_BATCH_CELLS]
-            range_data = [{
-                "opType": "formula",
-                "rowFrom": int(c["row"]) - 1, "rowTo": int(c["row"]) - 1,
-                "colFrom": int(c["col"]) - 1, "colTo": int(c["col"]) - 1,
-                "formula": str(c["value"]),
-            } for c in batch]
-            self._run("sheet", "update-range-data", params={
-                "file_id": file_id, "worksheet_id": worksheet_id,
-                "rangeData": range_data})
-
-    def read_formulas(self, file_id: str, worksheet_id: int,
-                      row_from: int, row_to: int,
-                      col_from: int, col_to: int) -> dict[tuple[int, int], str]:
-        """读取指定区域的公式本体（而不是计算后的显示值）。"""
-        data = self._run("sheet", "get-range-data", params={
-            "file_id": file_id, "worksheet_id": worksheet_id,
-            "range": {"rowFrom": row_from, "rowTo": row_to,
-                      "colFrom": col_from, "colTo": col_to}})
-        cells = (data.get("detail") or {}).get("rangeData") or {}
-        return {(int(c.get("originRow", 0)), int(c.get("originCol", 0))): str(c["fmlaText"])
-                for c in cells if isinstance(c, dict) and c.get("fmlaText")}
-
-    # ---- 格式 ----
-
-    def insert_rows(self, file_id: str, worksheet_id: int, *,
-                    row: int, count: int) -> None:
-        """在 1-based 行号 ``row`` 之前插入 ``count`` 个空行。
-
-        新行占据 row..row+count-1，原有内容（含公式、底色）整体下移。
-        接口参数是 0-based 闭区间：row_from = row_to = row - 1 + count - 1。
-        """
-        if count <= 0:
-            return
-        self._run("sheet", "insert-rows-cols", params={
-            "file_id": file_id, "worksheet_id": worksheet_id, "type": "row",
-            "row_from": row - 1, "row_to": row - 1 + count - 1})
-
-    def delete_rows(self, file_id: str, worksheet_id: int, *,
-                    row: int, count: int) -> None:
-        """删除 1-based 行号 ``row`` 起的 ``count`` 行（插入失败时的回滚手段）。"""
-        if count <= 0:
-            return
-        self._run("sheet", "delete-range-data", params={
-            "file_id": file_id, "worksheet_id": worksheet_id,
-            "range_data": [{
-                "col_from": 0, "col_to": 16383,
-                "row_from": row - 1, "row_to": row - 1 + count - 1}],
-            "shift_type": "shift_up"})
-
-    def delete_columns(self, file_id: str, worksheet_id: int, *,
-                       column: int, rows: int) -> None:
-        """删除一整列（排序辅助列的收尾清理）。``column`` 为 1-based 列号。
-
-        辅助列一定在该表所有内容列的右侧，所以左移删除不会动到任何数据。
-        """
-        self._run("sheet", "delete-range-data", params={
-            "file_id": file_id, "worksheet_id": worksheet_id,
-            "range_data": [{
-                "col_from": column - 1, "col_to": column - 1,
-                "row_from": 0, "row_to": max(0, rows - 1)}],
-            "shift_type": "shift_left"})
-
-    def write_format_ops(self, file_id: str, worksheet_id: int,
-                         ops: Sequence[Mapping[str, Any]]) -> None:
-        """批量写格式操作（opType=format），按接口单次上限自动分批。"""
-        if not ops:
-            return
-        pending = [dict(op) for op in ops]
-        for start in range(0, len(pending), WRITE_BATCH_CELLS):
-            self._run("sheet", "update-range-data", params={
-                "file_id": file_id, "worksheet_id": worksheet_id,
-                "rangeData": pending[start:start + WRITE_BATCH_CELLS]})
-
-    def read_cell_format(self, file_id: str, worksheet_id: int,
-                         row: int, col: int) -> dict[str, Any] | None:
-        """读取单个单元格的格式（1-based 行列）；空单元格返回 None。
-
-        只用于"学一行参考格式"。注意：**只有带内容的格才会被接口返回**，
-        所以调用方要挑一个确实有值的格子。
-        """
-        data = self._run("sheet", "get-range-data", params={
-            "file_id": file_id, "worksheet_id": worksheet_id,
-            "range": {"rowFrom": row - 1, "rowTo": row - 1,
-                      "colFrom": col - 1, "colTo": col - 1}})
-        detail = data.get("detail") if isinstance(data, dict) else None
-        cells = (detail or {}).get("rangeData") or []
-        for cell in cells:
-            if isinstance(cell, dict) and cell.get("cellText") not in (None, ""):
-                return cell
-        return None
-
-    def sort_range(self, file_id: str, worksheet_id: int, *, range_ref: str,
-                   key: str, order: str = "asc", header: bool = True,
-                   key2: str | None = None, order2: str | None = None) -> None:
-        """原地排序（供后续功能使用）。``range_ref`` 形如 ``A3:L42``。"""
-        params: dict[str, Any] = {
-            "file_id": file_id, "worksheet_id": worksheet_id,
-            "range": range_ref, "key": key, "order": order, "header": header}
-        if key2:
-            params["key2"] = key2
-        if order2:
-            params["order2"] = order2
-        self._run("sheet", "range-sort", params=params)
-
-    def list_files(self, drive_id: str, parent_id: str = "0",
-                   page_size: int = 200) -> list[dict[str, Any]]:
-        """列出云盘目录下的文件；接口两种返回形态都兼容，取不到时返回空列表。"""
-        data = self._run("drive", "list-files", params={
-            "drive_id": drive_id, "parent_id": parent_id, "page_size": page_size})
-        return data.get("data", {}).get("items") or data.get("items") or []
 
 
 # ----------------------------------------------------------------------
 # 云端表解析与计划
 # ----------------------------------------------------------------------
 
-def _find_column(header: Mapping[int, str], names: Sequence[str]) -> int | None:
-    """在表头里按名字找列，返回 **1-based** 列号（与写入接口保持一致）。
-
-    注意：``header`` 的键来自 ``read_grid``，是 0-based 列号。
-    """
-    for col, text in header.items():
-        if str(text).strip() in names:
-            return int(col) + 1
-    return None
 
 
-def find_target_column(header: Mapping[int, str],
-                       target: _dt.date,
-                       *, col_from: int = 1, col_to: int = MAX_SCAN_COL
-                       ) -> tuple[int, str] | None:
-    """在表头里找目标日期的列（只比对月.日），**限定在日期区间内**。
-
-    必须限定区间：协作者的标记格里也写着「9.14 周一」，若不设限，在当天还没有
-    真实日期列时会命中标记列，把 1 写进协作者的格子。
-    """
-    for col in sorted(header):
-        column = int(col) + 1
-        if not (col_from <= column <= col_to):
-            continue
-        parsed = parse_date_header(header[col])
-        if parsed and parsed == (target.month, target.day):
-            return col, str(header[col])
-    return None
 
 
-def column_name(column: int) -> str:
-    """把 1-based 列号转成 Excel 列名（1 → ``A``，27 → ``AA``）。"""
-    result = ""
-    while column:
-        column, remainder = divmod(column - 1, 26)
-        result = chr(65 + remainder) + result
-    return result
 
 
 def formula_cells_for_new_rows(plan: SheetPlan, rows: Sequence[int]) -> list[dict[str, Any]]:
@@ -1384,11 +832,6 @@ def build_plan(cli: KdocsCli, *, local_orders: Mapping[str, Sequence[CloudOrder]
     return plans
 
 
-def _as_int(value: Any) -> int:
-    try:
-        return int(float(str(value).strip()))
-    except (TypeError, ValueError):
-        return 0
 
 
 def summarize_plan(plans: Iterable[SheetPlan]) -> dict[str, int]:
@@ -1802,42 +1245,12 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
 
 
 # 传输层瞬时错误的特征词：这些值得重试（业务错误不重试）。
-_TRANSIENT_HINTS = (
-    "TLS handshake timeout", "connection reset", "connection refused",
-    "i/o timeout", "EOF", "broken pipe", "no such host",
-    "temporarily unavailable", "timeout awaiting response",
-)
 
 
-def _is_transient(exc: BaseException) -> bool:
-    text = str(exc)
-    return any(hint.lower() in text.lower() for hint in _TRANSIENT_HINTS)
 
 
-def scan_bounds(info: Mapping[str, Any] | None, *,
-                max_col: int = MAX_SCAN_COL,
-                max_row: int = MAX_SCAN_ROW,
-                budget: int = MAX_READ_CELLS) -> tuple[int, int]:
-    """按接口单次上限，算出安全的读取范围 ``(row_to, col_to)``（0-based 闭区间）。
-
-    先按需取列宽，再据此压缩行数 —— 宽表（排单表有 100+ 个日期列）必须少读行。
-    """
-    sheet = (info or {}) if isinstance(info, Mapping) else {}
-    col_to = min(int(sheet.get("colTo") or 0), max_col)
-    row_to = min(int(sheet.get("rowTo") or 0), max_row)
-    cols = col_to + 1
-    if cols > 0:
-        row_to = min(row_to, max(0, budget // cols - 1))
-    return row_to, col_to
 
 
-def _argb_to_int(hexcolor: str) -> int:
-    """"#FF92D050" -> 4287811664（接口用 ARGB 整数传色）。"""
-    text = str(hexcolor).strip().lstrip("#")
-    try:
-        return int(text, 16) & 0xFFFFFFFF
-    except ValueError:
-        return 0xFFFFFFFF
 
 
 def learn_row_format(cli: "KdocsCli", file_id: str, worksheet_id: int, *,

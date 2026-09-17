@@ -11,7 +11,7 @@ import os
 import pytest
 
 from app.wps.sync import KdocsCli, termux_cli_runtime
-from app.wps import sync as wps_cloud
+from app.wps import cli as wps_cli
 
 
 @pytest.fixture()
@@ -22,19 +22,19 @@ def termux(tmp_path, monkeypatch):
     (prefix / "etc" / "tls" / "cert.pem").write_text("CA", encoding="utf-8")
     (prefix / "etc" / "resolv.conf").write_text("nameserver 8.8.8.8", encoding="utf-8")
     monkeypatch.setenv("PREFIX", str(prefix))
-    monkeypatch.setattr(wps_cloud.shutil, "which", lambda name: f"/fake/bin/{name}")
+    monkeypatch.setattr(wps_cli.shutil, "which", lambda name: f"/fake/bin/{name}")
     return prefix
 
 
 def _hide_system_resolv(monkeypatch, exists: bool):
-    real_exists = wps_cloud.Path.exists
+    real_exists = wps_cli.Path.exists
 
     def fake_exists(self):
         if str(self) == "/etc/resolv.conf":
             return exists
         return real_exists(self)
 
-    monkeypatch.setattr(wps_cloud.Path, "exists", fake_exists)
+    monkeypatch.setattr(wps_cli.Path, "exists", fake_exists)
 
 
 def test_non_termux_environment_is_untouched(monkeypatch):
@@ -66,7 +66,7 @@ def test_no_proot_needed_when_system_resolv_conf_exists(termux, monkeypatch):
 
 def test_missing_proot_still_sets_ca_bundle(termux, monkeypatch):
     _hide_system_resolv(monkeypatch, exists=False)
-    monkeypatch.setattr(wps_cloud.shutil, "which", lambda name: None)
+    monkeypatch.setattr(wps_cli.shutil, "which", lambda name: None)
     prefix, env = termux_cli_runtime()
     assert prefix == []
     assert env["SSL_CERT_FILE"]
@@ -74,7 +74,7 @@ def test_missing_proot_still_sets_ca_bundle(termux, monkeypatch):
 
 def test_login_argv_carries_the_proot_prefix(termux, monkeypatch):
     _hide_system_resolv(monkeypatch, exists=False)
-    monkeypatch.setattr(wps_cloud, "find_cli", lambda _=None: "/fake/kdocs-cli")
+    monkeypatch.setattr(wps_cli, "find_cli", lambda _=None: "/fake/kdocs-cli")
     cli = KdocsCli(None)
     argv = cli.login_argv()
     assert argv[:3] == ["/fake/bin/proot", "-b",
@@ -86,14 +86,14 @@ def test_login_argv_carries_the_proot_prefix(termux, monkeypatch):
 
 def test_login_env_is_none_without_extra_vars(monkeypatch):
     monkeypatch.delenv("PREFIX", raising=False)
-    monkeypatch.setattr(wps_cloud, "find_cli", lambda _=None: "/fake/kdocs-cli")
+    monkeypatch.setattr(wps_cli, "find_cli", lambda _=None: "/fake/kdocs-cli")
     assert KdocsCli(None).login_env() is None
 
 
 def test_run_once_passes_prefix_and_env_to_subprocess(termux, monkeypatch):
     """真正决定成败的一步：命令前缀与 SSL_CERT_FILE 必须落到 subprocess 上。"""
     _hide_system_resolv(monkeypatch, exists=False)
-    monkeypatch.setattr(wps_cloud, "find_cli", lambda _=None: "/fake/kdocs-cli")
+    monkeypatch.setattr(wps_cli, "find_cli", lambda _=None: "/fake/kdocs-cli")
     captured: dict[str, object] = {}
 
     class _Proc:
@@ -106,7 +106,7 @@ def test_run_once_passes_prefix_and_env_to_subprocess(termux, monkeypatch):
         captured["env"] = kwargs.get("env")
         return _Proc()
 
-    monkeypatch.setattr(wps_cloud.subprocess, "run", fake_run)
+    monkeypatch.setattr(wps_cli.subprocess, "run", fake_run)
     KdocsCli(None)._run_once("sheet", "get-sheets-info", params={"file_id": "x"})
 
     cmd = captured["cmd"]
@@ -122,7 +122,7 @@ def test_run_once_passes_prefix_and_env_to_subprocess(termux, monkeypatch):
 
 def test_run_once_leaves_env_untouched_off_termux(monkeypatch):
     monkeypatch.delenv("PREFIX", raising=False)
-    monkeypatch.setattr(wps_cloud, "find_cli", lambda _=None: "/fake/kdocs-cli")
+    monkeypatch.setattr(wps_cli, "find_cli", lambda _=None: "/fake/kdocs-cli")
     captured: dict[str, object] = {}
 
     class _Proc:
@@ -135,7 +135,7 @@ def test_run_once_leaves_env_untouched_off_termux(monkeypatch):
         captured["env"] = kwargs.get("env")
         return _Proc()
 
-    monkeypatch.setattr(wps_cloud.subprocess, "run", fake_run)
+    monkeypatch.setattr(wps_cli.subprocess, "run", fake_run)
     KdocsCli(None)._run_once("auth", "status")
     assert captured["cmd"] == ["/fake/kdocs-cli", "auth", "status"]
     # env=None 表示完全沿用父进程环境——桌面端行为不变的关键。
