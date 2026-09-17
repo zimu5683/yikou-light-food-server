@@ -16,8 +16,13 @@ from app.wps import cli as wps_cli
 
 @pytest.fixture()
 def termux(tmp_path, monkeypatch):
-    """伪造一个 Termux 前缀目录，并清掉宿主的 /etc/resolv.conf 判定。"""
-    prefix = tmp_path / "usr"
+    """伪造一个 Termux 前缀目录，并清掉宿主的 /etc/resolv.conf 判定。
+
+    路径里必须真的包含 ``com.termux``：生产逻辑用它区分 Termux 与桌面，
+    而不是把任意 PREFIX 都当 Termux。GitHub runner 的 /tmp 不含这个子串，
+    因此旧测试只在 Termux 本机假绿。
+    """
+    prefix = tmp_path / "com.termux" / "usr"
     (prefix / "etc" / "tls").mkdir(parents=True)
     (prefix / "etc" / "tls" / "cert.pem").write_text("CA", encoding="utf-8")
     (prefix / "etc" / "resolv.conf").write_text("nameserver 8.8.8.8", encoding="utf-8")
