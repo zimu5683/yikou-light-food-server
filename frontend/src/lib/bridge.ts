@@ -234,6 +234,10 @@ type BridgeEventBase =
     }
   | { event: 'task:error'; payload: { message: string } }
   | { event: 'update:available'; payload: UpdateAvailable }
+  | {
+      event: 'desktop_update:available'
+      payload: { tag: string; current: string; body: string; html_url?: string }
+    }
   | { event: 'update:latest'; payload: { manual: boolean; current: string } }
   | { event: 'update:error'; payload: { message: string } }
   | { event: 'decision'; payload: DecisionRequest }

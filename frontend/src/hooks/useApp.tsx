@@ -142,6 +142,21 @@ export function AppProvider({ children }: { children: ReactNode }) {
         case 'update:error':
           toast.error(`检查更新失败：${event.payload.message}`)
           break
+        case 'desktop_update:available': {
+          // 桌面版更新只是提示，不参与网页版更新，也不会改动任何网页端文件。
+          const payload = event.payload
+          const url = payload.html_url
+            || `https://github.com/zimu5683/yikou-light-food-desktop/releases/tag/${payload.tag}`
+          toast.info(`桌面版发布新版本 ${payload.tag}`, {
+            description: '网页版不会自动更新；如需同步功能，请手动调整代码。',
+            duration: 12000,
+            action: {
+              label: '查看桌面版发布页',
+              onClick: () => { api().open_external(url).catch(() => {}) },
+            },
+          })
+          break
+        }
         case 'decision':
           setDecision(event.payload)
           break

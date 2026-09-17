@@ -19,9 +19,17 @@ from urllib.request import Request, urlopen
 
 from app import __version__
 
-#: 发布仓库。与 README / git remote 保持一致。
-REPOSITORY = "zimu5683/yikou-light-food-server"
-RELEASES_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
+#: 网页版服务端自己的发布仓库：这里的新版本才代表“网页版需要更新”。
+WEB_REPOSITORY = "zimu5683/yikou-light-food-server"
+#: 桌面版仓库：只在网页版里做“桌面端有更新”的提示，不参与网页版版本比较。
+DESKTOP_REPOSITORY = "zimu5683/yikou-light-food-desktop"
+#: 兼容旧名称；默认仍指网页版自己。
+REPOSITORY = WEB_REPOSITORY
+
+
+def releases_url(repository: str) -> str:
+    """返回某个 GitHub 仓库的 latest release API 地址。"""
+    return f"https://api.github.com/repos/{repository}/releases/latest"
 
 #: 版本号必须形如 3.5.0（允许 v 前缀）。非 SemVer 一律拒绝比较，避免误判。
 _VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
@@ -39,6 +47,7 @@ class ReleaseInfo:
     name: str = ""
     body: str = ""
     html_url: str = ""
+    repository: str = REPOSITORY
 
     @property
     def version(self) -> str:
@@ -47,7 +56,7 @@ class ReleaseInfo:
 
     @property
     def release_url(self) -> str:
-        return self.html_url or f"https://github.com/{REPOSITORY}/releases"
+        return self.html_url or f"https://github.com/{self.repository}/releases"
 
 
 def _version_tuple(text: str) -> tuple[int, int, int] | None:
@@ -68,10 +77,12 @@ def compare_versions(left: str, right: str) -> int:
     return (lhs > rhs) - (lhs < rhs)
 
 
-def fetch_latest_release(*, timeout: float = 10.0) -> ReleaseInfo:
-    """读取最新 Release。网络或解析失败抛 :class:`ReleaseCheckError`。"""
+def fetch_latest_release(*, repository: str = WEB_REPOSITORY,
+                         timeout: float = 10.0) -> ReleaseInfo:
+    """读取指定仓库的最新 Release；网络或解析失败抛 :class:`ReleaseCheckError`。"""
+    repository = str(repository or WEB_REPOSITORY).strip() or WEB_REPOSITORY
     request = Request(
-        RELEASES_URL,
+        releases_url(repository),
         headers={
             "Accept": "application/vnd.github+json",
             "User-Agent": f"yikou-light-food/{__version__}",
@@ -97,23 +108,27 @@ def fetch_latest_release(*, timeout: float = 10.0) -> ReleaseInfo:
         name=str(payload.get("name") or ""),
         body=str(payload.get("body") or ""),
         html_url=str(payload.get("html_url") or ""),
+        repository=repository,
     )
 
 
-def check_for_update(current_version: str = __version__, **kwargs: Any) -> ReleaseInfo | None:
-    """有新版本返回 :class:`ReleaseInfo`，已是最新返回 ``None``。
+def check_for_update(current_version: str = __version__, *,
+                     repository: str = WEB_REPOSITORY,
+                     **kwargs: Any) -> ReleaseInfo | None:
+    """检查指定仓库是否有比当前版本更新的 Release。
 
-    与旧实现一致的行为：**同版本不算更新**（不静默覆盖），**降级拒绝**。
+    远端版本 **小于或等于** 当前版本都返回 ``None``：远端更旧只说明两个仓库的
+    版本轨道还没对齐，不是错误，更不应该在启动时弹报错。
     """
     if _version_tuple(current_version) is None:
         raise ReleaseCheckError(f"当前版本号不是 SemVer，无法比较：{current_version}")
-    release = fetch_latest_release(**kwargs)
+    release = fetch_latest_release(repository=repository, **kwargs)
     if _version_tuple(release.tag_name) is None:
         raise ReleaseCheckError(f"Release 版本号不是 SemVer：{release.tag_name}")
     comparison = compare_versions(release.version, current_version)
     if comparison < 0:
-        raise ReleaseCheckError(
-            f"远端版本 {release.version} 低于当前版本 {current_version}，拒绝降级")
+        # 远端更旧：不降级，也不算“有更新”。
+        return None
     if comparison == 0:
         return None
     return release

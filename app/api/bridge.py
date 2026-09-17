@@ -12,9 +12,10 @@ sequence 中间缺口和关键事件超限都会返回 ``events:dropped`` 告警
 - status             {state}                   ready/running/stopping/success/partial/stopped/error/updating
 - task:done          {message, stopped, partial}
 - task:error         {message}
-- update:available   {tag, current, body, html_url}
-- update:latest      {manual}
-- update:error       {message}
+- update:available         {tag, current, body, html_url}   网页版自己的 Release
+- desktop_update:available {tag, current, body, html_url}   桌面版提示，不改变网页版
+- update:latest            {manual}
+- update:error             {message}
 - decision           {id, kind, title, message, choices}
 - captcha            {id, image}
 - address_input      {id, title, message, items[{raw_address, order_numbers,
@@ -46,7 +47,11 @@ from app.core.credentials import (delete_password, delete_sss_password, get_pass
 from app.order.templates import write_order_template, write_sss_template
 from app.ordering.sss import expected_delivery_date, run_sss_job
 from app.ordering.cloud_import import ImportRefused, prepare_day_orders
-from app.core.update import ReleaseCheckError, check_for_update
+from app.core.update import (
+    DESKTOP_REPOSITORY,
+    ReleaseCheckError,
+    check_for_update,
+)
 from app.wps.sync import (KdocsCli, SyncLedger, WpsCloudError, apply_plan,
                         build_plan, effective_tables, format_plan,
                         read_local_orders, summarize_plan, target_date_for)
@@ -1386,7 +1391,9 @@ class Bridge:
         return {"ok": True}
 
     def _check_updates_worker(self, manual: bool) -> None:
+        web_ok = True
         try:
+            # 1) 网页版自己的 Release：只有这个仓库的新版本才代表“网页版需要更新”。
             release = check_for_update()
             if release:
                 self._emit_event("update:available", {
@@ -1399,13 +1406,33 @@ class Bridge:
                 self._set_status("ready")
                 self._emit_event("update:latest", {"manual": True, "current": __version__})
             else:
-                self.log("已是最新版本")
+                self.log("网页版已是最新版本")
                 self._set_status("ready")
         except ReleaseCheckError as exc:
+            web_ok = False
             self._set_status("error")
             self._emit_event("update:error", {"message": str(exc)})
-        finally:
-            self._update_checking = False
+
+        # 2) 桌面版仓库只做“有更新”的提示：不参与网页版版本比较、不下载、
+        #    更不会改动任何网页端文件。用户可据此决定是否手动移植代码。
+        try:
+            desktop = check_for_update(repository=DESKTOP_REPOSITORY)
+            if desktop:
+                self._emit_event("desktop_update:available", {
+                    "tag": desktop.tag_name,
+                    "current": __version__,
+                    "body": desktop.body or "（暂无更新说明）",
+                    "html_url": desktop.release_url,
+                })
+                self.log(f"桌面版发布新版本 {desktop.tag_name}；"
+                         "网页版内容不会被自动改动，如需同步功能请手动移植代码")
+        except ReleaseCheckError as exc:
+            # 桌面版检查失败只是提示信息缺失，不影响网页版自身的更新状态。
+            self.log(f"桌面版更新检查失败：{exc}", "WARN")
+
+        if not web_ok and not manual:
+            pass  # 保留上面的 error 状态，前台会提示检查失败
+        self._update_checking = False
 
     def open_external(self, url: str) -> dict[str, Any]:
         """用系统默认程序打开外链。
