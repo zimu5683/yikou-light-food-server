@@ -149,3 +149,21 @@ def test_extra_env_overrides_process_value(termux, monkeypatch):
     _, env = termux_cli_runtime()
     assert env["SSL_CERT_FILE"] == str(termux / "etc" / "tls" / "cert.pem")
     assert os.environ["SSL_CERT_FILE"] == "/wrong/bundle.pem"
+
+def test_find_cli_checks_repo_vendor_path(monkeypatch, tmp_path):
+    """app/wps/cli.py 的 vendor 路径必须指向仓库根，而不是 app/vendor。"""
+    from app.wps import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "__file__", str(tmp_path / "app" / "wps" / "cli.py"))
+    monkeypatch.setattr(cli_mod.shutil, "which", lambda _name: None)
+    monkeypatch.delenv("_MEIPASS", raising=False)
+    monkeypatch.setattr(cli_mod.sys, "executable", str(tmp_path / "python"))
+
+    expected = tmp_path / "vendor" / "kdocs-cli" / "kdocs-cli"
+    real_is_file = cli_mod.Path.is_file
+
+    def fake_is_file(self):
+        return self == expected or real_is_file(self)
+
+    monkeypatch.setattr(cli_mod.Path, "is_file", fake_is_file)
+    assert cli_mod.find_cli() == str(expected)

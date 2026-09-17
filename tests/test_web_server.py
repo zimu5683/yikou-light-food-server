@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import threading
+from pathlib import Path
 import urllib.error
 import urllib.request
 
@@ -279,6 +280,14 @@ def test_fs_list_result_is_json_serialisable(server, tmp_path):
 
 def test_excel_suffixes_cover_the_dialog_filters():
     assert {".xlsx", ".xlsm"} <= EXCEL_SUFFIXES
+
+
+def test_default_dist_dir_points_to_project_root_frontend_dist():
+    """文件从 app/web_server.py 挪到 app/web/server.py 后，路径深度不能算错。"""
+    from app.web.server import default_dist_dir
+
+    project_root = Path(__file__).resolve().parent.parent
+    assert default_dist_dir() == project_root / "frontend" / "dist"
 
 
 # ----------------------------------------------------------------------

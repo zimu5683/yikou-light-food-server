@@ -39,7 +39,7 @@ def find_cli(explicit: str | os.PathLike[str] | None = None) -> str:
         for name in names:
             candidates.append(Path(bundle) / name)
     # 源码运行：仓库内的 vendor/kdocs-cli/
-    repo_vendor = Path(__file__).resolve().parent.parent / "vendor" / "kdocs-cli"
+    repo_vendor = Path(__file__).resolve().parents[2] / "vendor" / "kdocs-cli"
     for name in names:
         candidates.append(repo_vendor / name)
     exe_dir = Path(sys.executable).parent

@@ -805,7 +805,7 @@ class _Server(ThreadingHTTPServer):
 
 
 def default_dist_dir() -> Path:
-    return Path(__file__).resolve().parent.parent / "frontend" / "dist"
+    return Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
 
 def build_bridge(on_destroy: Any = None, config_path: Any = None) -> Bridge:
