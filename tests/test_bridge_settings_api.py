@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import pytest
 
-from app import bridge as bridge_module
-from app.bridge import Bridge
+from app.api.bridge import Bridge
+from app.api import bridge as bridge_module
 
 
 def _bridge(tmp_path) -> Bridge:
@@ -199,7 +199,7 @@ def test_partial_address_order_payload_keeps_the_other_sheets(tmp_path):
 
 
 def test_config_is_persisted(tmp_path):
-    from app.config import AppConfig
+    from app.core.config import AppConfig
 
     bridge = _bridge(tmp_path)
     bridge.save_wps_config({"enabled": True, "cli_path": "/x/kdocs"})

@@ -22,6 +22,28 @@ Linux SecretService）保存，没有可用密钥环时退化为每次运行手�
 
 固定使用**纯接口模式**：直接调用平台 HTTP 接口完成登录、读单和下单，不启动任何浏览器。
 
+## 项目结构
+
+```
+app/
+  main.py               CLI 入口
+  core/                 配置、凭据、共享模型、版本检查
+  integrations/         管理后台 / 闪时送 HTTP 客户端
+  order/                管理后台订单处理（解析、抓取、模板、地址）
+  ordering/             闪时送下单与云端名单导入
+  wps/                  WPS 云文档增量同步
+  api/                  前端唯一 API 表面 Bridge
+  web/                  HTTP 服务器、鉴权、登录/管理员页面
+frontend/               React + TypeScript 前端（构建产物在 frontend/dist/）
+tests/                  pytest 与前端契约测试
+scripts/                运维/构建脚本      tools/  一次性诊断探针
+docs/                   当前架构说明       design/ 历史方案与验证资料（见 design/README.md）
+```
+
+依赖方向：`web → api → 领域包（order / ordering / wps）→ core / integrations`，
+由 `tests/test_architecture_boundaries.py` 静态约束。详见
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
+
 ## 网页版（手机 / 服务器当主机）
 
 不想开原生窗口，或想把跑任务的那台机器当服务器、用**其它设备**（电脑、平板、另一台手机）
@@ -46,8 +68,8 @@ python run.py --web --new-token      # 轮换访问令牌
 
 ### 它是怎么跑的
 
-- 页面由 `app/web_server.py` 提供：静态前端 + `POST /api/<方法名>`，业务逻辑全在
-  `app/bridge.py`；事件是「Python 追加 + 前端按 cursor 轮询」，因此不需要 WebSocket；
+- 页面由 `app/web/server.py` 提供：静态前端 + `POST /api/<方法名>`，业务逻辑全在
+  `app/api/bridge.py`；事件是「Python 追加 + 前端按 cursor 轮询」，因此不需要 WebSocket；
 - **选择 Excel 文件**用服务器端文件浏览器：任务在主机上跑，Excel 也在主机上，
   所以浏览并选择的是**主机上的路径**，而不是打开网页那台设备的文件；
 - 没有原生窗口，标题栏不提供最小化/最大化。
@@ -136,6 +158,10 @@ ERROR: Allow outbound QUIC traffic on port 7844 or use HTTP2.
 exec cloudflared tunnel run --protocol http2 --token-file "$HOME/.cloudflared/token"
 ```
 
+> ⚠️ 注意：`--protocol` 是 **cloudflared 的隐藏参数** —— 2026.9.1 的 `--help`
+> 里已经看不到它，但传进去依然生效（启动日志会出现
+> `Settings: map[p:http2 protocol:http2 ...]`）。**不要在清理参数时把它删掉**。
+
 改完 `sv restart cloudflared`，日志里会出现
 `Registered tunnel connection ... protocol=http2`，隧道变 `healthy`。
 
@@ -200,7 +226,7 @@ tar xzf k.tar.gz -C vendor/kdocs-cli && chmod +x vendor/kdocs-cli/kdocs-cli
 ```
 
 但**静态链接**意味着它不经过 Termux 对绝对路径的重写，在 Android 上必然踩两个坑，
-程序已自动处理（见 `app/wps_cloud.py` 的 `termux_cli_runtime()`）：
+程序已自动处理（见 `app/wps/sync.py` 的 `termux_cli_runtime()`）：
 
 | 症状 | 原因 | 处理 |
 |---|---|---|

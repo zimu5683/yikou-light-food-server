@@ -16,7 +16,7 @@ import datetime as dt
 
 import pytest
 
-from app.wps_cloud import (CloudOrder, SheetPlan, SyncLedger, WpsCloudError,
+from app.wps.sync import (CloudOrder, SheetPlan, SyncLedger, WpsCloudError,
                            _rollback_inserts, apply_plan, build_plan)
 
 BASE_HEADER = {0: "名字", 1: "地址", 2: "电话", 3: "9.10 周四",
@@ -242,7 +242,7 @@ def test_failure_after_successful_sort_does_not_roll_back():
 # README：校验不通过则报告并**不更新本地账本**
 # ----------------------------------------------------------------------
 def _ledger(tmp_path):
-    from app.wps_cloud import SyncLedger
+    from app.wps.sync import SyncLedger
     return SyncLedger(tmp_path / "wps_sync_state.json")
 
 
@@ -365,8 +365,8 @@ def test_wps_upload_swallows_every_exception(tmp_path, monkeypatch):
     ``{"ok": False, "reason": "类型: 消息"}``，界面只会看到一条红色日志，
     排单任务不会被云同步的意外错误带崩。
     """
-    from app import bridge as bridge_module
-    from app.bridge import Bridge
+    from app.api import bridge as bridge_module
+    from app.api.bridge import Bridge
 
     bridge = Bridge(config_path=str(tmp_path / "config.json"))
     bridge._config.excel_path = tmp_path / "排单.xlsx"

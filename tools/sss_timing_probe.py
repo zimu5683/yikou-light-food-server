@@ -33,7 +33,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app import sss as S  # noqa: E402
-from app.api_client import SssApiClient  # noqa: E402
+from app.integrations.api_client import SssApiClient  # noqa: E402
 
 CONFIG_PATH = Path.home() / ".config" / "yikou-light-food" / "config.json"
 
@@ -179,7 +179,7 @@ def main() -> int:
 
     password = ""
     try:
-        from app.credentials import get_sss_password
+        from app.core.credentials import get_sss_password
         password = get_sss_password(account) or ""
         log("已从系统钥匙串读取闪时送密码" if password else "系统钥匙串中没有闪时送密码，将提示输入")
     except Exception as exc:  # pragma: no cover
@@ -280,7 +280,6 @@ def main() -> int:
                 str(cfg.get("sss_product_name") or "轻食"), account=account,
                 batch_id="probe", idempotency_field="")
             started = time.perf_counter()
-            fingerprints = [S._task_fingerprint(task) for task in tasks]
             build_s = time.perf_counter() - started
             log("")
             log(f"本地任务组装：{len(tasks)}/{total_orders} 单，指纹计算 {build_s * 1000:.1f} ms "

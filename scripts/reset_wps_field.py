@@ -6,14 +6,14 @@
 - **基线存档** = `基准-<子表名>.xlsx`（**只读**，永不改动）。
 
 重置做法：从存档**复制出新的**试验田副本（存档本身不动，可无限次重置），
-并把新 file_id 写回 `app/config.py`。
+并把新 file_id 写回 `app/core/config.py`。
 
 用法：
     python scripts/reset_wps_field.py            # 只预览（默认）
     python scripts/reset_wps_field.py --apply    # 真正执行
 
 注意：本项目已改为网页版专用，不再打包成可执行文件，因此原先的 ``--rebuild``
-（调用 PyInstaller 重新打包）已移除。改完 ``app/config.py`` 后重启服务即可生效：
+（调用 PyInstaller 重新打包）已移除。改完 ``app/core/config.py`` 后重启服务即可生效：
 ``sv restart yikou-light-food``。
 """
 from __future__ import annotations
@@ -30,11 +30,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from app.config import AppConfig  # noqa: E402
-from app.wps_cloud import KdocsCli, WpsCloudError  # noqa: E402
+from app.core.config import AppConfig  # noqa: E402
+from app.wps.sync import KdocsCli, WpsCloudError  # noqa: E402
 
 ARCHIVE_FILE = ROOT / "design" / "WPS基线存档.json"
-CONFIG_PY = ROOT / "app" / "config.py"
+CONFIG_PY = ROOT / "app" / "core" / "config.py"
 DEVICE = "757726038"
 STAMP = datetime.datetime.now().strftime("%m%d-%H%M")
 
@@ -125,7 +125,7 @@ def main() -> int:
                                 encoding="utf-8")
             print(f"已清除用户配置里过期的 wps_tables（原文件备份为 {backup.name}）")
 
-    print("提示：新的试验田 ID 已写入 app/config.py，重启服务后生效：")
+    print("提示：新的试验田 ID 已写入 app/core/config.py，重启服务后生效：")
     print("      sv restart yikou-light-food")
     return 0
 

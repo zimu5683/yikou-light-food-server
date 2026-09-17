@@ -27,7 +27,7 @@ sys.path.insert(0, str(PROJECT))
 import requests  # noqa: E402
 import urllib.request  # noqa: E402
 
-from app.api_client import _browser_headers, origin_from_url  # noqa: E402
+from app.integrations.api_client import _browser_headers, origin_from_url  # noqa: E402
 
 
 def _show_proxy_configuration() -> dict:

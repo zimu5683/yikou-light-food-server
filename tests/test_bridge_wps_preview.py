@@ -17,9 +17,9 @@ import datetime as _dt
 
 import pytest
 
-from app import bridge as bridge_module
-from app.bridge import Bridge
-from app.wps_cloud import WpsCloudError
+from app.api.bridge import Bridge
+from app.wps.sync import WpsCloudError
+from app.api import bridge as bridge_module
 
 
 def _bridge(tmp_path) -> Bridge:
@@ -184,7 +184,7 @@ def test_sort_and_address_order_come_from_config(preview_env):
 
 
 def test_target_date_uses_the_configured_window(preview_env):
-    from app.wps_cloud import target_date_for
+    from app.wps.sync import target_date_for
 
     bridge, captured, _ = preview_env
     bridge._config.wps_target_hour_start = 20

@@ -22,8 +22,8 @@ import time
 
 import pytest
 
-from app import wps_cloud
-from app.wps_cloud import CloudOrder, WpsCloudError, build_plan
+from app.wps.sync import CloudOrder, WpsCloudError, build_plan
+from app.wps import sync as wps_cloud
 
 SHEETS = ["东湖中餐", "东湖晚餐", "衣锦中餐", "衣锦晚餐", "医学院中餐", "医学院晚餐"]
 TARGET = dt.date(2026, 9, 11)

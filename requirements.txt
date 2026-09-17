@@ -4,7 +4,7 @@
 openpyxl>=3.1,<4
 keyring>=24,<26
 requests>=2.31,<3
-# Cloudflare Access 的 JWT 验签（app/web_auth.py）用到
+# Cloudflare Access 的 JWT 验签（app/web/auth.py）用到
 cryptography>=42,<52
 
 # 开发/测试依赖

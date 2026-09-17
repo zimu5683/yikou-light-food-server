@@ -1,4 +1,4 @@
-"""Tests for app.wps_cloud —— 云文档同步（全部离线，不联网、不写云端）。
+"""Tests for app.wps.sync —— 云文档同步（全部离线，不联网、不写云端）。
 
 覆盖：目标日期规则、表头解析、人员匹配、总餐次绝对值语义、幂等、
 列定位（含协作者写错星期的情况）、写入与回读校验、错误处理。
@@ -11,12 +11,12 @@ from pathlib import Path
 
 import pytest
 
-from app import wps_cloud as wc
-from app.wps_cloud import (
+from app.wps.sync import (
     Change, CloudOrder, SheetPlan, SyncLedger, WpsCloudError,
     apply_plan, build_plan, find_cli, format_plan, parse_date_header,
     person_key, summarize_plan, target_date_for, weekday_number,
 )
+from app.wps import sync as wc
 
 # ----------------------------------------------------------------------
 # 测试替身

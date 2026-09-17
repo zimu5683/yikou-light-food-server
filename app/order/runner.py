@@ -1,14 +1,13 @@
-"""Playwright order automation and Excel integration.
+"""管理后台订单处理：HTTP 抓单、详情合并、地址归一化与写排单表。
 
-This module contains no credentials or machine-specific paths.  The GUI passes
-an :class:`AppConfig`, a password and a cancellation event to ``run_job``.
-Network selectors intentionally mirror the current admin site, while parsing
-and Excel helpers remain usable in unit tests without Playwright installed.
+调用方传入 :class:`AppConfig`、口令与取消事件；本模块不保存凭据，也不依赖
+任何浏览器/桌面运行时。平台请求全部经由
+:class:`app.integrations.api_client.AdminApiClient`。
 """
 from __future__ import annotations
 
 import datetime as _dt
-import json
+
 import re
 import shutil
 import time
@@ -16,36 +15,20 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-try:
-    from .models import MealInfo, OrderInfo
-    from .processing import (
-        clear_campus_sub_sheets,
-        get_address_base_sheet_name,
-        get_yijin_address_from_product_note,
-        sort_campus_sub_sheets,
-    )
-except ImportError:  # pragma: no cover - allows ``python app/automation.py``
-    from models import MealInfo, OrderInfo
-    from processing import (
-        clear_campus_sub_sheets,
-        get_address_base_sheet_name,
-        get_yijin_address_from_product_note,
-        sort_campus_sub_sheets,
-    )
+from app.core.models import MealInfo, OrderInfo
+from app.order.parsing import (
+    clear_campus_sub_sheets,
+    get_address_base_sheet_name,
+    get_yijin_address_from_product_note,
+    sort_campus_sub_sheets,
+)
 
-try:
-    from .api_client import AdminApiClient
-    from .address_aliases import aliases_path, load_aliases, write_pending
-    from .delivery_point import DEFAULT_ALIASES, normalize_delivery_point
-except ImportError:  # pragma: no cover - allows ``python app/automation.py``
-    from api_client import AdminApiClient
-    from address_aliases import aliases_path, load_aliases, write_pending
-    from delivery_point import DEFAULT_ALIASES, normalize_delivery_point
+from app.integrations.api_client import AdminApiClient
+from app.order.aliases import aliases_path, load_aliases, write_pending
+from app.order.delivery import DEFAULT_ALIASES, normalize_delivery_point
 
 REG_MEAL_COUNT = re.compile(r"x\s*(\d+)", re.I)
 REG_MEAL_SPLIT = re.compile(r"（午餐）|（晚餐）")
-MAX_PAGE_SEARCH = 20
-PAGE_JUMP_THRESHOLD = 6
 SHEET_MEAL_SUFFIX = {"午餐": "中餐", "晚餐": "晚餐"}
 WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 HISTORICAL_SHEET_HEADERS = (
@@ -118,29 +101,6 @@ def parse_order_created_date(value: object) -> _dt.date | None:
     return None
 
 
-class OrderSearchNotFound(LookupError):
-    """Raised when every order-list page was searched without a match."""
-
-
-BROWSER_DIR_NAME = "browser"
-BROWSER_DIR_ENV = "YIKOU_BROWSER_DIR"
-BROWSER_MANIFEST_NAME = "browser.json"
-# 内置目录里可执行文件的名字随 Playwright 版本变化，逐个探测；下面的 glob
-# 覆盖 ``browser/<name>-<revision>/chrome-<platform>/…`` 解包布局。
-_BROWSER_EXECUTABLE_NAMES = (
-    "chrome.exe",                     # Windows
-    "chrome",                         # Linux
-    "Chromium",                       # macOS（Playwright 较早版本）
-    "Google Chrome for Testing",      # macOS（Playwright 1.4x 起）
-)
-_BROWSER_EXECUTABLE_GLOBS = (
-    "*/chrome-*/chrome.exe",
-    "*/chrome-*/chrome",
-    "*/chrome-*/Chromium.app/Contents/MacOS/Chromium",
-    "*/chrome-*/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
-)
-
-
 def _emit(callback: Callable[[str], Any] | None, message: str) -> None:
     if callback:
         callback(message)
@@ -166,9 +126,6 @@ def parse_meal_rows(rows: Iterable[dict[str, str]], meal_type: str) -> list[Meal
                 meal_type=meal_type,
             ))
     return result
-
-
-MEAL_ROWS_JS = """rows => rows.map(r => ({product:(r.querySelector('td:nth-child(1)')||{}).innerText||'', qty:(r.querySelector('td:nth-child(3)')||{}).innerText||''}))"""
 
 
 def _historical_sheet_name(target_date: _dt.date) -> str:
@@ -338,37 +295,6 @@ def _load_order_workbook(excel_path: Path, loader: Callable[..., Any] | None = N
     return loader(excel_path, keep_vba=excel_path.suffix.lower() == ".xlsm")
 
 
-def _detail_api_json(page: Any, detail_url: str) -> dict[str, Any] | None:
-    """在已登录会话内直接请求详情接口，绕过前端渲染层。
-
-    站点前端存在渲染缺陷（接口数据到达却不渲染、路由随机弹回首页），
-    而 /channel/order/{id} 接口稳定返回完整 JSON。鉴权走 Bearer token
-    （localStorage.layout_token）与 uniacid 头，不走 Cookie。
-    """
-    match = re.search(r"[?&]id=(\d+)", detail_url or "")
-    if not match:
-        return None
-    store_match = re.search(r"[?&]storeId=(\d+)", detail_url or "")
-    store_id = store_match.group(1) if store_match else ""
-    script = (
-        "async ({oid, sid}) => {"
-        "const r = await fetch(`/channel/order/${oid}?storeId=${sid}`, {"
-        "credentials: 'include',"
-        "headers: {'authorization': `Bearer ${localStorage.layout_token}`,"
-        "'uniacid': localStorage.layout_uniacid || ''}});"
-        "return await r.text();"
-        "}"
-    )
-    try:
-        raw = page.evaluate(script, {"oid": match.group(1), "sid": store_id})
-        payload = json.loads(raw)
-    except Exception:
-        return None
-    if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
-        return None
-    return payload["data"]
-
-
 def _order_from_api_data(code: str, data: dict[str, Any]) -> OrderInfo | None:
     """把 /channel/order/{id} 的 data 字段解析为订单；字段全空时返回 None。
 
@@ -425,8 +351,8 @@ def _api_list_waimai_orders(api_get: Callable[[str], dict[str, Any]],
     服务端过滤，只能整表分页拉取后由本程序按目标日期筛选。因此这里直接
     并发拉取全部分页，并使用较大的 ``pageSize=200`` 减少请求次数。
 
-    ``concurrent_pages=True`` 时（纯接口模式）剩余分页并发拉取；浏览器模式
-    保持串行，避免 Playwright 并发问题。
+    ``concurrent_pages=True`` 时剩余分页并发拉取（HTTP 客户端每次调用独立，
+    不会像浏览器会话那样受单页并发限制）。
     """
     def parse_batch(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -651,7 +577,7 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
     pending_orders: list[OrderInfo] = []
 
     def process_orders(api_get: Callable[[str], dict[str, Any]]) -> None:
-        nonlocal processed, found, refunded_numbers, applied_numbers, pending_orders
+        nonlocal processed, refunded_numbers, applied_numbers, pending_orders
         list_start = time.perf_counter()
         rows = _api_list_waimai_orders(api_get, selected_date, progress_callback,
                                         concurrent_pages=True)
@@ -694,7 +620,7 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
         # 纯接口模式下并发预取订单详情；失败项仍走下方串行重试/决策流程。
         # 退款订单不预取也不写表，只对正常订单发起。
         prefetched: dict[int, OrderInfo] | None = None
-        # 纯接口模式：多页并发拉取（浏览器模式已移除）
+        # 纯 HTTP 接口：多页并发拉取，缩短大订单列表的读取时间。
         if len(normal_numbers) > 1:
             detail_start = time.perf_counter()
             prefetched = _prefetch_order_details(api_get, rows_by_pick, normal_numbers, max_workers=5)

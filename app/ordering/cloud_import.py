@@ -18,7 +18,7 @@
 7. **拒绝语义**：云端读不到（未授权 / 缺 kdocs-cli / 额度用尽 / 表头异常）或要下单
    的人数据不完整 → 抛 :class:`ImportRefused`，由调用方在登录与提交之前中断。
 
-本模块只依赖 ``openpyxl`` 与 :mod:`app.wps_cloud`，**不导入** :mod:`app.sss`
+本模块只依赖 ``openpyxl`` 与 :mod:`app.wps.sync`，**不导入** :mod:`app.ordering.sss`
 （避免循环导入）：送达日期等规则由调用方以参数传入。
 """
 from __future__ import annotations
@@ -32,40 +32,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-try:
-    from .wps_cloud import (
-        ADDRESS_ALIASES,
-        HEADER_ADDRESS,
-        HEADER_NAME,
-        HEADER_PHONE,
-        HEADER_ROW,
-        KdocsCli,
-        WpsCloudError,
-        _address_key,
-        _find_column,
-        column_name,
-        date_region,
-        effective_tables,
-        find_target_column,
-        scan_bounds,
-    )
-except ImportError:  # pragma: no cover - allows ``python app/sss_import.py``
-    from wps_cloud import (  # type: ignore[no-redef]
-        ADDRESS_ALIASES,
-        HEADER_ADDRESS,
-        HEADER_NAME,
-        HEADER_PHONE,
-        HEADER_ROW,
-        KdocsCli,
-        WpsCloudError,
-        _address_key,
-        _find_column,
-        column_name,
-        date_region,
-        effective_tables,
-        find_target_column,
-        scan_bounds,
-    )
+from app.wps.sync import (
+    ADDRESS_ALIASES,
+    HEADER_ADDRESS,
+    HEADER_NAME,
+    HEADER_PHONE,
+    HEADER_ROW,
+    KdocsCli,
+    WpsCloudError,
+    _address_key,
+    _find_column,
+    column_name,
+    date_region,
+    effective_tables,
+    find_target_column,
+    scan_bounds,
+)
 
 # 闪时送工作表 -> 云端排单表（用户口径：闪时送的午餐/晚餐就是东湖的两顿）。
 SSS_SHEET_SOURCES: dict[str, str] = {"午餐": "东湖中餐", "晚餐": "东湖晚餐"}
@@ -115,8 +97,8 @@ def _clean_text(value: Any) -> str:
 def normalise_phone(value: Any) -> str:
     """规范成 11 位 ASCII 数字字符串，拒绝含糊格式。
 
-    与 :func:`app.sss._normalise_phone` 行为一致（这里独立实现是为了避免
-    与 ``app.sss`` 形成循环导入）。
+    与 :func:`app.ordering.sss._normalise_phone` 行为一致（这里独立实现是为了避免
+    与 ``app.ordering.sss`` 形成循环导入）。
     """
     if isinstance(value, bool) or value is None:
         return ""
@@ -159,7 +141,7 @@ def ordering_target_date(now: _dt.datetime | None = None, *,
     - ``hour >= start_hour``（晚上 20:00 之后）→ 识别**次日**；
     - 其余时刻（含次日 00:00~10:00 的清晨）→ 识别**运行日**。
 
-    与云同步的 :func:`app.wps_cloud.target_date_for` **刻意不同**：后者在
+    与云同步的 :func:`app.wps.sync.target_date_for` **刻意不同**：后者在
     ``[0, end_hour)`` 也 +1 天（那是"这一晚该往哪一列写"的问题）；下单必须与
     实际送达日期一致 —— 清晨 9 点下单送的是**当天**的午餐/晚餐，不能顺延。
     """

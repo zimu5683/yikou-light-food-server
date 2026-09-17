@@ -3,7 +3,7 @@
  *
  * 任务在服务器（手机）上跑，Excel 也在手机上，所以这里选的是**服务端**路径；
  * 浏览器自带的 <input type="file"> 只能拿到客户端自己的文件，对远程操作没有用。
- * 列表来自 `GET /api/fs/list`（见 app/web_server.py），只返回目录与 Excel 文件。
+ * 列表来自 `GET /api/fs/list`（见 app/web/server.py），只返回目录与 Excel 文件。
  */
 import { useEffect, useState } from 'react'
 import { ArrowUp, FileSpreadsheet, Folder, Loader2 } from 'lucide-react'

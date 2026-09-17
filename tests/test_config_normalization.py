@@ -1,4 +1,4 @@
-"""``app.config`` 规整函数 + ``sss_import.normalise_phone`` 的行为回归锁。
+"""``app.core.config`` 规整函数 + ``sss_import.normalise_phone`` 的行为回归锁。
 
 这些是**纯函数**，却是「配置正确性」和「谁能收到订单」的守门人：
 
@@ -16,14 +16,14 @@ from __future__ import annotations
 
 import pytest
 
-from app import config as config_module
-from app.config import (DEFAULT_ADDRESS_ORDER, DEFAULT_WPS_PRODUCTION_TABLES,
+from app.core.config import (DEFAULT_ADDRESS_ORDER, DEFAULT_WPS_PRODUCTION_TABLES,
                         MAX_SPLIT_RATIO, MIN_SPLIT_RATIO, clamp_split_ratio,
                         default_wps_address_order, default_wps_production_tables,
                         default_wps_tables, normalize_wps_address_order,
                         normalize_wps_production_tables, normalize_wps_tables,
                         normalize_wps_test_tables)
-from app.sss_import import address_group, normalise_phone, should_skip_address
+from app.ordering.cloud_import import address_group, normalise_phone, should_skip_address
+from app.core import config as config_module
 
 FALLBACK_RATIO = 0.38
 

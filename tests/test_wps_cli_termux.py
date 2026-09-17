@@ -2,7 +2,7 @@
 
 kdocs-cli 是静态链接的 linux/arm64 Go 程序，看不到 Termux 对绝对路径的重写，
 因此在 Android 上必然遇到「无 /etc/resolv.conf」和「无系统 CA 包」两个问题。
-这里锁定 :func:`app.wps_cloud.termux_cli_runtime` 的判定与产物。
+这里锁定 :func:`app.wps.sync.termux_cli_runtime` 的判定与产物。
 """
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ import os
 
 import pytest
 
-from app import wps_cloud
-from app.wps_cloud import KdocsCli, termux_cli_runtime
+from app.wps.sync import KdocsCli, termux_cli_runtime
+from app.wps import sync as wps_cloud
 
 
 @pytest.fixture()

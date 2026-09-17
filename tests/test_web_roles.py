@@ -21,8 +21,8 @@ import urllib.request
 
 import pytest
 
-from app.web_auth import AuthStore
-from app.web_server import SESSION_COOKIE, create_server
+from app.web.auth import AuthStore
+from app.web.server import SESSION_COOKIE, create_server
 
 ADMIN = "admin@example.com"
 ADMIN_PW = "adminpw123"
@@ -155,7 +155,7 @@ def test_non_admin_still_gets_task_parameters(server):
 
 def test_non_admin_password_never_returned(server, auth):
     """即使密钥环里存了平台密码，也不能回传给普通用户。"""
-    from app import bridge as bridge_module
+    from app.api import bridge as bridge_module
 
     server.bridge._config.phone_number = "13900000000"
     monkey = "secret-platform-password"
@@ -184,7 +184,7 @@ def test_non_admin_password_never_returned(server, auth):
     "clear_password",         # 清掉已保存的凭据
     "choose_excel",           # 服务器端选文件
     "new_template",
-    "check_updates", "install_update",
+    "check_updates",
     "wps_authorize",          # 重新授权云文档
     "open_external",
 ])
@@ -259,7 +259,6 @@ def test_forced_payload_uses_preset_values(server):
     assert forced["phone"] == "13900000000"
     assert forced["password"] == "", "普通用户不该借下单写入或替换平台口令"
     assert forced["remember"] is False
-    assert "api_mode" not in forced
 
 
 def test_non_admin_payload_uses_saved_password(server, monkeypatch):
@@ -267,7 +266,7 @@ def test_non_admin_payload_uses_saved_password(server, monkeypatch):
 
     否则会卡在校验「请输入登录密码」，表现为「点开始处理没反应」。
     """
-    from app import bridge as bridge_module
+    from app.api import bridge as bridge_module
 
     server.bridge._config.phone_number = "13900000000"
     monkeypatch.setattr(bridge_module, "get_password", lambda *_a, **_k: "saved-pw")
@@ -279,7 +278,7 @@ def test_non_admin_payload_uses_saved_password(server, monkeypatch):
 
 def test_non_admin_payload_without_saved_password_stays_empty(server, monkeypatch):
     """密钥环里没存过口令时保持为空，让校验如实报错（由管理员去补）。"""
-    from app import bridge as bridge_module
+    from app.api import bridge as bridge_module
 
     server.bridge._config.phone_number = "13900000000"
     monkeypatch.setattr(bridge_module, "get_password", lambda *_a, **_k: None)

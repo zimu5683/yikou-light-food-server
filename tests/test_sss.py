@@ -5,7 +5,7 @@ import datetime as dt
 
 import pytest
 
-from app import sss
+from app.ordering import sss
 
 
 def test_compute_delivery_time_lunch_before_16():
@@ -218,7 +218,7 @@ def test_fixed_address_from_config_missing_coords_raises():
 
 
 def test_normalize_timeout_converts_milliseconds():
-    from app.api_client import _normalize_timeout
+    from app.integrations.api_client import _normalize_timeout
 
     connect, read = _normalize_timeout(8000)
     assert (connect, read) == (5.0, 8.0)
@@ -347,7 +347,7 @@ def test_dry_run_skips_network(tmp_path):
         sss_dry_run=True, sss_store_name="一口轻食", sss_common_address="嗯哼",
         sss_use_fixed_address=True, sss_fixed_lnt=1.0, sss_fixed_lat=2.0,
         sss_fixed_area_code="330110", sss_fixed_address_detail="X",
-        sss_product_name="轻食", api_mode=True, element_timeout_ms=8000,
+        sss_product_name="轻食",
         sss_url="https://example.invalid", sss_store_id=None,
         sss_store_name_cached="", sss_max_workers=8,
     )
@@ -464,7 +464,7 @@ def _station_record(task):
 
 
 def test_sss_client_retries_get_but_not_post():
-    from app.api_client import SssApiClient
+    from app.integrations.api_client import SssApiClient
 
     client = SssApiClient("https://example.invalid/takeout", "a", "p")
     try:
@@ -475,7 +475,7 @@ def test_sss_client_retries_get_but_not_post():
 
 
 def test_sss_client_treats_non_json_401_as_auth_expired():
-    from app.api_client import ApiError, SssApiClient
+    from app.integrations.api_client import ApiError, SssApiClient
 
     class Html401:
         status_code = 401
@@ -1113,7 +1113,7 @@ def test_collect_tasks_reuses_stable_client_request_id_on_retry():
     {"success": False, "message": "Unauthorized", "code": 500},
 ])
 def test_sss_client_detects_auth_expired_payload(payload):
-    from app.api_client import ApiError, SssApiClient
+    from app.integrations.api_client import ApiError, SssApiClient
 
     class Response:
         status_code = 200
@@ -1255,8 +1255,7 @@ def test_preflight_reads_but_never_submits(monkeypatch, tmp_path):
         sss_fixed_lnt=119.728224, sss_fixed_lat=30.256632,
         sss_fixed_area_code="330110",
         sss_fixed_address_detail="浙江农林大学东湖校区",
-        sss_product_name="轻食", api_mode=True,
-        element_timeout_ms=8000, sss_url="https://example.invalid",
+        sss_product_name="轻食", sss_url="https://example.invalid",
         sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
         sss_unit_price=1.9, sss_read_timeout_s=20.0, sss_idempotency_field="",
     )
@@ -1333,8 +1332,7 @@ def test_preflight_succeeds_when_station_has_no_orders(monkeypatch, tmp_path):
         sss_fixed_lnt=119.728224, sss_fixed_lat=30.256632,
         sss_fixed_area_code="330110",
         sss_fixed_address_detail="浙江农林大学东湖校区",
-        sss_product_name="轻食", api_mode=True,
-        element_timeout_ms=8000, sss_url="https://example.invalid",
+        sss_product_name="轻食", sss_url="https://example.invalid",
         sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
         sss_unit_price=1.9, sss_read_timeout_s=20.0, sss_idempotency_field="",
     )
@@ -1408,8 +1406,7 @@ def test_preflight_stops_when_order_list_is_unreadable(monkeypatch, tmp_path):
         sss_dry_run=False, sss_preflight=True, sss_store_name="一口轻食",
         sss_common_address="嗯哼", sss_use_fixed_address=True,
         sss_fixed_lnt=1.0, sss_fixed_lat=2.0, sss_fixed_area_code="330110",
-        sss_fixed_address_detail="X", sss_product_name="轻食", api_mode=True,
-        element_timeout_ms=8000, sss_url="https://example.invalid",
+        sss_fixed_address_detail="X", sss_product_name="轻食", sss_url="https://example.invalid",
         sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
         sss_unit_price=1.9, sss_read_timeout_s=20.0, sss_idempotency_field="",
     )
@@ -1482,8 +1479,7 @@ def test_balance_guard_stops_before_any_submit(monkeypatch, tmp_path):
         sss_dry_run=False, sss_preflight=False, sss_store_name="一口轻食",
         sss_common_address="嗯哼", sss_use_fixed_address=True,
         sss_fixed_lnt=1.0, sss_fixed_lat=2.0, sss_fixed_area_code="330110",
-        sss_fixed_address_detail="X", sss_product_name="轻食", api_mode=True,
-        element_timeout_ms=8000, sss_url="https://example.invalid",
+        sss_fixed_address_detail="X", sss_product_name="轻食", sss_url="https://example.invalid",
         sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
         sss_unit_price=1.9, sss_read_timeout_s=20.0, sss_idempotency_field="",
     )
@@ -1540,7 +1536,7 @@ def test_expected_delivery_date_follows_the_16h_rollover_rule():
     """
     import datetime as dt
 
-    from app.sss import expected_delivery_date
+    from app.ordering.sss import expected_delivery_date
 
     same_day = [0, 9, 15]          # 00:00 ~ 15:59 → 运行日
     next_day = [16, 19, 20, 23]    # 16:00 ~ 23:59 → 次日
@@ -1556,7 +1552,7 @@ def test_expected_delivery_date_agrees_with_compute_delivery_time():
     """两者必须永远一致 —— 它们算的是同一件事（日期），只是往返形式不同。"""
     import datetime as dt
 
-    from app.sss import compute_delivery_time, expected_delivery_date
+    from app.ordering.sss import compute_delivery_time, expected_delivery_date
 
     for hour in range(24):
         now = dt.datetime(2026, 9, 15, hour, 0)
@@ -1568,7 +1564,7 @@ def test_expected_delivery_date_agrees_with_compute_delivery_time():
 def test_expected_delivery_date_rolls_over_month_boundary():
     import datetime as dt
 
-    from app.sss import expected_delivery_date
+    from app.ordering.sss import expected_delivery_date
 
     assert expected_delivery_date(dt.datetime(2026, 9, 30, 20, 0)) == dt.date(2026, 10, 1)
     assert expected_delivery_date(dt.datetime(2026, 12, 31, 16, 0)) == dt.date(2027, 1, 1)

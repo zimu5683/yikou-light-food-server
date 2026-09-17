@@ -11,8 +11,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from app.config import DEFAULT_WPS_PRODUCTION_TABLES  # noqa: E402
-from app.wps_cloud import KdocsCli, WpsCloudError, scan_bounds  # noqa: E402
+from app.core.config import DEFAULT_WPS_PRODUCTION_TABLES  # noqa: E402
+from app.wps.sync import KdocsCli, WpsCloudError, scan_bounds  # noqa: E402
 
 DEVICE = "757726038"
 

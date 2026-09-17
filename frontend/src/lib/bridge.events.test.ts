@@ -1,7 +1,8 @@
 /**
  * Node 内置测试运行器覆盖桥接 cursor/重放去重逻辑。
  *
- * 运行：pnpm test（Node 24 原生类型擦除，不需要额外测试依赖）。
+ * 运行：pnpm test（Node 原生类型擦除，不需要额外测试依赖）。
+ * 传输层现在是 HTTP，因此这里用假的 globalThis.fetch 顶替后端。
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
@@ -19,44 +20,50 @@ test('replayed bridge events are deduplicated and cursor advances', async () => 
     timestamp: 1,
     droppable: true,
   }
+  const state = {
+    version: 'test',
+    status: 'ready' as const,
+    event_producer_id: 'producer-1',
+    config: {
+      target_url: '', phone_number: '', excel_path: '', order_date: '',
+      order_count: null, split_ratio: 0.38, sss_url: '', sss_account: '',
+      sss_excel_path: '', sss_order_source: 'wps' as const,
+      sss_product_name: '', sss_common_address: '',
+      sss_use_fixed_address: true, sss_fixed_lnt: 0, sss_fixed_lat: 0,
+      sss_fixed_area_code: '', sss_fixed_address_detail: '',
+      sss_dry_run: true,
+    },
+    passwords: { order: '', sss: '' },
+  }
 
-  const fakeApi = {
-    bridge_ready: async () => ({
-      version: 'test',
-      status: 'ready' as const,
-      frozen: false,
-      event_producer_id: 'producer-1',
-      config: {
-        target_url: '', phone_number: '', excel_path: '', order_date: '',
-        order_count: null, split_ratio: 0.38, sss_url: '', sss_account: '',
-        sss_excel_path: '', sss_order_source: 'wps' as const,
-        sss_product_name: '', sss_common_address: '',
-        sss_use_fixed_address: true, sss_fixed_lnt: 0, sss_fixed_lat: 0,
-        sss_fixed_area_code: '', sss_fixed_address_detail: '',
-        sss_dry_run: true, api_mode: true,
-      },
-      passwords: { order: '', sss: '' },
-    }),
-    drain_events: async (lastSequence = 0) => {
+  function json(payload: unknown): Response {
+    return { ok: true, status: 200, text: async () => JSON.stringify(payload) } as Response
+  }
+
+  globalThis.fetch = (async (url: string, init?: RequestInit) => {
+    if (url === '/api/bridge_ready') return json(state)
+    if (url === '/api/drain_events') {
       drainCalls += 1
-      return {
+      const args = JSON.parse(String(init?.body ?? '[]')) as [number?]
+      const lastSequence = Number(args[0] ?? 0)
+      return json({
         events: lastSequence < 1 ? [event] : [],
         producer_id: 'producer-1',
         latest_sequence: 1,
         acked_sequence: lastSequence,
         dropped_count: 0,
         first_available_sequence: 1,
-      }
-    },
-  }
+      })
+    }
+    return json({})
+  }) as typeof fetch
 
   globalThis.window = {
     localStorage: {
       getItem: (key: string) => storage.get(key) ?? null,
       setItem: (key: string, value: string) => storage.set(key, value),
     },
-    __bridge: { dispatch: () => {} },
-    pywebview: { api: fakeApi },
+    location: { search: '' },
   } as unknown as Window & typeof globalThis
 
   const bridge = await import('./bridge.ts')

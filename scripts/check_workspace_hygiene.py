@@ -26,7 +26,7 @@ FORBIDDEN_PATTERNS = (
 SKIP_DIRS = {
     ".git", ".venv", "venv", "node_modules", "dist", "build",
     ".pytest_cache", ".ruff_cache", "__pycache__",
-    # 内置 Chromium 载荷（数百 MB 的第三方二进制），逐文件扫描没有意义。
+    # 历史 Chromium 载荷目录（如果本机还有残留），逐文件扫描没有意义。
     "browser",
 }
 SECRET_PATTERNS = (

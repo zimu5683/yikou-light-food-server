@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.delivery_point import (
+from app.order.delivery import (
     detect_campus,
     normalize_delivery_point as ndp,
 )

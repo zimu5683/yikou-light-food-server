@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from app.address_aliases import load_aliases, write_pending
+from app.order.aliases import load_aliases, write_pending
 
 
 def test_load_aliases_creates_empty_file(tmp_path):
@@ -45,7 +45,7 @@ def test_write_pending_atomically_replaces_previous_report(tmp_path):
 # 改动前完全未被引用的两个路径辅助
 # ----------------------------------------------------------------------
 def test_alias_and_pending_paths_live_side_by_side():
-    from app.address_aliases import aliases_path, pending_path
+    from app.order.aliases import aliases_path, pending_path
 
     aliases = aliases_path()
     pending = pending_path()

@@ -2,10 +2,10 @@
 
 为什么需要这一层
 ----------------
-``web_server`` 原来的设计假设「运行任务的机器和操作网页的人是同一个人」，因此
-整套操作权限只用**一个固定令牌**保护。一旦把域名挂到公网（Cloudflare Tunnel），
-这个假设就不成立了：任何人拿到那个网址就等于拿到手机的全部操作权限（真实下单、
-读管理后台密码、读写 WPS 云文档）。
+``app.web.server`` 早期的设计假设「运行任务的机器和操作网页的人是同一个人」，
+因此整套操作权限只用**一个固定令牌**保护。一旦把域名挂到公网
+（Cloudflare Tunnel），这个假设就不成立了：任何人拿到那个网址就等于拿到手机的
+全部操作权限（真实下单、读管理后台密码、读写 WPS 云文档）。
 
 本模块提供一套自包含的账号体系，正好对应上面的落差：
 
@@ -16,7 +16,6 @@
 
 设计要点
 --------
-* **不改桌面路径**：pywebview 版完全不经过本模块，``Bridge`` 一行没动。
 * **不引入新依赖**：口令用标准库 ``hashlib.pbkdf2_hmac``；Access JWT 用项目已有
   的 ``cryptography`` 验签（不依赖 PyJWT）。
 * **单进程多线程**：``ThreadingHTTPServer`` 是单进程，因此用 ``RLock`` 保护内存
@@ -40,7 +39,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .config import user_data_dir
+from app.core.config import user_data_dir
 
 # ----------------------------------------------------------------------
 # 常量

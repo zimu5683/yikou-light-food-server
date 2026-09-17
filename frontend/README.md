@@ -1,32 +1,28 @@
-# React + TypeScript + Vite
+# 一口轻食 Web 前端
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+React 19 + TypeScript + Vite 8 + Tailwind 4，构建为单文件产物供
+`app/web/server.py` 静态提供。
 
-Currently, two official plugins are available:
+## 开发
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```bash
+pnpm install
+pnpm dev        # Vite 本地开发；无后端时会退化为 mock 数据
+pnpm build      # 产物写入 frontend/dist/index.html
+pnpm test       # Node 内置 test runner，覆盖 lib/ 纯函数与 bridge 事件去重
+pnpm lint       # oxlint
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+注意：Python 服务读取的是 `frontend/dist/index.html`，改完前端后必须重新
+`pnpm build`；仓库根目录的 CI 也会执行 build/lint/test。
+
+## 目录
+
+- `src/lib/bridge.ts` — HTTP/桥接传输、事件分发与全部接口类型
+- `src/lib/` — 格式化、主题、日志抽屉几何等纯函数与 hooks
+- `src/hooks/useApp.tsx` — 全局状态与后端事件到 React 的唯一入口
+- `src/components/` — 业务组件；`components/ui/` 为无领域 UI 原子
+- `src/App.tsx` — 手机/平板/桌面三种响应式布局
+
+接口字段与 Python 返回值的契约由仓库根目录 `tests/test_frontend_contract.py`
+反向校验，改字段名时两边要一起改。

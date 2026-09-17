@@ -1,4 +1,4 @@
-"""``app.credentials`` 的回归锁（改动前 9 个公开函数**一个都没被测过**）。
+"""``app.core.credentials`` 的回归锁（改动前 9 个公开函数**一个都没被测过**）。
 
 这个模块守的是一条 README 明确写下的安全属性：
 
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from app import credentials as cred
+from app.core import credentials as cred
 
 
 class FakeKeyring:

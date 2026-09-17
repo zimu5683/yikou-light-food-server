@@ -1,20 +1,19 @@
-"""网页版服务器：把 pywebview 的 js_api 桥接层暴露成 HTTP 接口。
+"""网页版 HTTP 服务器：把 :class:`app.api.bridge.Bridge` 暴露为 JSON API。
 
 用途：把运行任务的机器（例如 Termux 手机）当服务器，其他设备用浏览器打开网址
 即可操作本项目全部任务（订单处理 / 云文档同步 / 闪时送下单）。
 
 设计要点：
 
-* **直接复用** :class:`app.bridge.Bridge` 的全部公开方法，不复制业务逻辑；桌面端
-  pywebview 路径完全不变。
+* **直接复用** :class:`app.api.bridge.Bridge` 的全部公开方法，不复制业务逻辑。
 * **不需要 WebSocket/SSE**：桥接层的事件通道本来就是「Python 只追加 + 前端用
   ``last_sequence`` 轮询 ``drain_events`` 并 ACK」的设计（见 ``bridge.py`` 顶部注释），
   天然适配 HTTP 请求/响应。
 * **不使用全局调用锁**：交互式流程（验证码 / 决策 / 地址补录）要求 worker 线程阻塞
   等待的同时，另一个请求还能调用 ``resolve_*``；加全局锁会直接死锁。因此沿用
   Bridge 自身的锁与 worker 生命周期模型。
-* **强制令牌鉴权**：本应用持有管理后台密码、WPS 云文档授权，并能真实下单，因此
-  ``/api/*`` 一律要求令牌；未授权请求返回 401。
+* **强制账号鉴权**：本应用持有管理后台密码、WPS 云文档授权，并能真实下单，因此
+  除登录页外的所有路径都要求有效会话；``/api/*`` 未授权返回 401。
 
 文件对话框：网页版没有原生对话框，改用**服务器端文件浏览器**（``/api/fs/list``）——
 客户端选中的必须是运行任务那台机器上的路径，而不是客户端自己的文件系统。
@@ -34,19 +33,19 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-from . import __version__, web_pages
-from .bridge import Bridge
-from .config import user_data_dir
-from .web_auth import (SESSION_TTL_SECONDS, STATUS_PENDING, AccessVerifier,
+from app import __version__
+from app.api.bridge import Bridge
+from app.core.config import user_data_dir
+from app.web.auth import (SESSION_TTL_SECONDS, STATUS_PENDING, AccessVerifier,
                        AuthError, AuthStore, access_verifier_from_env,
                        default_auth_dir)
+import app.web.pages
 
 #: 默认端口。选一个不常用的高位端口，避免和 Termux 里其它服务撞车。
 DEFAULT_PORT = 8756
 
-#: 不通过 HTTP 暴露的方法：attach 需要真实窗口对象，on_native_closing 是
-#: pywebview 的关闭事件回调，走 HTTP 没有意义。
-_NON_HTTP = frozenset({"attach", "on_native_closing"})
+#: 不通过 HTTP 暴露的方法：attach 由服务端启动时内部调用，走 HTTP 没有意义。
+_NON_HTTP = frozenset({"attach"})
 
 #: 文件浏览器默认展示的根目录候选（按存在与否过滤）。
 _BROWSE_ROOTS = (
@@ -201,41 +200,27 @@ def lan_addresses() -> list[tuple[str, str]]:
 
 
 # ----------------------------------------------------------------------
-# 顶替 pywebview 的窗口对象
+# 服务端运行时适配层
 # ----------------------------------------------------------------------
 class _WebWindow:
-    """只实现 :class:`Bridge` 真正用到的少量窗口方法。
+    """只实现 :class:`Bridge` 在服务端真正需要的一个能力：``destroy``。
 
-    Bridge 对窗口的依赖仅有：``create_file_dialog``（网页版改为前端选路径，
-    见 :meth:`Bridge.choose_excel` 的 ``path`` 参数）、``destroy``（关闭服务）、
-    ``minimize``/``restore``/``maximize``（浏览器里没有意义，空实现）。
+    ``request_close`` 通过它回调 ``on_destroy`` 来停止 HTTP 服务。网页版没有
+    原生窗口，也没有可最小化/最大化的东西，因此不再承载桌面窗口动作。
     """
 
     def __init__(self, on_destroy: Any = None) -> None:
-        self.uid = "web"
+        self.uid = "server-runtime"
         self._on_destroy = on_destroy
         self._closed = threading.Event()
 
-    def create_file_dialog(self, *args: Any, **kwargs: Any) -> tuple[Any, ...]:
-        """网页版没有原生文件对话框，返回空选择让调用方走提示分支。"""
-        return ()
-
     def destroy(self) -> None:
-        """关闭服务：由 request_close / 更新安装完成后调用。"""
+        """关闭服务：由 request_close 调用，幂等。"""
         if self._closed.is_set():
             return
         self._closed.set()
         if self._on_destroy is not None:
             self._on_destroy()
-
-    def minimize(self) -> None:
-        """浏览器标签页无法由服务端最小化，空实现。"""
-
-    def restore(self) -> None:
-        """同上。"""
-
-    def maximize(self) -> None:
-        """同上。"""
 
 
 # ----------------------------------------------------------------------
@@ -500,7 +485,7 @@ class _Handler(BaseHTTPRequestHandler):
         error = (query.get("error") or [""])[0]
         notice = (query.get("notice") or [""])[0]
         next_url = self._safe_next((query.get("next") or ["/"])[0])
-        self._send_html(web_pages.login_page(
+        self._send_html(app.web.pages.login_page(
             error=error, notice=notice, next_url=next_url,
             pending_count=self._auth.pending_count(),
         ))
@@ -562,12 +547,12 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _send_denied(self, title: str, message: str, user: Any) -> None:
         """403：身份已识别但权限不够。与 401（没登录）必须区分开。"""
-        self._send_html(web_pages.denied_page(
+        self._send_html(app.web.pages.denied_page(
             title=title, message=message,
             username=getattr(user, "username", "")), HTTPStatus.FORBIDDEN)
 
     def _render_admin(self, user: Any, *, error: str = "", notice: str = "") -> None:
-        self._send_html(web_pages.admin_page(
+        self._send_html(app.web.pages.admin_page(
             actor=user.username,
             pending=[u.public() for u in self._auth.list_users(STATUS_PENDING)],
             users=[u.public() for u in self._auth.list_users()],

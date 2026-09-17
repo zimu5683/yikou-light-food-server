@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import pytest
 
-from app import bridge as bridge_module
-from app.bridge import MAX_ORDER_COUNT, Bridge
+from app.api.bridge import MAX_ORDER_COUNT, Bridge
+from app.api import bridge as bridge_module
 
 
 def _bridge(tmp_path) -> Bridge:
@@ -40,7 +40,6 @@ def _payload(tmp_path, **overrides):
         "excel": str(_excel(tmp_path)),
         "date": "",
         "count": "",
-        "api_mode": True,
         "remember": True,
     }
     base.update(overrides)
@@ -210,7 +209,7 @@ def test_success_updates_only_the_order_side_of_the_config(bridge, tmp_path):
 
 
 def test_success_persists_the_config(bridge, tmp_path):
-    from app.config import AppConfig
+    from app.core.config import AppConfig
 
     bridge.start_order(_payload(tmp_path, phone="13900000000"))
     assert AppConfig.load(str(tmp_path / "config.json")).phone_number == "13900000000"
@@ -259,11 +258,6 @@ def test_launch_receives_the_expected_arguments(bridge, tmp_path, monkeypatch):
     bridge.start_order(_payload(tmp_path, count="5", password="SECRET"))
 
     assert captured == [("order", 5, "SECRET")]
-
-
-def test_api_mode_flag_is_carried_into_the_config(bridge, tmp_path):
-    bridge.start_order(_payload(tmp_path, api_mode=False))
-    assert bridge._config.api_mode is False
 
 
 def test_success_returns_ok_without_fields(bridge, tmp_path):

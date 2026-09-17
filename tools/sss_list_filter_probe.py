@@ -24,7 +24,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app import sss as S  # noqa: E402
-from app.api_client import SssApiClient  # noqa: E402
+from app.integrations.api_client import SssApiClient  # noqa: E402
 
 CONFIG_PATH = Path.home() / ".config" / "yikou-light-food" / "config.json"
 POST_PATH = S._CREATE_ORDER_PATH
@@ -109,7 +109,7 @@ def main() -> int:
     log = lines.append
     log(f"# 闪时送列表查询参数只读侦察  {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    from app.credentials import get_sss_password
+    from app.core.credentials import get_sss_password
     password = get_sss_password(account) or os.environ.get("YIKOU_SSS_PASSWORD", "")
     if not password:
         import getpass

@@ -401,7 +401,7 @@ def find_marker_column(header: Mapping[int, str], remark_col: int) -> int:
 
 LOCAL_SHEETS = ("东湖中餐", "衣锦中餐", "医学院中餐",
                 "东湖晚餐", "衣锦晚餐", "医学院晚餐")
-# 本地子表列（1-based），与 app/excel_templates.py 的排单模板一致
+# 本地子表列（1-based），与 app/order/templates.py 的排单模板一致
 LOCAL_COL = {
     "order": 1, "name": 2, "address": 3, "phone": 4,
     "type": 12, "kind": 13, "meals": 14,
@@ -466,9 +466,9 @@ def read_local_orders(excel_path: str | os.PathLike[str], *,
 def default_state_path() -> Path:
     """同步账本的默认路径：用户配置目录下的 ``wps_sync_state.json``。"""
     try:
-        from .config import user_data_dir
+        from app.core.config import user_data_dir
     except ImportError:  # pragma: no cover - 直接执行模块时
-        from config import user_data_dir
+        from app.core.config import user_data_dir
     return user_data_dir() / "wps_sync_state.json"
 
 

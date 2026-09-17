@@ -2,7 +2,7 @@
  * 对话框体系：把旧版 15 种 messagebox/filedialog 映射为 Dialog/Toast。
  * - 决策弹窗（decision 事件）：订单定位失败/下单失败 retry-skip-stop、
  *   Excel 占用 retry-cancel、关闭保护 stop_and_close-keep-cancel
- * - 更新流程：发现新版本（确认安装/打开 Release）、下载进度（不可关闭）
+ * - 更新流程：发现新版本，打开 Release 页面（网页版不做自动安装）
  */
 import { useState } from 'react'
 import {
@@ -22,7 +22,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { Progress } from '@/components/ui/progress'
 import { useApp, useUpdateAvailable } from '@/hooks/appContext'
 import { cn } from '@/lib/utils'
 
@@ -119,24 +118,17 @@ export function CaptchaDialog() {
   )
 }
 
-/** 发现新版本（对应旧版 askyesno「发现新版本」） */
+/** 发现新版本：网页版只提示并打开 Release 页面，不做自动安装。 */
 export function UpdateAvailableDialog() {
   const { available, setAvailable } = useUpdateAvailable()
-  const { installUpdate, openExternal, frozen } = useApp()
-  const [installing, setInstalling] = useState(false)
+  const { openExternal } = useApp()
   if (!available) return null
-
-  async function onInstall() {
-    setInstalling(true)
-    const ok = await installUpdate()
-    if (!ok) setInstalling(false)
-    // 成功后由 update:progress 事件接管界面
-  }
 
   function onOpenPage() {
     if (!available) return
-    // Release 页地址由 tag 拼出（open_external 校验 https）
-    openExternal(`https://github.com/zimu5683/yikou-light-food-desktop/releases/tag/${available.tag}`)
+    const url = available.html_url
+      || `https://github.com/zimu5683/yikou-light-food-server/releases/tag/${available.tag}`
+    openExternal(url)
     setAvailable(null)
   }
 
@@ -157,57 +149,10 @@ export function UpdateAvailableDialog() {
           >
             暂不更新
           </Button>
-          {frozen && available.can_auto_install ? (
-            <Button className="h-8 rounded-[6px] text-xs" disabled={installing} onClick={onInstall}>
-              {installing ? '准备下载…' : '立即下载并安装'}
-            </Button>
-          ) : (
-            <Button className="h-8 rounded-[6px] text-xs" onClick={onOpenPage}>
-              打开 Release 页面
-            </Button>
-          )}
+          <Button className="h-8 rounded-[6px] text-xs" onClick={onOpenPage}>
+            打开 Release 页面
+          </Button>
         </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-/** 更新下载进度（模态、不可关闭，对应旧版禁止关闭的进度窗） */
-export function UpdateProgressDialog() {
-  const { updateProgress } = useApp()
-  if (!updateProgress) return null
-  const percent =
-    updateProgress.total && updateProgress.total > 0
-      ? Math.min((updateProgress.downloaded * 100) / updateProgress.total, 100)
-      : null
-  const mb = (n: number) => `${(n / 1024 / 1024).toFixed(1)} MB`
-  return (
-    <Dialog open>
-      <DialogContent
-        className="sm:max-w-sm rounded-lg [&>button]:hidden"
-        onInteractOutside={(e) => e.preventDefault()}
-        onEscapeKeyDown={(e) => e.preventDefault()}
-      >
-        <DialogHeader>
-          <DialogTitle className="font-serif">正在更新</DialogTitle>
-          <DialogDescription>
-            {updateProgress.stage}
-            {updateProgress.downloaded > 0 && (
-              <>
-                ：已下载 {mb(updateProgress.downloaded)}
-                {updateProgress.total ? ` / ${mb(updateProgress.total)}（${percent!.toFixed(0)}%）` : ''}
-              </>
-            )}
-          </DialogDescription>
-        </DialogHeader>
-        {percent !== null ? (
-          <Progress value={percent} className="h-2" />
-        ) : (
-          <Progress value={100} className="h-2 animate-pulse" />
-        )}
-        <p className="text-[11px] text-muted-foreground">
-          下载完成后程序会自动关闭、替换并重新启动。
-        </p>
       </DialogContent>
     </Dialog>
   )

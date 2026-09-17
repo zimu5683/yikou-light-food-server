@@ -176,20 +176,7 @@ class AppConfig:
     target_url: str = "https://m.icall.me/admin/#/login"
     phone_number: str = ""
     excel_path: Path | None = None
-    # 已弃用：自动化固定使用随包分发的内置 Chromium，不再按此选择系统
-    # 浏览器。字段保留只为兼容既有 config.json，不会影响运行行为。
-    browser_mode: str = "auto"  # auto, msedge, chromium
-    headless: bool = False
-    # 默认使用纯接口模式（不启动浏览器）；False 时退回 Playwright 浏览器模式。
-    api_mode: bool = True
-    max_page_search: int = 20
-    element_timeout_ms: int = 8000
-    network_idle_timeout_ms: int = 5000
-    # The order table is rendered asynchronously after navigation/back.
-    order_search_timeout_ms: int = 8000
-    retry_wait_ms: int = 1000
-    order_search_attempts: int = 3
-    # Empty means "today". The GUI validates the YYYY-MM-DD form before a run.
+    # 留空 = 当天；前端在开始前按 YYYY-MM-DD 校验。
     order_date: str = ""
     # 待处理订单数；None 表示「留空 = 处理全部」（与表单语义一致，随配置持久化）。
     order_count: int | None = None
@@ -219,7 +206,7 @@ class AppConfig:
     sss_store_name_cached: str = ""
     # 批量下单并发 worker 数（1 = 串行，用于服务端限流时回退）。
     sss_max_workers: int = 4
-    # 闪时送 API 读取超时（秒）；与浏览器元素超时独立，慢响应不会误判失败。
+    # 闪时送 API 读取超时（秒）；慢响应不会被误判成失败。
     sss_read_timeout_s: float = 20.0
     # 闪时送单均价（元）：>0 时只提示预计送完结算费用，不拦截下单。
     sss_unit_price: float = 1.9
@@ -252,10 +239,7 @@ class AppConfig:
     config_path: Optional[str] = None
 
     def __init__(self, target_url: str = "https://m.icall.me/admin/#/login", phone_number: str = "",
-                 excel_path: str | os.PathLike[str] = "", browser_mode: str = "auto", headless: bool = False, api_mode: bool = True,
-                 max_page_search: int = 20, element_timeout_ms: int = 8000,
-                 network_idle_timeout_ms: int = 5000, order_search_timeout_ms: int = 8000,
-                 retry_wait_ms: int = 1000, order_search_attempts: int = 3,
+                 excel_path: str | os.PathLike[str] = "",
                  order_date: str = "",
                  order_count: int | None = None,
                  split_ratio: float = 0.38,
@@ -294,26 +278,15 @@ class AppConfig:
                  wps_sort_enabled: bool = True,
                  wps_address_order: Optional[Dict[str, Any]] = None,
                  config_path: Optional[str] = None,
-                 *, url: Optional[str] = None, phone: Optional[str] = None,
-                 browser: Optional[str] = None) -> None:
-        # url/phone/browser are compatibility aliases used by the GUI.
-        # 这几个字段都要**去首尾空格**：电话与账号同时是系统密钥链里的账号名，
-        # 带空格的 " 138 " 与 "138" 会被当成两个不同账号，导致「密码明明存过却取不到」。
+                 *, url: Optional[str] = None, phone: Optional[str] = None) -> None:
+        # url/phone 是旧界面层用过的字段别名；两个字段都要**去首尾空格**：
+        # 电话与账号同时是系统密钥链里的账号名，带空格的 " 138 " 与 "138"
+        # 会被当成两个不同账号，导致「密码明明存过却取不到」。
         self.target_url = str(url if url is not None else target_url or "").strip()
         self.phone_number = str(phone if phone is not None else phone_number or "").strip()
-        # ``Path("")`` resolves to the current directory and used to pass the
-        # GUI's existence check on a fresh install.  ``None`` is an unambiguous
-        # representation of "no workbook selected".
+        # ``Path("")`` 会解析成当前目录，曾被旧界面误当成“文件已选”。
+        # 用 ``None`` 明确表示「没有选择工作簿」。
         self.excel_path = Path(excel_path) if excel_path else None
-        self.browser_mode = browser if browser is not None else browser_mode
-        self.headless = headless
-        self.api_mode = bool(api_mode)
-        self.max_page_search = max_page_search
-        self.element_timeout_ms = element_timeout_ms
-        self.network_idle_timeout_ms = network_idle_timeout_ms
-        self.order_search_timeout_ms = order_search_timeout_ms
-        self.retry_wait_ms = retry_wait_ms
-        self.order_search_attempts = order_search_attempts
         self.order_date = str(order_date or "").strip()
         self.order_count = order_count
         self.split_ratio = clamp_split_ratio(split_ratio)
@@ -405,16 +378,6 @@ class AppConfig:
         """设置登录账号。"""
         self.phone_number = value
 
-    @property
-    def browser(self) -> str:
-        """浏览器模式（已弃用，仅为兼容旧配置保留）。"""
-        return self.browser_mode
-
-    @browser.setter
-    def browser(self, value: str) -> None:
-        """设置浏览器模式（已弃用）。"""
-        self.browser_mode = value
-
     @classmethod
     def default_path(cls) -> Path:
         """配置文件默认位置：用户配置目录下的 ``config.json``。"""
@@ -434,9 +397,8 @@ class AppConfig:
             config._last_seen_disk = dict(payload)
             return config
         except (OSError, ValueError, TypeError):
-            # A malformed config must not prevent the application starting,
-            # but the GUI saves defaults over it on the next run, so keep a
-            # copy the user can still inspect or restore.
+            # 损坏的配置不能阻止服务启动；下一次保存会用默认值覆盖，
+            # 因此先留一份 .bak 供用户检查或恢复。
             try:
                 target.replace(target.with_name(target.name + ".bak"))
             except OSError:

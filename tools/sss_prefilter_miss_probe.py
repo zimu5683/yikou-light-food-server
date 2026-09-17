@@ -26,7 +26,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app import sss as S  # noqa: E402
-from app.api_client import SssApiClient  # noqa: E402
+from app.integrations.api_client import SssApiClient  # noqa: E402
 
 CONFIG_PATH = Path.home() / ".config" / "yikou-light-food" / "config.json"
 CST = dt.timezone(dt.timedelta(hours=8))
@@ -92,7 +92,7 @@ def main() -> int:
     log(f"# 预筛窗口漏单原因只读诊断  {time.strftime('%Y-%m-%d %H:%M:%S')}")
     log(f"本机时区={time.strftime('%Z%z')}")
 
-    from app.credentials import get_sss_password
+    from app.core.credentials import get_sss_password
     password = get_sss_password(account) or os.environ.get("YIKOU_SSS_PASSWORD", "")
     if not password:
         import getpass

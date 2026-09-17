@@ -6,6 +6,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.ropeproject/
 .venv/
 venv/
 env/
@@ -26,14 +27,12 @@ credentials.json
 *.pem
 *.key
 
-# User data / logs / browser cache
+# User data / logs / runtime cache
 *.xlsx
 *.xlsm
 *.xls
 logs/
 *.log
-.playwright/
-playwright-browsers/
 
 # IDE and OS files
 .vs/
@@ -54,14 +53,12 @@ latest.json.sig
 workspace-before-audit.patch
 *.bak
 
-# 内置浏览器载荷（Chromium，约 320MB，不入库；
-# 构建脚本 scripts/fetch_browser.py 会自行抓取并精简）
-vendor/browser/
-browser/
-
 # WPS 云文档同步组件（金山官方二进制，体积大，不入库；
 # 校验和与获取方式见 vendor/kdocs-cli/README.md，构建脚本会自行下载）
 vendor/kdocs-cli/kdocs-cli
 vendor/kdocs-cli/kdocs-cli.exe
 vendor/kdocs-cli/*.tar.gz
 vendor/kdocs-cli/*.zip
+
+# 生成的交互式结构导航图（project-structure-viewer skill 产物，可随时重建）
+docs/project-structure.html

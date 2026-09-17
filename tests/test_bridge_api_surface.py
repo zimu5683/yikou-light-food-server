@@ -11,8 +11,8 @@ Promise）。改动前 `tests/` 只碰过其中 11 个，剩下 26 个没有任�
   实际却在改协作者的正式表。
 * ``frontend_report`` / ``pop_reports`` —— 前端回传运行快照的通道（自动化验收依赖
   它而非 ``evaluate_js``），带 50 条上限与「取出即清空」语义。
-* ``echo_test`` / ``worker_alive`` / ``set_split_ratio`` / ``window_action`` /
-  ``restore_wps_production_tables`` —— 其余状态与窗口动作。
+* ``echo_test`` / ``worker_alive`` / ``set_split_ratio`` /
+  ``restore_wps_production_tables`` —— 其余状态与配置动作。
 """
 from __future__ import annotations
 
@@ -20,9 +20,9 @@ import datetime as _dt
 
 import pytest
 
-from app import bridge as bridge_module
-from app.bridge import Bridge
-from app.wps_cloud import SyncLedger, WpsCloudError
+from app.api.bridge import Bridge
+from app.wps.sync import SyncLedger, WpsCloudError
+from app.api import bridge as bridge_module
 
 
 def _bridge(tmp_path) -> Bridge:
@@ -30,23 +30,6 @@ def _bridge(tmp_path) -> Bridge:
     # Bridge 的默认角色是「非管理员」（安全默认），故此处显式以管理员构造；
     # 角色相关的拦截由 tests/test_web_roles.py 专门覆盖。
     return Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
-
-
-class _FakeWindow:
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-
-    def minimize(self) -> None:
-        self.calls.append("minimize")
-
-    def maximize(self) -> None:
-        self.calls.append("maximize")
-
-    def restore(self) -> None:
-        self.calls.append("restore")
-
-    def destroy(self) -> None:
-        self.calls.append("destroy")
 
 
 class _FakeCli:
@@ -86,7 +69,6 @@ def test_bridge_ready_exposes_version_status_and_producer_id(tmp_path):
 
     assert state["version"] == __version__
     assert state["status"] == "ready"
-    assert state["frozen"] is False
     assert state["event_producer_id"] == bridge._event_producer_id
     # 前端靠 producer_id 识别 Python 进程重启，不能为空
     assert state["event_producer_id"]
@@ -103,7 +85,7 @@ def test_bridge_ready_config_carries_every_field_the_frontend_needs(tmp_path):
         "sss_order_source", "sss_product_name", "sss_common_address",
         "sss_use_fixed_address", "sss_fixed_lnt", "sss_fixed_lat",
         "sss_fixed_area_code", "sss_fixed_address_detail", "sss_dry_run",
-        "sss_preflight", "sss_idempotency_field", "api_mode",
+        "sss_preflight", "sss_idempotency_field",
         "wps_enabled", "wps_test_mode", "wps_test_file_id", "wps_test_drive_id",
         "wps_test_tables", "wps_drive_id", "wps_cli_path", "wps_tables",
         "wps_target_hour_start", "wps_target_hour_end", "wps_marker_enabled",
@@ -280,7 +262,7 @@ def test_wps_status_target_date_and_tables(tmp_path, monkeypatch):
     assert status["target_date"] == status["target_date"]   # 形如 2026-09-16
     _dt.date.fromisoformat(status["target_date"])
     # 通讯记号写的是**运行日**的周几
-    from app.wps_cloud import weekday_number
+    from app.wps.sync import weekday_number
     assert status["weekday_number"] == weekday_number(_dt.date.today())
     assert [t["sheet"] for t in status["tables"]] == ["东湖中餐"]
     assert status["tables"][0]["file_id"] == "F1"
@@ -403,7 +385,7 @@ def test_worker_alive_reflects_thread_state(tmp_path):
     (None, 0.38), ("abc", 0.38),
 ])
 def test_set_split_ratio_clamps_and_persists(tmp_path, given, expected):
-    from app.config import AppConfig
+    from app.core.config import AppConfig
 
     bridge = _bridge(tmp_path)
     got = bridge.set_split_ratio(given)  # type: ignore[arg-type]
@@ -412,51 +394,6 @@ def test_set_split_ratio_clamps_and_persists(tmp_path, given, expected):
     assert bridge._config.split_ratio == expected
     # 落盘后重新加载仍是夹紧后的值
     assert AppConfig.load(str(tmp_path / "config.json")).split_ratio == expected
-
-
-# ----------------------------------------------------------------------
-# window_action
-# ----------------------------------------------------------------------
-def test_window_action_without_window_reports_not_ok(tmp_path):
-    assert _bridge(tmp_path).window_action("minimize") == {"ok": False}
-
-
-def test_window_action_minimize_and_unknown(tmp_path):
-    bridge = _bridge(tmp_path)
-    window = _FakeWindow()
-    bridge.attach(window)
-
-    assert bridge.window_action("minimize") == {"ok": True}
-    assert bridge.window_action("随便什么") == {"ok": True}
-    assert window.calls == ["minimize"]
-
-
-def test_window_action_toggle_maximize_alternates(tmp_path):
-    """pywebview 没有「是否最大化」查询，因此靠 _maximized 成对调用。"""
-    bridge = _bridge(tmp_path)
-    window = _FakeWindow()
-    bridge.attach(window)
-
-    bridge.window_action("toggle_maximize")
-    assert window.calls == ["maximize"]
-
-    bridge.window_action("toggle_maximize")
-    assert window.calls == ["maximize", "restore"]
-
-    bridge.window_action("toggle_maximize")
-    assert window.calls == ["maximize", "restore", "maximize"]
-
-
-def test_window_action_close_routes_to_request_close(tmp_path, monkeypatch):
-    bridge = _bridge(tmp_path)
-    bridge.attach(_FakeWindow())
-    called: list[bool] = []
-    monkeypatch.setattr(bridge, "request_close",
-                        lambda: (called.append(True), {"action": "accepted"})[1])
-
-    got = bridge.window_action("close")
-
-    assert got == {"action": "accepted"} and called == [True]
 
 
 # ----------------------------------------------------------------------
@@ -485,44 +422,3 @@ def test_restore_switches_write_target_back_to_production(tmp_path):
     levels = [e["payload"]["level"] for e in bridge.drain_events(0)["events"]
               if e["event"] == "log" and "切回正式排单表" in e["payload"]["msg"]]
     assert levels == ["WARN"]
-
-
-# ----------------------------------------------------------------------
-# on_native_closing
-# ----------------------------------------------------------------------
-def test_native_closing_is_allowed_when_already_closing(tmp_path):
-    bridge = _bridge(tmp_path)
-    bridge._closing = True
-    assert bridge.on_native_closing() is True
-
-
-def test_native_closing_is_allowed_when_no_task_is_running(tmp_path):
-    """没有任务在跑时直接放行（返回 True 让 pywebview 走默认关闭）。"""
-    assert _bridge(tmp_path).on_native_closing() is True
-
-
-def test_native_closing_is_cancelled_while_a_task_runs(tmp_path, monkeypatch):
-    """任务在跑时返回 False 取消原生关闭，改由 request_close 走确认流程。"""
-    bridge = _bridge(tmp_path)
-
-    class _Alive:
-        def is_alive(self) -> bool:
-            return True
-
-    bridge._worker = _Alive()  # type: ignore[assignment]
-    started: list[dict] = []
-
-    class _FakeThread:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            self.daemon = bool(kwargs.get("daemon"))
-
-        def start(self):
-            started.append(self.kwargs)
-
-    monkeypatch.setattr(bridge_module.threading, "Thread", _FakeThread)
-
-    assert bridge.on_native_closing() is False
-    # 必须另起线程走 request_close，而不是在 pywebview 的回调里阻塞
-    assert len(started) == 1
-    assert started[0]["target"] == bridge.request_close

@@ -24,26 +24,30 @@ def main() -> None:
         print(f"yikou-light-food {__version__}")
         return
     if "--self-check" in sys.argv:
-        # 更新替换前由 updater 调用：只验证打包产物能导入关键模块，不启动 GUI。
-        import app.automation  # noqa: F401
-        import app.bridge  # noqa: F401
-        import app.excel_templates  # noqa: F401
-        import app.release_check  # noqa: F401
-        import app.sss  # noqa: F401
-        import app.sss_import  # noqa: F401
-        import app.wps_cloud  # noqa: F401
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import (  # noqa: F401
-            Ed25519PublicKey,
-        )
+        # 部署前自检：只验证关键模块与加密依赖可导入，不联网、不启动任务。
+        import importlib
+
+        for module in (
+            "app.order.runner",
+            "app.order.templates",
+            "app.api.bridge",
+            "app.ordering.sss",
+            "app.ordering.cloud_import",
+            "app.wps.sync",
+            "app.web.auth",
+            "app.web.server",
+            "cryptography.hazmat.primitives.asymmetric.ed25519",
+        ):
+            importlib.import_module(module)
         from . import __version__
         print(f"self-check OK {__version__}")
         return
     if "--wps-check" in sys.argv:
-        # 打包后自检：确认随包分发的 kdocs-cli 能被找到、授权状态可读，
-        # 并打印 6 个写入目标。只读，不写任何云端内容。
+        # WPS 只读自检：确认 kdocs-cli 能被找到、授权状态可读，并打印生效目标。
+        # 只读取本地配置/授权状态，不写任何云端内容。
         from . import __version__
-        from .config import AppConfig
-        from .wps_cloud import KdocsCli, WpsCloudError
+        from app.core.config import AppConfig
+        from app.wps.sync import KdocsCli, WpsCloudError
 
         cfg = AppConfig.load()
         print(f"yikou-light-food {__version__}")
@@ -66,10 +70,10 @@ def main() -> None:
         # 「闪时送下单」云端名单只读自检：确认 kdocs-cli、生效目标表、当天列与
         # 标 1 人数（含被「大西/小」过滤掉的人数）。不写云端、不写本地任何文件。
         from . import __version__
-        from .config import AppConfig
-        from .sss_import import (SSS_SHEET_SOURCES, ImportRefused,
+        from app.core.config import AppConfig
+        from app.ordering.cloud_import import (SSS_SHEET_SOURCES, ImportRefused,
                                  collect_day_orders)
-        from .wps_cloud import (KdocsCli, WpsCloudError, effective_tables,
+        from app.wps.sync import (KdocsCli, WpsCloudError, effective_tables,
                                 target_date_for)
 
         cfg = AppConfig.load()
@@ -112,8 +116,8 @@ def main() -> None:
         return
     # 默认（以及显式 --web）都启动网页服务。
     # 本项目已改为网页版专用：桌面原生窗口（pywebview）那套已经移除，
-    # 见 app/web_server.py。--web 仍保留，兼容既有的启动脚本与 runit 服务配置。
-    from .web_server import main as web_main
+    # 见 app/web/server.py。--web 仍保留，兼容既有的启动脚本与 runit 服务配置。
+    from app.web.server import main as web_main
 
     raise SystemExit(web_main())
 

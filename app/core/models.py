@@ -1,8 +1,7 @@
-"""Public data models used by the desktop application.
+"""公共业务数据模型（纯数据，可直接序列化）。
 
-The models deliberately contain only serialisable business data so that the
-browser and GUI layers can exchange values without depending on Playwright or
-openpyxl objects.
+模型只保存订单/餐次等业务值，不依赖 HTTP 框架、openpyxl 或任何 UI/存储实现，
+方便领域层与 API 层安全传递。
 """
 from __future__ import annotations
 

@@ -5,8 +5,8 @@ import datetime as dt
 
 from openpyxl import Workbook
 
-from app.models import MealInfo, OrderInfo
-from app.processing import (
+from app.core.models import MealInfo, OrderInfo
+from app.order.parsing import (
     get_address_base_sheet_name,
     get_donghu_address_segment,
     get_first_empty_row,
@@ -99,7 +99,7 @@ def test_get_first_empty_row_skips_leading_placeholder_rows():
 
 
 def test_historical_order_writes_to_a_dated_sheet():
-    from app.automation import _write_order
+    from app.order.runner import _write_order
 
     workbook = Workbook()
     order = OrderInfo(order_no="W2", name="张三", address="大西A101", phone="13800000001")
@@ -119,8 +119,8 @@ def test_weekday_sheet_fills_lunch_dinner_columns_contiguously(tmp_path):
     """回归：周表的中餐/晚餐两栏必须各自从第 3 行连续填充，不能对角错位。"""
     from openpyxl import load_workbook
 
-    from app.automation import _write_order
-    from app.excel_templates import write_order_template
+    from app.order.runner import _write_order
+    from app.order.templates import write_order_template
 
     excel = tmp_path / "排单.xlsx"
     write_order_template(excel)
@@ -156,7 +156,7 @@ def test_weekday_sheet_fills_lunch_dinner_columns_contiguously(tmp_path):
 
 
 def test_group_orders_by_pick_keeps_api_order_and_skips_empty_pick_no():
-    from app.automation import _group_orders_by_pick
+    from app.order.runner import _group_orders_by_pick
 
     rows = [
         {"order_id": "3", "pick_no": "W1", "date": dt.date(2026, 9, 3)},
@@ -170,7 +170,7 @@ def test_group_orders_by_pick_keeps_api_order_and_skips_empty_pick_no():
 
 def test_group_orders_by_pick_groups_repeated_pick_numbers_across_days():
     """取单号跨天重复：同号不同日期的行都保留，顺序与新单在前一致。"""
-    from app.automation import _group_orders_by_pick
+    from app.order.runner import _group_orders_by_pick
 
     rows = [
         {"order_id": "30", "pick_no": "W2", "date": dt.date(2026, 9, 3)},
@@ -183,7 +183,7 @@ def test_group_orders_by_pick_groups_repeated_pick_numbers_across_days():
 
 
 def test_filter_rows_by_date_keeps_only_target_date():
-    from app.automation import _filter_rows_by_date
+    from app.order.runner import _filter_rows_by_date
 
     target = dt.date(2026, 9, 7)
     rows = [
@@ -197,7 +197,7 @@ def test_filter_rows_by_date_keeps_only_target_date():
 
 
 def test_order_numbers_for_date_returns_descending_existing_numbers():
-    from app.automation import _order_numbers_for_date
+    from app.order.runner import _order_numbers_for_date
 
     rows_by_pick = {
         "W8": [{"order_id": "1", "date": dt.date(2026, 9, 7)}],
@@ -214,7 +214,7 @@ def test_order_numbers_for_date_returns_descending_existing_numbers():
 
 
 def test_api_list_waimai_orders_falls_back_to_page_size_50_on_exception():
-    from app.automation import _api_list_waimai_orders
+    from app.order.runner import _api_list_waimai_orders
 
     calls: list[str] = []
 
@@ -240,7 +240,7 @@ def test_api_list_waimai_orders_falls_back_to_page_size_50_on_exception():
 
 
 def test_prefetch_order_details_keeps_only_successes_in_order():
-    from app.automation import _prefetch_order_details
+    from app.order.runner import _prefetch_order_details
 
     def api_get(path: str) -> dict:
         if "1001" in path:
@@ -265,7 +265,7 @@ def test_prefetch_order_details_keeps_only_successes_in_order():
 def test_api_list_waimai_orders_concurrent_pages_fetches_all():
     import re
 
-    from app.automation import _api_list_waimai_orders
+    from app.order.runner import _api_list_waimai_orders
 
     calls: list[str] = []
 
@@ -295,7 +295,7 @@ def test_api_list_waimai_orders_concurrent_pages_fetches_all():
 
 def test_split_refund_orders_categorises_by_state():
     """退款订单分类：state=8 已退款 / state=7 申请退款中，正常单保留。"""
-    from app.automation import _filter_rows_by_date, _group_orders_by_pick, \
+    from app.order.runner import _filter_rows_by_date, _group_orders_by_pick, \
         _order_numbers_for_date, split_refund_orders
 
     rows = [
@@ -314,7 +314,7 @@ def test_split_refund_orders_categorises_by_state():
 
 def test_parse_batch_keeps_refund_state():
     """列表接口解析保留 state 字段；缺失时按非退款容忍。"""
-    from app.automation import _api_list_waimai_orders
+    from app.order.runner import _api_list_waimai_orders
 
     def api_get(path: str) -> dict:
         return {"data": {"list": [
@@ -338,9 +338,9 @@ def test_run_job_skips_refunded_orders_and_reports_summary(tmp_path, monkeypatch
 
     from openpyxl import load_workbook
 
-    from app import automation as automod
-    from app.automation import run_job
-    from app.excel_templates import write_order_template
+    from app.order import runner as automod
+    from app.order.runner import run_job
+    from app.order.templates import write_order_template
 
     excel = tmp_path / "排单.xlsx"
     write_order_template(excel)
@@ -350,9 +350,6 @@ def test_run_job_skips_refunded_orders_and_reports_summary(tmp_path, monkeypatch
         target_url = "https://example.com"
         phone_number = "13900000000"
         order_date = "2026-09-07"
-        api_mode = True
-        element_timeout_ms = 8000
-        browser_mode = "auto"
 
     def api_get(path: str) -> dict:
         if "/channel/order?" in path and "pageNo=1" in path:
@@ -420,9 +417,9 @@ def test_run_job_writes_pending_addresses_after_certain_orders(tmp_path, monkeyp
 
     from openpyxl import load_workbook
 
-    from app import automation as automod
-    from app.automation import run_job
-    from app.excel_templates import write_order_template
+    from app.order import runner as automod
+    from app.order.runner import run_job
+    from app.order.templates import write_order_template
 
     today = dt.date.today()
     date_text = today.isoformat()
@@ -435,9 +432,6 @@ def test_run_job_writes_pending_addresses_after_certain_orders(tmp_path, monkeyp
         target_url = "https://example.com"
         phone_number = "13900000000"
         order_date = date_text
-        api_mode = True
-        element_timeout_ms = 8000
-        browser_mode = "auto"
 
     addresses = {
         "3": "浙江农林大学东湖校区 A5 506",
@@ -514,9 +508,9 @@ def test_run_job_manual_pending_address_override_and_sort(tmp_path, monkeypatch)
 
     from openpyxl import load_workbook
 
-    from app import automation as automod
-    from app.automation import run_job
-    from app.excel_templates import write_order_template
+    from app.order import runner as automod
+    from app.order.runner import run_job
+    from app.order.templates import write_order_template
 
     today = dt.date.today()
     date_text = today.isoformat()
@@ -529,9 +523,6 @@ def test_run_job_manual_pending_address_override_and_sort(tmp_path, monkeypatch)
         target_url = "https://example.com"
         phone_number = "13900000000"
         order_date = date_text
-        api_mode = True
-        element_timeout_ms = 8000
-        browser_mode = "auto"
 
     addresses = {
         "3": "浙江农林大学东湖校区 D2",
@@ -612,7 +603,7 @@ def test_run_job_manual_pending_address_override_and_sort(tmp_path, monkeypatch)
 
 
 def test_pending_report_deduplicates_address_and_keeps_all_orders():
-    from app.automation import _pending_report_items, _prepare_order_address
+    from app.order.runner import _pending_report_items, _prepare_order_address
 
     raw = "浙江农林大学东湖校区 B1号楼 b2宿舍楼"
     orders = [
@@ -630,7 +621,7 @@ def test_pending_report_deduplicates_address_and_keeps_all_orders():
 
 
 def test_historical_pending_order_is_appended_after_certain_order():
-    from app.automation import _prepare_order_address, _write_order
+    from app.order.runner import _prepare_order_address, _write_order
 
     workbook = Workbook()
     meal = MealInfo(total_meals=1, grade="经济", meal_type="午餐")
@@ -677,7 +668,7 @@ def _col_c(ws):
 
 def test_sort_donghu_sub_sheet_order():
     from openpyxl import Workbook
-    from app.processing import sort_campus_sub_sheets
+    from app.order.parsing import sort_campus_sub_sheets
 
     wb = Workbook()
     ws = wb.active
@@ -688,7 +679,7 @@ def test_sort_donghu_sub_sheet_order():
 
 def test_sort_yijin_sub_sheet_order():
     from openpyxl import Workbook
-    from app.processing import sort_campus_sub_sheets
+    from app.order.parsing import sort_campus_sub_sheets
 
     wb = Workbook()
     ws = wb.active
@@ -699,7 +690,7 @@ def test_sort_yijin_sub_sheet_order():
 
 def test_sort_yixue_sub_sheet_order():
     from openpyxl import Workbook
-    from app.processing import sort_campus_sub_sheets
+    from app.order.parsing import sort_campus_sub_sheets
 
     wb = Workbook()
     ws = wb.active
@@ -711,7 +702,7 @@ def test_sort_yixue_sub_sheet_order():
 
 def test_sort_leaves_weekday_sheet_untouched():
     from openpyxl import Workbook
-    from app.processing import sort_campus_sub_sheets
+    from app.order.parsing import sort_campus_sub_sheets
 
     wb = Workbook()
     ws = wb.active
@@ -726,7 +717,7 @@ def test_sort_leaves_weekday_sheet_untouched():
 
 def test_clear_campus_sub_sheets_keeps_headers():
     from openpyxl import Workbook
-    from app.processing import clear_campus_sub_sheets
+    from app.order.parsing import clear_campus_sub_sheets
 
     wb = Workbook()
     ws = wb.active
@@ -759,7 +750,7 @@ def test_clear_campus_sub_sheets_keeps_headers():
 
 def test_clear_campus_sub_sheets_empty_sheet_not_reported():
     from openpyxl import Workbook
-    from app.processing import clear_campus_sub_sheets
+    from app.order.parsing import clear_campus_sub_sheets
 
     wb = Workbook()
     ws = wb.active
@@ -773,7 +764,7 @@ def test_clear_campus_sub_sheets_empty_sheet_not_reported():
 def test_sort_handles_gap_rows_and_compacts():
     """回归：数据区中间有空行、数据在后时，排序必须扫描全表并压缩。"""
     from openpyxl import Workbook
-    from app.processing import sort_campus_sub_sheets
+    from app.order.parsing import sort_campus_sub_sheets
 
     wb = Workbook()
     ws = wb.active
@@ -796,7 +787,7 @@ def test_sort_handles_gap_rows_and_compacts():
 def test_clear_deletes_rows_and_shrinks_sheet():
     """回归：清空必须真删行，max_row 收缩，新数据从第3行起写。"""
     from openpyxl import Workbook
-    from app.processing import clear_campus_sub_sheets
+    from app.order.parsing import clear_campus_sub_sheets
 
     wb = Workbook()
     ws = wb.active
@@ -817,7 +808,7 @@ def test_clear_deletes_rows_and_shrinks_sheet():
 # ----------------------------------------------------------------------
 def test_split_text_and_number_separates_letters_from_digits():
     """把「地址/楼号」拆成（非数字部分, 数字部分）—— 排序键要用。"""
-    from app.processing import split_text_and_number
+    from app.order.parsing import split_text_and_number
 
     assert split_text_and_number("b2") == ("b", "2")
     assert split_text_and_number("A10号楼") == ("A号楼", "10")   # 数字全部抽走
@@ -827,7 +818,7 @@ def test_split_text_and_number_separates_letters_from_digits():
 
 
 def test_split_text_and_number_handles_empty_input():
-    from app.processing import split_text_and_number
+    from app.order.parsing import split_text_and_number
 
     assert split_text_and_number(None) == ("", "")
     assert split_text_and_number("") == ("", "")
@@ -838,7 +829,7 @@ def test_get_weekday_fill_value_marks_tomorrow():
     """协作者的通讯记号写的是**运行日的次日**周几（周日跑 → 周一）。"""
     import datetime as dt
 
-    from app.processing import get_weekday_fill_value
+    from app.order.parsing import get_weekday_fill_value
 
     names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
     for offset in range(7):
@@ -852,7 +843,7 @@ def test_get_weekday_fill_value_marks_tomorrow():
 def test_get_weekday_fill_value_uses_exactly_one_marker():
     import datetime as dt
 
-    from app.processing import get_weekday_fill_value
+    from app.order.parsing import get_weekday_fill_value
 
     marks = get_weekday_fill_value(dt.datetime(2026, 9, 20, 23, 59))  # 周日深夜
     assert marks["周一"] == 1

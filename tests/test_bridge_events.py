@@ -4,7 +4,7 @@ from __future__ import annotations
 import threading
 import time
 
-from app.bridge import Bridge
+from app.api.bridge import Bridge
 
 
 class _AliveWorker:
@@ -13,7 +13,7 @@ class _AliveWorker:
 
 
 def test_event_replay_window_keeps_critical_events(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.bridge.EVENT_HISTORY_LIMIT", 10)
+    monkeypatch.setattr("app.api.bridge.EVENT_HISTORY_LIMIT", 10)
     bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
     for index in range(50):
         bridge.log(f"log {index}")
@@ -148,7 +148,7 @@ def test_request_close_timeout_leaves_no_pending_interaction(tmp_path):
 
 
 def test_ack_sequence_prunes_acknowledged_events(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.bridge.EVENT_ACK_RETAIN", 1)
+    monkeypatch.setattr("app.api.bridge.EVENT_ACK_RETAIN", 1)
     bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
     for index in range(5):
         bridge.log(f"log {index}")
@@ -162,7 +162,7 @@ def test_ack_sequence_prunes_acknowledged_events(tmp_path, monkeypatch):
 
 
 def test_middle_sequence_gap_emits_dropped_notice(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.bridge.EVENT_HISTORY_LIMIT", 10)
+    monkeypatch.setattr("app.api.bridge.EVENT_HISTORY_LIMIT", 10)
     bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
     bridge._emit_event("task:done", {"message": "done", "stopped": False,
                                      "partial": False, "result": {}})
@@ -181,7 +181,7 @@ def test_middle_sequence_gap_emits_dropped_notice(tmp_path, monkeypatch):
 
 
 def test_critical_events_have_explicit_cap_notice(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.bridge.CRITICAL_EVENT_LIMIT", 2)
+    monkeypatch.setattr("app.api.bridge.CRITICAL_EVENT_LIMIT", 2)
     bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
     for index in range(4):
         bridge._emit_event("task:error", {"message": str(index)})
@@ -195,7 +195,7 @@ def test_critical_events_have_explicit_cap_notice(tmp_path, monkeypatch):
 
 
 def test_ack_from_other_producer_is_ignored(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.bridge.EVENT_ACK_RETAIN", 1)
+    monkeypatch.setattr("app.api.bridge.EVENT_ACK_RETAIN", 1)
     bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
     for index in range(3):
         bridge.log(f"log {index}")
@@ -209,8 +209,8 @@ def test_ack_from_other_producer_is_ignored(tmp_path, monkeypatch):
 
 
 def test_dropped_ranges_merge_even_when_critical_pruned_after_logs(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.bridge.EVENT_HISTORY_LIMIT", 3)
-    monkeypatch.setattr("app.bridge.CRITICAL_EVENT_LIMIT", 1)
+    monkeypatch.setattr("app.api.bridge.EVENT_HISTORY_LIMIT", 3)
+    monkeypatch.setattr("app.api.bridge.CRITICAL_EVENT_LIMIT", 1)
     bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
     bridge._emit_event("task:done", {"message": "1", "stopped": False,
                                      "partial": False, "result": {}})
@@ -239,12 +239,12 @@ def test_sss_day_orders_rejects_while_worker_running(tmp_path):
 
 
 def test_sss_day_orders_reports_import_refusal(tmp_path, monkeypatch):
-    from app.sss_import import ImportRefused
+    from app.ordering.cloud_import import ImportRefused
 
     def refuse(config, **kwargs):
         raise ImportRefused("读取云端表「东湖中餐」失败：未授权")
 
-    monkeypatch.setattr("app.bridge.prepare_day_orders", refuse)
+    monkeypatch.setattr("app.api.bridge.prepare_day_orders", refuse)
     bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
     result = bridge.sss_day_orders()
     assert result["ok"] is False
@@ -257,7 +257,7 @@ def test_sss_day_orders_reports_import_refusal(tmp_path, monkeypatch):
 def test_sss_day_orders_returns_counts_and_logs(tmp_path, monkeypatch):
     import datetime as dt
 
-    from app.sss_import import DayOrders, MealImport
+    from app.ordering.cloud_import import DayOrders, MealImport
 
     meals = [
         MealImport(meal="午餐", table="东湖中餐", date_text="9.16 周三",
@@ -270,7 +270,7 @@ def test_sss_day_orders_returns_counts_and_logs(tmp_path, monkeypatch):
     day = DayOrders(target_date=dt.date(2026, 9, 16), meals=meals,
                     orders_by_sheet={"午餐": meals[0].orders, "晚餐": []})
 
-    monkeypatch.setattr("app.bridge.prepare_day_orders",
+    monkeypatch.setattr("app.api.bridge.prepare_day_orders",
                         lambda config, **kwargs: day)
     bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
     result = bridge.sss_day_orders()
@@ -290,7 +290,7 @@ def test_sss_day_orders_returns_counts_and_logs(tmp_path, monkeypatch):
 
 
 def test_sss_config_defaults_to_wps_source_and_roundtrips(tmp_path):
-    from app.config import AppConfig
+    from app.core.config import AppConfig
 
     path = tmp_path / "config.json"
     config = AppConfig(config_path=str(path))

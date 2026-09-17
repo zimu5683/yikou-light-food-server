@@ -1,4 +1,4 @@
-"""``app.config`` 的边界语义回归锁（由模糊测试发现并固定下来）。
+"""``app.core.config`` 的边界语义回归锁（由模糊测试发现并固定下来）。
 
 **这份文件的由来**：第 15 轮做「边界验证」时，对配置做了一次 300 组随机
 `save → load` 往返 + 8700 次字段比对，发现若干字段**写进去和读回来不一样**。
@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.config import (AppConfig, default_wps_address_order, normalize_wps_address_order,
+from app.core.config import (AppConfig, default_wps_address_order, normalize_wps_address_order,
                         normalize_wps_tables, normalize_wps_test_tables)
 
 # 这些字段在 __init__ 里写成 `x or "默认值"`，因此**空串会被默认值取代**
@@ -119,7 +119,7 @@ def test_sss_read_timeout_is_clamped(given, expected):
 
 
 def test_split_ratio_is_clamped_on_construction():
-    from app.config import MAX_SPLIT_RATIO, MIN_SPLIT_RATIO
+    from app.core.config import MAX_SPLIT_RATIO, MIN_SPLIT_RATIO
 
     assert AppConfig(split_ratio=0).split_ratio == MIN_SPLIT_RATIO
     assert AppConfig(split_ratio=9).split_ratio == MAX_SPLIT_RATIO
@@ -146,7 +146,6 @@ ROUNDTRIP_FIELDS = {
     "sss_dry_run": False,
     "sss_preflight": True,
     "sss_idempotency_field": "client_request_id",
-    "api_mode": False,
     "wps_enabled": True,
     "wps_test_mode": False,
     "wps_test_file_id": "TEST_FID",
@@ -156,7 +155,6 @@ ROUNDTRIP_FIELDS = {
     "wps_target_hour_end": 10,
     "wps_marker_enabled": False,
     "wps_sort_enabled": True,
-    "headless": True,
 }
 
 

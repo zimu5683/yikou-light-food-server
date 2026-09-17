@@ -1,4 +1,4 @@
-"""Tests for app.sss_import —— 闪时送下单前的「云端当天名单」导入（全部离线）。
+"""Tests for app.ordering.cloud_import —— 闪时送下单前的「云端当天名单」导入（全部离线）。
 
 覆盖：当天列定位（含忽略协作者标记列）、地址过滤（大西/小）、数据校验、
 留档写回与 E1、缺当天列跳过、云端错误拒绝、日期闸门，以及与 run_sss_job 的接入。
@@ -10,9 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from app import sss
-from app import sss_import as si
-from app.wps_cloud import WpsCloudError
+from app.wps.sync import WpsCloudError
+from app.ordering import cloud_import as si, sss
 
 LUNCH_FILE = "F_LUNCH"
 DINNER_FILE = "F_DINNER"
@@ -435,7 +434,7 @@ def test_run_sss_job_wps_source_refuses_before_login(monkeypatch):
         raise si.ImportRefused("云端读取失败：额度用尽")
 
     monkeypatch.setattr(sss, "prepare_day_orders", refuse)
-    config = make_config(sss_dry_run=False, api_mode=True, sss_account="18758187837")
+    config = make_config(sss_dry_run=False, sss_account="18758187837")
     with pytest.raises(si.ImportRefused, match="额度用尽"):
         sss.run_sss_job(config, _Stop(), lambda message: None, password="x")
     assert created == []

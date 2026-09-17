@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .config import user_data_dir
+    from app.core.config import user_data_dir
 except ImportError:  # pragma: no cover - direct module execution compatibility
-    from config import user_data_dir
+    from app.core.config import user_data_dir
 
 
 def aliases_path() -> Path:

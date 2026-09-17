@@ -1,7 +1,6 @@
-"""Pure parsing and Excel-processing helpers.
+"""订单文本解析与 Excel 处理纯函数。
 
-Browser code can call these functions, while tests can exercise them without a
-network connection or a running Playwright instance.
+不访问网络、不依赖 UI；领域 runner 与测试可直接复用。
 """
 from __future__ import annotations
 
@@ -11,7 +10,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
-from .models import MealInfo, OrderInfo
+from app.core.models import MealInfo, OrderInfo
 
 RECEIVER_BRACKET = re.compile(r"^\s*(.+?)\s*[（(,，:：]\s*(\d{5,15})\s*[）),，:：]?\s*$")
 NUMBERS = re.compile(r"\d+")

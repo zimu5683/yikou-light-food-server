@@ -1,12 +1,11 @@
 /**
- * 桥接客户端：与 app/bridge.py 的 js_api / 事件协议一一对应。
+ * 后端 API 客户端：与 app/api/bridge.py 的方法 / 事件协议一一对应。
  *
- * Python→JS：window.__bridge.dispatch({event, payload})，由本模块分发。
- * JS→Python：window.pywebview.api.<method>()，返回 Promise。
+ * JS→Python：``POST /api/<method>``，JSON 数组按位置传参；
+ * Python→JS：前端定时 ``drain_events`` 拉取事件，按 ``event_id`` 去重后分发。
  *
- * 网页版（手机/服务器模式，见 app/web_server.py）：没有 pywebview，改用
- * ``POST /api/<method>``（JSON 数组按位置传参）调用同一批 Python 方法；访问令牌
- * 从网址的 ``?token=`` 读取并持久化，之后随 ``X-Yikou-Token`` 头发送。
+ * 访问令牌从网址的 ``?token=`` 读取并持久化，之后随 ``X-Yikou-Token`` 头发送；
+ * 未配置后端的纯静态预览会退化为 mock 数据（仅用于样式开发）。
  */
 
 // ---------- 协议类型 ----------
@@ -52,7 +51,6 @@ export interface AppConfigState {
   sss_preflight: boolean
   /** 平台支持客户端幂等字段时由配置指定，默认空 = 至少一次提交+对账确认。 */
   sss_idempotency_field?: string
-  api_mode: boolean
   /** WPS 云文档同步：把本地排单表增量写入云端排单表。 */
   wps_enabled: boolean
   wps_test_mode: boolean
@@ -168,7 +166,6 @@ export interface SssDayOrders {
 export interface AppState {
   version: string
   status: StatusState
-  frozen: boolean
   /** 当前登录账号是否管理员。后端按会话判定，前端据此只做显示裁剪。 */
   is_admin?: boolean
   /** Python 进程标识：用于识别重启后 sequence 归零，避免复用旧 cursor。 */
@@ -219,7 +216,8 @@ export interface UpdateAvailable {
   tag: string
   current: string
   body: string
-  can_auto_install: boolean
+  /** Release 页面地址；旧后端未返回时由前端回退到仓库地址。 */
+  html_url?: string
 }
 
 type BridgeEventBase =
@@ -238,10 +236,6 @@ type BridgeEventBase =
   | { event: 'update:available'; payload: UpdateAvailable }
   | { event: 'update:latest'; payload: { manual: boolean; current: string } }
   | { event: 'update:error'; payload: { message: string } }
-  | { event: 'update:progress'; payload: { downloaded: number; total: number | null } }
-  | { event: 'update:stage'; payload: { stage: string } }
-  | { event: 'update:install_error'; payload: { message: string } }
-  | { event: 'update:installed'; payload: { message: string } }
   | { event: 'decision'; payload: DecisionRequest }
   | { event: 'captcha'; payload: CaptchaRequest }
   | { event: 'address_input'; payload: AddressInputRequest }
@@ -289,8 +283,6 @@ export interface OrderFormPayload {
   date: string
   count: string
   remember: boolean
-  /** 可选：后端已固定纯接口模式，缺省即为 true（保留字段以兼容旧客户端）。 */
-  api_mode?: boolean
 }
 
 /** 订单表单防抖即时保存的载荷（不触发任务、不带密码）。 */
@@ -300,7 +292,6 @@ export interface OrderConfigPayload {
   excel?: string
   date?: string
   count?: number | null
-  api_mode?: boolean
 }
 
 /** 闪时送表单防抖即时保存的载荷（不触发任务、不带密码）。 */
@@ -318,7 +309,6 @@ export interface SssConfigPayload {
   fixed_address_detail?: string
   dry_run?: boolean
   preflight?: boolean
-  api_mode?: boolean
 }
 
 export interface SssFormPayload {
@@ -337,8 +327,6 @@ export interface SssFormPayload {
   remember: boolean
   dry_run: boolean
   preflight: boolean
-  /** 可选：后端已固定纯接口模式，缺省即为 true（保留字段以兼容旧客户端）。 */
-  api_mode?: boolean
 }
 
 export interface FieldErrors {
@@ -367,7 +355,7 @@ export interface WpsConfigPayload {
 
 // ---------- window 声明 ----------
 
-interface PywebviewApi {
+interface BackendApi {
   bridge_ready(): Promise<AppState>
   start_order(payload: OrderFormPayload): Promise<FieldErrors>
   start_sss(payload: SssFormPayload): Promise<FieldErrors>
@@ -387,12 +375,10 @@ interface PywebviewApi {
   save_wps_config(payload: WpsConfigPayload): Promise<{ ok: boolean; reason?: string }>
   clear_password(mode: 'order' | 'sss'): Promise<{ ok: boolean }>
   check_updates(manual: boolean): Promise<{ ok: boolean; reason?: string }>
-  install_update(): Promise<{ ok: boolean; reason?: string }>
   open_external(url: string): Promise<{ ok: boolean }>
   frontend_report(payload: Record<string, unknown> | string): Promise<{ ok: boolean }>
   drain_events(lastSequence?: number, ackSequence?: number, producerId?: string): Promise<DrainEventsResult>
   echo_test(message: string, payload?: Record<string, unknown>): Promise<{ echo: string; payload_keys: string[] | null }>
-  window_action(action: 'minimize' | 'toggle_maximize' | 'close'): Promise<{ action?: string }>
   request_close(): Promise<{ action: string }>
   set_split_ratio(ratio: number): Promise<{ ok: boolean; ratio: number }>
   save_order_config(payload: OrderConfigPayload): Promise<{ ok: boolean; reason?: string; saved?: { order_date: string; order_count: number | null } }>
@@ -401,19 +387,17 @@ interface PywebviewApi {
 
 declare global {
   interface Window {
-    pywebview?: { api: PywebviewApi }
-    __bridge: { dispatch(message: BridgeEvent): void }
+    // 仅依赖 localStorage / location 等标准字段，不再需要原生窗口壳注入 API。
   }
 }
 
 // ---------- 传输方式 ----------
 
 /**
- * `pywebview`：桌面端原生窗口（原有行为）；
- * `http`：网页版，浏览器 ↔ app/web_server.py；
- * `mock`：纯浏览器直开（无 Python），只给样式开发用的静态假数据。
+ * `http`：浏览器 ↔ app/web/server.py；
+ * `mock`：无后端的纯静态预览，只给样式开发用的假数据。
  */
-export type Transport = 'pywebview' | 'http' | 'mock'
+export type Transport = 'http' | 'mock'
 
 let transport: Transport = 'mock'
 
@@ -493,8 +477,8 @@ function errorMessage(data: unknown, status: number): string {
   return `请求失败（HTTP ${status}）`
 }
 
-/** 用 HTTP 实现整个 PywebviewApi：方法名即路径，参数按位置传。 */
-function createHttpApi(): PywebviewApi {
+/** 用 HTTP 实现整个 BackendApi：方法名即路径，参数按位置传。 */
+function createHttpApi(): BackendApi {
   const call = async (method: string, args: unknown[]): Promise<unknown> => {
     const { ok, status, data } = await postJson(`/api/${method}`, args)
     if (!ok) {
@@ -503,7 +487,7 @@ function createHttpApi(): PywebviewApi {
     }
     return data
   }
-  return new Proxy({} as PywebviewApi, {
+  return new Proxy({} as BackendApi, {
     get(_target, prop) {
       if (typeof prop !== 'string') return undefined
       return (...args: unknown[]) => call(prop, args)
@@ -683,61 +667,30 @@ function dispatch(message: BridgeEvent): void {
   for (const listener of listeners) listener(message)
 }
 
-window.__bridge = { dispatch }
-
 export function onBridgeEvent(listener: Listener): () => void {
   listeners.add(listener)
   return () => listeners.delete(listener)
 }
 
-let httpApi: PywebviewApi | null = null
+let httpApi: BackendApi | null = null
 
-export function api(): PywebviewApi {
-  const raw = window.pywebview?.api
-  if (raw) {
-    return new Proxy(raw, {
-      get(target, prop) {
-        const value = Reflect.get(target, prop)
-        if (typeof value !== 'function') return value
-        return (...args: unknown[]) => {
-          const promise = (value as (...a: unknown[]) => Promise<unknown>).apply(target, args)
-          // evaluate_js 结果投递在 WebKitGTK 上可能被吞，超时兜底避免 UI 永久悬挂。
-          // 文件对话框等会合法长阻塞的调用不设超时。
-          const timeoutMs = prop === 'drain_events' ? 4000 : 0
-          if (!timeoutMs) return promise
-          return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error('bridge timeout')), timeoutMs)
-            promise.then(
-              (value) => {
-                clearTimeout(timer)
-                resolve(value)
-              },
-              (error) => {
-                clearTimeout(timer)
-                reject(error)
-              },
-            )
-          })
-        }
-      },
-    }) as PywebviewApi
-  }
+export function api(): BackendApi {
   if (transport === 'http') {
     httpApi ??= createHttpApi()
     return httpApi
   }
-  throw new Error('桥接 API 尚未就绪')
+  throw new Error('后端 API 尚未就绪')
 }
 
 export function isApiReady(): boolean {
-  return Boolean(window.pywebview?.api) || transport === 'http'
+  return transport === 'http'
 }
 
 export interface ReadyResult {
   state: AppState
   /** 模拟浏览器开发环境（无 Python 壳）时为 true。 */
   mocked: boolean
-  /** 实际使用的传输方式，便于界面区分「网页版」与「mock 预览」。 */
+  /** 实际使用的传输方式，便于界面区分「HTTP 网页版」与「mock 预览」。 */
   transport: Transport
   /** 网页版令牌无效时的提示（非空表示需要用户换用带令牌的网址）。 */
   authError: string
@@ -764,55 +717,33 @@ async function tryHttpHandshake(): Promise<{ state: AppState | null; authError: 
 }
 
 /**
- * 建立桥接：优先 pywebview，其次网页版 HTTP，最后降级 mock。
- *
- * 网页版探测放在前面且很快返回，避免浏览器直开时白等 pywebview 的 10 秒注入窗口；
- * 桌面端（file:// 或 Vite 开发服务器）探测一定失败，行为与以前一致。
+ * 建立连接：优先探测 HTTP 后端；探测不到才进入 mock 预览（仅样式开发）。
  */
 export async function connectBridge(): Promise<ReadyResult> {
-  if (!window.pywebview?.api) {
-    const { state, authError } = await tryHttpHandshake()
-    if (state) {
-      transport = 'http'
-      adoptProducer(state.event_producer_id)
-      apiReady = true
-      for (const message of queued.splice(0)) dispatch(message)
-      return { state, mocked: false, transport, authError: '' }
-    }
-    if (authError) {
-      // 服务端在，但令牌不对：不能悄悄退化成 mock，否则用户会以为连上了。
-      return { state: mockState(), mocked: true, transport: 'mock', authError }
-    }
+  const { state, authError } = await tryHttpHandshake()
+  if (state) {
+    transport = 'http'
+    adoptProducer(state.event_producer_id)
+    apiReady = true
+    for (const message of queued.splice(0)) dispatch(message)
+    return { state, mocked: false, transport, authError: '' }
   }
-  if (!window.pywebview) {
-    await new Promise<void>((resolve) => {
-      // pywebview 6 GTK 的注入可能晚于首帧；10s 内未注入才降级 mock。
-      const timer = setTimeout(() => resolve(), 10000)
-      window.addEventListener('pywebviewready', () => {
-        clearTimeout(timer)
-        resolve()
-      })
-    })
-  }
-  if (!window.pywebview?.api) {
-    // 浏览器直开（无 Python 壳）：提供 mock 状态方便样式开发。
+  if (authError) {
+    // 服务端在，但令牌不对：不能悄悄退化成 mock，否则用户会以为连上了。
     transport = 'mock'
     apiReady = true
-    return { state: mockState(), mocked: true, transport, authError: '' }
+    return { state: mockState(), mocked: true, transport, authError }
   }
-  transport = 'pywebview'
-  const state = await api().bridge_ready()
-  adoptProducer(state.event_producer_id)
+  // 浏览器直开（无后端）：提供 mock 状态方便样式开发。
+  transport = 'mock'
   apiReady = true
-  for (const message of queued.splice(0)) dispatch(message)
-  return { state, mocked: false, transport, authError: '' }
+  return { state: mockState(), mocked: true, transport, authError: '' }
 }
 
 function mockState(): AppState {
   return {
     version: '3.0.0-dev',
     status: 'ready',
-    frozen: false,
     config: {
       target_url: 'https://m.icall.me/admin/#/login',
       phone_number: '13968033834',
@@ -834,7 +765,6 @@ function mockState(): AppState {
       sss_dry_run: true,
       sss_preflight: false,
       sss_idempotency_field: '',
-      api_mode: true,
       wps_enabled: false,
       wps_test_mode: true,
       wps_test_file_id: '',

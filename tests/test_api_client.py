@@ -1,4 +1,4 @@
-"""``app.api_client`` 的登录态判定与网址解析回归锁。
+"""``app.integrations.api_client`` 的登录态判定与网址解析回归锁。
 
 改动前 ``tests/`` 里**没有任何一处**引用过这三个函数，而它们守的是两条要命的边界：
 
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.api_client import (AUTH_ERROR_CODES, AUTH_MESSAGE_KEYWORDS,
+from app.integrations.api_client import (AUTH_ERROR_CODES, AUTH_MESSAGE_KEYWORDS,
                             auth_error_message, is_auth_expired_payload,
                             origin_from_url)
 

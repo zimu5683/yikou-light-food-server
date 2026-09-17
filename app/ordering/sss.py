@@ -1,14 +1,12 @@
 """闪时送（sss）平台批量下单自动化（接口模式）。
 
-本模块与管理后台订单处理（:mod:`app.automation`）方向相反：从独立的
+本模块与管理后台订单处理（:mod:`app.order.runner`）方向相反：从独立的
 《闪时送.xlsx》读取订单（午餐/晚餐两表），再在闪时送平台逐单创建预约单。
 
-默认使用纯接口模式：直接请求闪时送 HTTP 接口完成登录与下单；用户只需在应用内
-输入图形验证码，不再弹出浏览器。备用浏览器模式仍会启动 Playwright，自动填写
-账号密码后由用户在浏览器中输入图形验证码。
+全程直接请求闪时送 HTTP 接口完成登录与下单；用户只需在应用内输入图形验证码。
 
 干跑模式：配置 ``sss_dry_run = true`` 时只组装并打印下单报文，不真实提交。
-凭据与路径由 GUI 通过 :class:`AppConfig` 传入，不写入源码。
+凭据与路径由 :class:`app.core.config.AppConfig` 传入，不写入源码。
 """
 from __future__ import annotations
 
@@ -29,16 +27,10 @@ from threading import Lock, local
 from typing import Any, Callable, NamedTuple
 from urllib.parse import urlencode
 
-try:
-    from .api_client import (ApiError, SssApiClient, SssTransportError,
-                             auth_error_message, is_auth_expired_payload)
-    from .automation import _emit
-    from .sss_import import ImportRefused, prepare_day_orders
-except ImportError:  # pragma: no cover - allows ``python app/sss.py``
-    from api_client import (ApiError, SssApiClient, SssTransportError,
-                            auth_error_message, is_auth_expired_payload)
-    from automation import _emit
-    from sss_import import ImportRefused, prepare_day_orders
+from app.integrations.api_client import (ApiError, SssApiClient, SssTransportError,
+                                         auth_error_message, is_auth_expired_payload)
+from app.order.runner import _emit
+from app.ordering.cloud_import import ImportRefused, prepare_day_orders
 
 DEFAULT_SHEETS = ("午餐", "晚餐")
 LUNCH_TIME = "11:00:00"
@@ -103,21 +95,6 @@ _PHONE_RE = re.compile(r"^[0-9]{11}$")
 _BALANCE_KEYWORDS = ("余额", "充值", "欠费", "冻结", "钱包",
                      "balance", "insufficient", "recharge")
 
-_SSS_FETCH_JS = """
-async ({method, path, body}) => {
-  let token = null;
-  try {
-    const t = JSON.parse(localStorage.getItem('tokenObj') || 'null');
-    if (t && t.expirationTime > Date.now()) token = t.token;
-  } catch (e) {}
-  const headers = {'Content-Type': 'application/json'};
-  if (token) headers['token'] = token;
-  const r = await fetch(path, {method, headers,
-      body: body === null || body === undefined ? undefined : JSON.stringify(body)});
-  return JSON.stringify({http: r.status, text: await r.text()});
-}
-"""
-
 
 def _clean(value: Any) -> Any:
     return value.strip() if isinstance(value, str) else value
@@ -131,7 +108,7 @@ _SSS_TRACE_ENABLED = os.environ.get("YIKOU_SSS_TRACE", "").strip().lower() not i
 
 
 def _trace(message: str) -> None:
-    """把埋点写到标准输出（GUI 启动时仍落在终端），不影响业务日志。"""
+    """把耗时埋点写到标准错误，不影响业务事件日志。"""
     if not _SSS_TRACE_ENABLED:
         return
     stamp = time.strftime("%H:%M:%S")
@@ -326,8 +303,8 @@ def _match_record(records: Any, keyword: str, what: str,
         for record in records:
             if not isinstance(record, dict):
                 continue
-            for field in fields:
-                value = record.get(field)
+            for key in fields:
+                value = record.get(key)
                 if value not in (None, "") and keyword in str(value):
                     return record
         for record in records:
@@ -341,68 +318,6 @@ def _match_record(records: Any, keyword: str, what: str,
     raise LookupError(
         f"{what}列表里没有匹配「{keyword}」的记录，共 {len(records)} 条："
         + json.dumps(records, ensure_ascii=False)[:600])
-
-
-def _sss_api(page: Any, method: str, path: str, body: Any = None) -> tuple[int, dict[str, Any]]:
-    """在登录页会话内调闪时送接口（token 头自动取自 localStorage.tokenObj）。"""
-    raw = page.evaluate(_SSS_FETCH_JS, {"method": method, "path": path, "body": body})
-    envelope = json.loads(raw)
-    try:
-        payload = json.loads(envelope.get("text") or "{}")
-    except ValueError:
-        payload = {}
-    return int(envelope.get("http") or 0), payload
-
-
-def _ensure_logged_in(page: Any, account: str, password: str, stop_event: Any,
-                      callback: Callable[[str], Any] | None) -> None:
-    """确保已登录：已登录直接返回；否则自动填写并等用户输验证码后自动点登录。
-
-    验证码输错时页面会刷新出新验证码，循环等待重输；登录成功的标志是
-    「创建订单」按钮出现（登录后进入的是订单页）。
-    """
-    if page.locator("text=创建订单").count():
-        return
-    page.wait_for_selector("text=账户密码登录", state="visible", timeout=30000)
-    page.get_by_text("账户密码登录").click()
-    page.wait_for_selector("input#account", state="visible", timeout=15000)
-    page.fill("input#account", account)
-    page.fill("input#password", password)
-    _emit(callback, ">>> 请在闪时送窗口输入图形验证码（输完自动点登录；"
-                    "窗口已最小化时请先点任务栏还原）<<<")
-
-    deadline = time.time() + 300
-    while time.time() < deadline:
-        if stop_event.is_set():
-            raise RuntimeError("已停止")
-        code_val = page.evaluate(
-            "() => (document.querySelector('input#code')||{}).value || ''")
-        if len(code_val.strip()) >= 4:
-            page.locator("button", has_text="登录").first.click()
-            page.wait_for_timeout(2500)
-            if page.locator("text=创建订单").count():
-                _emit(callback, "登录成功")
-                return
-            # 验证码错误：清空输入框等待重输（否则残留旧值会触发误重试）
-            try:
-                page.fill("input#code", "")
-            except Exception:
-                pass
-            _emit(callback, "验证码不正确或登录未成功，请按窗口里的新验证码重新输入")
-        page.wait_for_timeout(400)
-    raise TimeoutError("登录超时：未完成验证码输入")
-
-
-def _minimize_window(browser: Any, callback: Callable[[str], Any] | None) -> None:
-    """Best-effort 最小化浏览器窗口（CDP），失败不阻断流程。"""
-    try:
-        session = browser.new_browser_cdp_session()
-        window_id = session.send("Browser.getWindowForTarget")["windowId"]
-        session.send("Browser.setWindowBounds",
-                     {"windowId": window_id, "bounds": {"windowState": "minimized"}})
-        _emit(callback, "浏览器已最小化（任务栏可见，需要输验证码时再还原）")
-    except Exception:
-        pass
 
 
 def build_order_payload(order: dict[str, Any], is_dinner: bool, store_id: int,
@@ -541,12 +456,11 @@ def _prepare_store_and_address(fetch_json: Callable[[str], dict[str, Any]],
                                parallel: bool = True,
                                store_cache_callback: Callable[[str, int], None] | None = None,
                                ) -> tuple[int, dict[str, Any]]:
-    """准备下单所需的门店 id 与地址（接口/浏览器分支共用）。
+    """准备下单所需的门店 id 与地址。
 
-    ``fetch_json`` 是 ``client.get_json`` 或浏览器版 ``_sss_api`` 的 GET
-    封装。门店 id 命中缓存则跳过门店查询；门店与地址查询并行发起。
-    ``parallel=False`` 时串行查询：Playwright 的 ``page.evaluate`` 非
-    线程安全，浏览器分支必须串行。
+    ``fetch_json`` 是 ``client.get_json`` 的 GET 封装。门店 id 命中缓存则跳过
+    门店查询；门店与地址查询默认并发发起，``parallel=False`` 时串行，
+    便于受限网络下回退排查。
     """
     store_id = _cached_store_id(config, store_name)
     need_store = store_id is None
@@ -2022,11 +1936,6 @@ def run_sss_job(config: Any, stop_event: Any,
                     "uncertain": not reconciled,
                     "semantics": ("idempotency-key+reconciliation"
                                   if idempotency_field else "at-least-once+reconciliation")})
-
-
-def _submit_order(page: Any, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-    http, resp = _sss_api(page, "POST", _CREATE_ORDER_PATH, payload)
-    return http, resp
 
 
 __all__ = ["run_sss_job", "load_sss_orders", "compute_delivery_time",

@@ -1,7 +1,7 @@
 /**
  * 全局应用状态：桥接事件 → React store 的唯一入口。
  *
- * 职责（对应 app/bridge.py 事件协议）：
+ * 职责（对应 app/api/bridge.py 事件协议）：
  * - 握手并装载初始状态（config / passwords / version）
  * - log、status、task:*、update:*、decision 事件分发
  * - 表单动作、任务动作、文件对话框、窗口控制
@@ -39,7 +39,6 @@ import {
   type AppStateBundle,
   type LogRow,
   type TaskMode,
-  type UpdateProgress,
 } from './appContext'
 
 export function AppProvider({ children }: { children: ReactNode }) {
@@ -49,7 +48,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [authError, setAuthError] = useState('')
   const [version, setVersion] = useState('')
   const [status, setStatus] = useState<StatusState>('ready')
-  const [frozen, setFrozen] = useState(false)
   // 默认 false（受限）：握手失败时退化为「看不到敏感项」，而不是「全都能看」
   const [isAdmin, setIsAdmin] = useState(false)
   const [config, setConfig] = useState<AppState['config'] | null>(null)
@@ -58,7 +56,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [decision, setDecision] = useState<DecisionRequest | null>(null)
   const [captcha, setCaptcha] = useState<CaptchaRequest | null>(null)
   const [addressInput, setAddressInput] = useState<AddressInputRequest | null>(null)
-  const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null)
   const [updateAvailable, setAvailableState] = useState<UpdateAvailable | null>(null)
   const [mode, setMode] = useState<TaskMode>('order')
   const logId = useRef(0)
@@ -78,7 +75,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setAuthError(authError)
       setVersion(state.version)
       setStatus(state.status)
-      setFrozen(state.frozen)
       setIsAdmin(state.is_admin === true)
       setConfig(state.config)
       setPasswords(state.passwords)
@@ -145,28 +141,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
           break
         case 'update:error':
           toast.error(`检查更新失败：${event.payload.message}`)
-          break
-        case 'update:progress':
-          setUpdateProgress((prev) => ({
-            stage: prev?.stage ?? '下载更新…',
-            downloaded: event.payload.downloaded,
-            total: event.payload.total,
-          }))
-          break
-        case 'update:stage':
-          setUpdateProgress((prev) => ({
-            stage: event.payload.stage,
-            downloaded: prev?.downloaded ?? 0,
-            total: prev?.total ?? null,
-          }))
-          break
-        case 'update:install_error':
-          setUpdateProgress(null)
-          toast.error(`更新失败：${event.payload.message}`, { duration: 8000 })
-          break
-        case 'update:installed':
-          setUpdateProgress(null)
-          toast.success('更新完成，程序即将关闭并自动重启。')
           break
         case 'decision':
           setDecision(event.payload)
@@ -255,11 +229,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
     api().check_updates(manual).catch(() => {})
   }, [])
 
-  const installUpdate = useCallback(async () => {
-    const result = await api().install_update().catch(() => ({ ok: false }))
-    return 'ok' in result && result.ok
-  }, [])
-
   const openExternal = useCallback((url: string) => {
     api().open_external(url).catch(() => {})
   }, [])
@@ -297,7 +266,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
       authError,
       version,
       status,
-      frozen,
       isAdmin,
       config,
       passwords,
@@ -305,7 +273,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
       decision,
       captcha,
       addressInput,
-      updateProgress,
       workerAlive: status === 'running' || status === 'stopping',
       mode,
       setMode,
@@ -316,7 +283,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
       newTemplate,
       clearPassword,
       checkUpdates,
-      installUpdate,
       openExternal,
       requestClose,
       setSplitRatio,
@@ -325,9 +291,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       resolveCaptcha,
       resolveAddressInput,
     }),
-    [ready, mocked, transport, authError, version, status, frozen, isAdmin, config, passwords, logs,
-      decision, updateProgress, mode, captcha, addressInput, startOrder, startSss, stopTask,
-      chooseExcel, newTemplate, clearPassword, checkUpdates, installUpdate,
+    [ready, mocked, transport, authError, version, status, isAdmin, config, passwords, logs,
+      decision, mode, captcha, addressInput, startOrder, startSss, stopTask,
+      chooseExcel, newTemplate, clearPassword, checkUpdates,
       openExternal, requestClose, setSplitRatio, clearLogs, resolveDecision, resolveCaptcha,
       resolveAddressInput],
   )

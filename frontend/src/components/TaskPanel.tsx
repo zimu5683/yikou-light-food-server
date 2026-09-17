@@ -157,8 +157,7 @@ function OrderForm({ logToggle }: { logToggle?: LogToggleProps }) {
     setBusy(true)
     setFields(null)
     try {
-      // 不再传 api_mode：后端已固定纯接口模式（浏览器模式已移除），
-      // 后端缺省值即为 True。
+      // 只提交当前表单字段；桌面/浏览器时代的兼容字段已经删除。
       const payload: OrderFormPayload = { url, phone, password, excel, date, count: count === null ? '' : String(count), remember }
       const errors = await startOrder(payload)
       if (errors) setFields(errors)

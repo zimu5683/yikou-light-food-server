@@ -1,4 +1,4 @@
-"""``app.automation.parse_meal_rows`` 的回归锁。
+"""``app.order.runner.parse_meal_rows`` 的回归锁。
 
 它把订单表格里的「商品名 + 数量」解析成 ``MealInfo``：**总餐次、经济/豪华、份数**
 全靠它。解析错了会直接写错排单表的餐数与档次。纯数据、不碰网络，测试零风险。
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.automation import parse_meal_rows
+from app.order.runner import parse_meal_rows
 
 
 def _rows(*pairs):

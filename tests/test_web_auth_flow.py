@@ -20,9 +20,9 @@ import urllib.request
 
 import pytest
 
-from app.web_auth import (STATUS_APPROVED, STATUS_PENDING, AuthStore,
+from app.web.auth import (STATUS_APPROVED, STATUS_PENDING, AuthStore,
                           hash_password, verify_password)
-from app.web_server import SESSION_COOKIE, create_server
+from app.web.server import SESSION_COOKIE, create_server
 
 ADMIN = "2485890442@qq.com"
 ADMIN_PW = "Ldm681202"

@@ -34,8 +34,8 @@ import openpyxl
 from openpyxl.styles import PatternFill
 
 from app import wps_cloud as wc
-from app.config import default_wps_address_order
-from app.wps_cloud import apply_plan, build_plan, person_key
+from app.core.config import default_wps_address_order
+from app.wps.sync import apply_plan, build_plan, person_key
 
 FIXTURE_DEFAULT = Path("/home/zimu/文档/测试东湖中餐.xlsx")
 SHEET_TEST = "东湖中餐（试验田）"

@@ -27,9 +27,9 @@ from pathlib import Path
 
 import pytest
 
-from app import bridge as bridge_module
-from app.bridge import Bridge
-from app.wps_cloud import SyncLedger, WpsCloudError
+from app.api.bridge import Bridge
+from app.wps.sync import SyncLedger, WpsCloudError
+from app.api import bridge as bridge_module
 
 BRIDGE_TS = Path(__file__).resolve().parent.parent / "frontend" / "src" / "lib" / "bridge.ts"
 

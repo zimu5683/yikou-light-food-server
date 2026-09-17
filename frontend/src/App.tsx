@@ -22,7 +22,6 @@ import {
   CaptchaDialog,
   DecisionDialog,
   UpdateAvailableDialog,
-  UpdateProgressDialog,
 } from '@/components/dialogs'
 import { LogConsole } from '@/components/LogConsole'
 import { useLogSheetDrag } from '@/lib/useLogSheetDrag'
@@ -171,7 +170,6 @@ export default function App() {
       <DecisionDialog />
       <CaptchaDialog />
       <UpdateAvailableDialog />
-      <UpdateProgressDialog />
       <Toaster position="bottom-right" richColors closeButton />
     </div>
   )

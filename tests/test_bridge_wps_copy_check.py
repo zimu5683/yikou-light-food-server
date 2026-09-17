@@ -19,9 +19,9 @@ import time
 
 import pytest
 
-from app import bridge as bridge_module
-from app.bridge import Bridge
-from app.wps_cloud import WpsCloudError
+from app.api.bridge import Bridge
+from app.wps.sync import WpsCloudError
+from app.api import bridge as bridge_module
 
 # 云表读取的真实参数：worksheet_id=1, row 2..300, col 0..2。
 _EXPECTED_READ_ARGS = (1, 2, 300, 0, 2)

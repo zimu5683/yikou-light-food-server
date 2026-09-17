@@ -24,24 +24,17 @@ export interface LogRow extends LogEntry {
   id: number
 }
 
-export interface UpdateProgress {
-  stage: string
-  downloaded: number
-  total: number | null
-}
-
 export type FieldErrors = Record<string, { message: string } | undefined>
 
 export interface AppStateBundle {
   ready: boolean
   mocked: boolean
-  /** 实际传输方式：桌面 pywebview / 网页版 HTTP / 无后端的 mock。 */
+  /** 实际传输方式：网页版 HTTP / 无后端的 mock。 */
   transport: Transport
   /** 网页版令牌无效时的提示；非空时界面提示改用带令牌的完整网址。 */
   authError: string
   version: string
   status: StatusState
-  frozen: boolean
   /** 当前账号是否管理员；非管理员只看到基础功能（后端另有强制拦截）。 */
   isAdmin: boolean
   config: AppState['config'] | null
@@ -50,7 +43,6 @@ export interface AppStateBundle {
   decision: DecisionRequest | null
   captcha: CaptchaRequest | null
   addressInput: AddressInputRequest | null
-  updateProgress: UpdateProgress | null
   workerAlive: boolean
   mode: TaskMode
   setMode: (mode: TaskMode) => void
@@ -61,7 +53,6 @@ export interface AppStateBundle {
   newTemplate: (mode: 'order' | 'sss') => Promise<{ path: string; error: string }>
   clearPassword: (mode: 'order' | 'sss') => Promise<void>
   checkUpdates: (manual: boolean) => void
-  installUpdate: () => Promise<boolean>
   openExternal: (url: string) => void
   requestClose: () => void
   setSplitRatio: (ratio: number) => void

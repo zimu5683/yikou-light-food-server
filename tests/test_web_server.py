@@ -1,4 +1,4 @@
-"""Tests for app/web_server.py —— 网页版 HTTP 桥接服务。
+"""Tests for app/web/server.py —— 网页版 HTTP 桥接服务。
 
 覆盖：令牌鉴权（含拒绝路径）、桥接方法分发与参数语义、文件浏览器、
 静态资源与目录穿越防护、窗口适配层、以及不对外暴露的方法。
@@ -12,7 +12,7 @@ import urllib.request
 
 import pytest
 
-from app.web_server import (EXCEL_SUFFIXES, WebServerError, _WebWindow,
+from app.web.server import (EXCEL_SUFFIXES, WebServerError, _WebWindow,
                             create_server, lan_addresses, load_or_create_token)
 
 
@@ -22,7 +22,7 @@ def server(tmp_path, monkeypatch):
     dist = tmp_path / "dist"
     dist.mkdir()
     (dist / "index.html").write_text("<!doctype html><title>t</title>", encoding="utf-8")
-    monkeypatch.setattr("app.web_server.user_data_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr("app.web.server.user_data_dir", lambda: tmp_path / "cfg")
     httpd = create_server("127.0.0.1", 0, dist_dir=dist, token="secret",
                           config_path=tmp_path / "config.json")
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -95,7 +95,7 @@ def _request_status(server, method, path, body=None, token=None, follow=False):
 # 令牌
 # ----------------------------------------------------------------------
 def test_token_file_is_created_and_reused(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.web_server.user_data_dir", lambda: tmp_path)
+    monkeypatch.setattr("app.web.server.user_data_dir", lambda: tmp_path)
     first = load_or_create_token()
     assert first
     # 第二次读取同一个令牌，保证客户端收藏的网址长期有效。
@@ -104,7 +104,7 @@ def test_token_file_is_created_and_reused(tmp_path, monkeypatch):
 
 
 def test_rotate_token_replaces_existing(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.web_server.user_data_dir", lambda: tmp_path)
+    monkeypatch.setattr("app.web.server.user_data_dir", lambda: tmp_path)
     first = load_or_create_token()
     assert load_or_create_token(rotate=True) != first
 
@@ -184,7 +184,7 @@ def test_unknown_method_returns_404(server):
     assert body["code"] == "unknown_method"
 
 
-@pytest.mark.parametrize("name", ["_run_order", "_emit_event", "attach", "on_native_closing"])
+@pytest.mark.parametrize("name", ["_run_order", "_emit_event", "attach"])
 def test_private_and_non_http_methods_are_not_exposed(server, name):
     status, _ = _request(server, "POST", f"/api/{name}", [])
     assert status == 404
@@ -292,24 +292,12 @@ def test_web_window_destroy_triggers_callback_once():
     assert calls == [1]
 
 
-def test_web_window_file_dialog_returns_empty_selection():
-    # 网页版没有原生对话框；空选择让 Bridge.choose_excel 走提示分支。
-    assert _WebWindow().create_file_dialog(None, allow_multiple=False) == ()
-
-
-def test_web_window_window_actions_are_noops():
-    window = _WebWindow()
-    assert window.minimize() is None
-    assert window.restore() is None
-    assert window.maximize() is None
-
-
 def test_destroy_callback_shuts_the_server_down(tmp_path, monkeypatch):
     """request_close 走到窗口 destroy 时应当关闭服务（对应网页版「停止服务」）。"""
     dist = tmp_path / "dist"
     dist.mkdir()
     (dist / "index.html").write_text("<!doctype html>", encoding="utf-8")
-    monkeypatch.setattr("app.web_server.user_data_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr("app.web.server.user_data_dir", lambda: tmp_path / "cfg")
     stopped = threading.Event()
     httpd = create_server("127.0.0.1", 0, dist_dir=dist, token="secret",
                           on_destroy=stopped.set, config_path=tmp_path / "config.json")
@@ -340,7 +328,7 @@ def test_lan_addresses_never_include_loopback():
 
 
 def test_lan_addresses_rank_ethernet_before_vpn(monkeypatch):
-    monkeypatch.setattr("app.web_server._interface_addresses",
+    monkeypatch.setattr("app.web.server._interface_addresses",
                         lambda: [("tun0", "172.19.0.1"), ("wlan0", "10.0.0.5")])
     # WiFi 必须排在 VPN 前面：VPN 地址其它设备根本连不上。
     assert [name for name, _ in lan_addresses()] == ["wlan0", "tun0"]

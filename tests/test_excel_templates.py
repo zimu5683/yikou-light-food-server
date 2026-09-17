@@ -1,11 +1,11 @@
-"""Tests for the Excel template generators (app.excel_templates)."""
+"""Tests for the Excel template generators (app.order.templates)."""
 from __future__ import annotations
 
 from pathlib import Path
 
 from openpyxl import load_workbook
 
-from app.excel_templates import write_order_template, write_sss_template
+from app.order.templates import write_order_template, write_sss_template
 
 ORDER_SHEETS = (
     "东湖中餐", "衣锦中餐", "医学院中餐",

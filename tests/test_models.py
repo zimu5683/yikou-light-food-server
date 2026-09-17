@@ -1,5 +1,5 @@
-from app.models import MealInfo, OrderInfo
-from app.config import AppConfig
+from app.core.models import MealInfo, OrderInfo
+from app.core.config import AppConfig
 
 
 def test_meal_info_to_dict_is_serialisable():
@@ -25,7 +25,7 @@ def test_order_info_to_dict_serialises_nested_meals():
 
 
 def test_save_workbook_retries_after_locked_file():
-    from app.automation import _save_workbook_with_retry
+    from app.order.runner import _save_workbook_with_retry
 
     class LockedWorkbook:
         def __init__(self):
@@ -42,7 +42,7 @@ def test_save_workbook_retries_after_locked_file():
 
 
 def test_order_log_contains_order_details():
-    from app.automation import _format_order_meals, _format_order_summary
+    from app.order.runner import _format_order_meals, _format_order_summary
 
     order = OrderInfo(
         order_no="W8",
@@ -54,7 +54,7 @@ def test_order_log_contains_order_details():
 
 
 def test_order_log_shows_platform_address_to_point_arrow():
-    from app.automation import _format_order_summary
+    from app.order.runner import _format_order_summary
 
     order = OrderInfo(
         order_no="W8",
@@ -68,7 +68,7 @@ def test_order_log_shows_platform_address_to_point_arrow():
 
 
 def test_order_log_address_unchanged_has_no_arrow():
-    from app.automation import _format_order_summary
+    from app.order.runner import _format_order_summary
 
     order = OrderInfo(
         order_no="W8",
@@ -83,7 +83,7 @@ def test_order_log_address_unchanged_has_no_arrow():
 
 
 def test_order_address_normalization_uses_latest_point_names():
-    from app.automation import _format_order_summary, _prepare_order_address
+    from app.order.runner import _format_order_summary, _prepare_order_address
 
     cases = [
         ("浙江省杭州市临安区浙江农林大学(东湖校区) 小西门", "小"),
@@ -118,7 +118,7 @@ def test_config_persists_order_date(tmp_path):
 
 
 def test_config_persists_order_count(tmp_path):
-    from app.config import AppConfig
+    from app.core.config import AppConfig
 
     path = tmp_path / "config.json"
     AppConfig(order_count=6).save(path)
@@ -146,7 +146,7 @@ def test_sss_transport_defaults_persist(tmp_path):
 
 def test_bridge_save_order_config_preserves_sss_side(tmp_path):
     """就地保存订单侧配置时，闪时送侧既有字段不被重置成默认。"""
-    from app.bridge import Bridge
+    from app.api.bridge import Bridge
 
     path = tmp_path / "config.json"
     bridge = Bridge(config_path=str(path), is_admin=True)
@@ -160,7 +160,6 @@ def test_bridge_save_order_config_preserves_sss_side(tmp_path):
         "excel": str(tmp_path / "排单.xlsx"),
         "date": "2026-09-07",
         "count": 6,
-        "api_mode": True,
     })
     assert result["ok"] is True
     loaded = AppConfig.load(path)
@@ -173,7 +172,7 @@ def test_bridge_save_order_config_preserves_sss_side(tmp_path):
 
 def test_bridge_save_sss_config_preserves_order_side(tmp_path):
     """就地保存闪时送侧配置时，订单侧既有字段不被重置成默认。"""
-    from app.bridge import Bridge
+    from app.api.bridge import Bridge
 
     path = tmp_path / "config.json"
     bridge = Bridge(config_path=str(path), is_admin=True)
@@ -199,7 +198,7 @@ def test_bridge_save_sss_config_preserves_order_side(tmp_path):
 
 
 def test_bridge_reports_stopped_sss_task_as_reconciled(tmp_path, monkeypatch):
-    import app.bridge as bridge_mod
+    import app.api.bridge as bridge_mod
 
     bridge = bridge_mod.Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
     captured = {}
@@ -213,7 +212,7 @@ def test_bridge_reports_stopped_sss_task_as_reconciled(tmp_path, monkeypatch):
 
 
 def test_bridge_reports_partial_sss_task_without_success_state(tmp_path, monkeypatch):
-    import app.bridge as bridge_mod
+    import app.api.bridge as bridge_mod
 
     bridge = bridge_mod.Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
     monkeypatch.setattr(bridge_mod, "run_sss_job", lambda *args, **kwargs: {
@@ -230,7 +229,7 @@ def test_bridge_reports_partial_sss_task_without_success_state(tmp_path, monkeyp
 
 
 def test_bridge_start_sss_preserves_store_cache_written_by_worker(tmp_path, monkeypatch):
-    from app.bridge import Bridge
+    from app.api.bridge import Bridge
 
     path = tmp_path / "config.json"
     workbook = tmp_path / "闪时送.xlsx"
@@ -254,7 +253,6 @@ def test_bridge_start_sss_preserves_store_cache_written_by_worker(tmp_path, monk
         "fixed_address_detail": "浙江农林大学东湖校区",
         "remember": False,
         "dry_run": True,
-        "api_mode": True,
     })
     assert result["ok"] is True
     loaded = AppConfig.load(path)
@@ -263,7 +261,7 @@ def test_bridge_start_sss_preserves_store_cache_written_by_worker(tmp_path, monk
 
 
 def test_xlsm_workbook_is_loaded_with_vba_preserved(tmp_path):
-    from app.automation import _load_order_workbook
+    from app.order.runner import _load_order_workbook
 
     calls = []
     workbook = object()
@@ -278,7 +276,7 @@ def test_xlsm_workbook_is_loaded_with_vba_preserved(tmp_path):
 
 
 def test_malformed_config_is_backed_up_before_reset(tmp_path):
-    from app.config import AppConfig
+    from app.core.config import AppConfig
 
     target = tmp_path / "config.json"
     target.write_text("{broken", encoding="utf-8")
@@ -293,7 +291,7 @@ def test_malformed_config_is_backed_up_before_reset(tmp_path):
 
 def test_config_save_merges_untouched_fields_after_concurrent_write(tmp_path):
     """两个实例并发保存时，未修改字段应保留磁盘上的新值。"""
-    from app.config import AppConfig
+    from app.core.config import AppConfig
 
     path = tmp_path / "config.json"
     AppConfig(order_date="2026-09-01").save(path)
@@ -311,7 +309,7 @@ def test_config_save_merges_untouched_fields_after_concurrent_write(tmp_path):
 
 
 def test_config_save_uses_atomic_backup(tmp_path):
-    from app.config import AppConfig
+    from app.core.config import AppConfig
 
     path = tmp_path / "config.json"
     AppConfig(order_date="2026-09-01").save(path)
@@ -324,7 +322,7 @@ def test_config_save_uses_atomic_backup(tmp_path):
 
 
 def test_bridge_reports_reconciliation_failure_as_uncertain(tmp_path, monkeypatch):
-    import app.bridge as bridge_mod
+    import app.api.bridge as bridge_mod
 
     bridge = bridge_mod.Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
     monkeypatch.setattr(bridge_mod, "run_sss_job", lambda *args, **kwargs: {

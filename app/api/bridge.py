@@ -1,9 +1,8 @@
 """业务逻辑与网页前端之间的桥接层（HTTP + 事件推送）。
 
-职责边界：本模块只做「UI 协议」，业务规则全部留在原模块
-（automation/sss/processing/release_check/credentials/config）。旧 Tkinter 界面
-（app/gui.py）里的每一条用户交互在这里都有对应实现，迁移对照表见
-tests 与 README。
+职责边界：本模块只做「应用 API / UI 协议」，业务规则全部留在领域模块
+（``app.order`` / ``app.ordering`` / ``app.wps`` / ``app.core``）。
+服务端不依赖任何桌面窗口框架，文件选择由 ``app.web`` 的文件浏览器完成。
 
 事件协议（Python → JS，经 ``drain_events(last_sequence, ack_sequence)``）：
 每条事件都是 ``{event, payload, event_id, sequence, created_at, timestamp, droppable}``；
@@ -13,13 +12,9 @@ sequence 中间缺口和关键事件超限都会返回 ``events:dropped`` 告警
 - status             {state}                   ready/running/stopping/success/partial/stopped/error/updating
 - task:done          {message, stopped, partial}
 - task:error         {message}
-- update:available   {tag, current, body, can_auto_install}
+- update:available   {tag, current, body, html_url}
 - update:latest      {manual}
 - update:error       {message}
-- update:progress    {downloaded, total}
-- update:stage       {stage}
-- update:install_error {message}
-- update:installed   {message}
 - decision           {id, kind, title, message, choices}
 - captcha            {id, image}
 - address_input      {id, title, message, items[{raw_address, order_numbers,
@@ -33,7 +28,6 @@ import datetime as _dt
 import json
 import os
 import secrets
-import sys
 import threading
 import time
 import logging
@@ -44,16 +38,16 @@ from dataclasses import dataclass, field
 from pathlib import Path as _Path
 from typing import Any
 
-from . import __version__
-from .automation import parse_target_date, run_job
-from .config import AppConfig, clamp_split_ratio, default_wps_address_order
-from .credentials import (delete_password, delete_sss_password, get_password,
+from app import __version__
+from app.order.runner import parse_target_date, run_job
+from app.core.config import AppConfig, clamp_split_ratio, default_wps_address_order
+from app.core.credentials import (delete_password, delete_sss_password, get_password,
                           get_sss_password, set_password, set_sss_password)
-from .excel_templates import write_order_template, write_sss_template
-from .sss import expected_delivery_date, run_sss_job
-from .sss_import import ImportRefused, prepare_day_orders
-from .release_check import ReleaseCheckError, check_for_update
-from .wps_cloud import (KdocsCli, SyncLedger, WpsCloudError, apply_plan,
+from app.order.templates import write_order_template, write_sss_template
+from app.ordering.sss import expected_delivery_date, run_sss_job
+from app.ordering.cloud_import import ImportRefused, prepare_day_orders
+from app.core.update import ReleaseCheckError, check_for_update
+from app.wps.sync import (KdocsCli, SyncLedger, WpsCloudError, apply_plan,
                         build_plan, effective_tables, format_plan,
                         read_local_orders, summarize_plan, target_date_for)
 
@@ -72,7 +66,7 @@ EVENT_DRAIN_LIMIT = 500
 EVENT_ACK_RETAIN = 0
 # 关键事件不参与普通淘汰，但必须有上限，否则前端长期不轮询会无限增长。
 CRITICAL_EVENT_LIMIT = 500
-DROPPABLE_EVENTS = frozenset({"log", "update:progress", "update:stage"})
+DROPPABLE_EVENTS = frozenset({"log"})
 # 交互请求（decision/captcha）等待上限；到点后 worker 必须能退出，而不是永久阻塞。
 DEFAULT_INTERACTION_TIMEOUT_S = 300.0
 
@@ -86,7 +80,7 @@ DEFAULT_INTERACTION_TIMEOUT_S = 300.0
 # ``_TRANSIENT_HINTS`` 并不包含限流提示，`_run` 不会重试它 —— 一旦突发触发，
 # 该表就会从「已核对」变成「读不了」，属于可观测的行为偏差。取 2 只把瞬时速率
 # 翻倍（串行约 5 次/秒 → 并发约 10 次/秒），在明显提速与不制造突发之间取平衡；
-# 这也是项目里最保守的既有取值（app/sss.py 的验证码/登录轮询同样用 2）。
+# 这也是项目里最保守的既有取值（app/ordering/sss.py 的验证码/登录轮询同样用 2）。
 WPS_COPY_CHECK_WORKERS = 2
 
 RETRY_CHOICES = [{"value": "retry", "label": "重试", "style": "primary"},
@@ -155,7 +149,10 @@ class Bridge:
     # 普通日志/进度会被丢弃，并通过 ``events:dropped`` 明确告警。
     # ------------------------------------------------------------------
     def attach(self, window: Any) -> None:
-        """把 pywebview 窗口对象交给桥接层，供窗口动作与关闭流程使用。"""
+        """挂接服务端运行时的窗口适配层（``destroy`` 用于停止服务）。
+
+        网页版这里收到的是 :class:`app.web.server._WebWindow`，不是原生窗口。
+        """
         self._window = window
 
     @staticmethod
@@ -326,7 +323,7 @@ class Bridge:
     # js_api：前端握手与初始状态
     # ------------------------------------------------------------------
     def echo_test(self, message: str = "", payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        """带参调用诊断：验证 pywebview 6 GTK 的 js_api 参数序列化是否正常。"""
+        """带参调用诊断：验证 API 层 JSON 参数序列化是否正常。"""
         return {"echo": message, "payload_keys": sorted(payload.keys()) if isinstance(payload, dict) else None}
 
     #: 非管理员不可见（但任务仍按这些值运行）的配置字段。
@@ -373,7 +370,6 @@ class Bridge:
         forced["excel"] = str(config.excel_path) if config.excel_path else ""
         forced["password"] = (get_password(config.phone_number) or "") if config.phone_number else ""
         forced["remember"] = False
-        forced.pop("api_mode", None)
         return forced
 
     def _forced_sss_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -389,7 +385,6 @@ class Bridge:
         forced["excel"] = str(config.sss_excel_path) if config.sss_excel_path else ""
         forced["password"] = (get_sss_password(config.sss_account) or "") if config.sss_account else ""
         forced["remember"] = False
-        forced.pop("api_mode", None)
         for key in ("use_fixed_address", "fixed_lnt", "fixed_lat",
                     "fixed_area_code", "fixed_address_detail", "common_address"):
             forced.pop(key, None)
@@ -401,7 +396,6 @@ class Bridge:
         state: dict[str, Any] = {
             "version": __version__,
             "status": self._status,
-            "frozen": bool(getattr(sys, "frozen", False)),
             # 前端据此识别 Python 进程重启，避免旧 cursor 与新的 sequence 冲突。
             "event_producer_id": self._event_producer_id,
             #: 前端据此决定显示哪些表单字段。真正的拦截在后端（见 _ADMIN_ONLY_CONFIG
@@ -428,7 +422,6 @@ class Bridge:
                 "sss_dry_run": config.sss_dry_run,
                 "sss_preflight": config.sss_preflight,
                 "sss_idempotency_field": config.sss_idempotency_field,
-                "api_mode": config.api_mode,
                 "wps_enabled": config.wps_enabled,
                 "wps_test_mode": config.wps_test_mode,
                 "wps_test_file_id": config.wps_test_file_id,
@@ -504,8 +497,8 @@ class Bridge:
         # 就地更新已加载配置并保存，避免用「全默认值新对象」覆盖另一半模式
         # （跑一次订单任务就把闪时送配置重置成默认值的同源问题）。
         _apply_order_payload(self._config, {
-            "url": url, "phone": phone, "excel": excel, "date": date_text,
-            "count": count, "api_mode": bool(payload.get("api_mode", True)),
+            "url": url, "phone": phone, "excel": excel,
+            "date": date_text, "count": count,
         })
         self._config.save()
         if payload.get("remember", True):
@@ -578,7 +571,6 @@ class Bridge:
             # dry_run：只组装并打印下单报文，不真实提交（联调/验收用）。
             "dry_run": bool(payload.get("dry_run", self._config.sss_dry_run)),
             "preflight": bool(payload.get("preflight", self._config.sss_preflight)),
-            "api_mode": bool(payload.get("api_mode", True)),
         })
         self._merge_sss_store_cache_from_disk()
         self._config.save()
@@ -936,47 +928,29 @@ class Bridge:
     # js_api：文件对话框与模板
     # ------------------------------------------------------------------
     def choose_excel(self, mode: str = "order", path: str = "") -> dict[str, Any]:
-        """弹出文件选择框，返回 ``{"path": ..., "error": ...}``。
+        """校验服务端文件浏览器选中的 Excel 路径。
 
-        ``error`` 由 :func:`_excel_field_error` 给出（空路径 / 文件不存在 / 后缀不是
-        ``.xlsx``/``.xlsm``）。注意：只接受对话框返回 ``list``/``tuple`` 的情形。
-
-        传入 ``path`` 时跳过系统对话框，直接校验该路径——网页版由浏览器端文件
-        浏览器选好路径后回填（WebView/pywebview 没有原生对话框可用），桌面端不传
-        该参数，行为与以前完全一致。
+        网页版没有原生文件对话框：``path`` 必填，由前端调用
+        ``GET /api/fs/list`` 浏览服务器文件系统后回填。返回
+        ``{"path": ..., "error": ...}``，``error`` 由 :func:`_excel_field_error`
+        给出（空路径 / 文件不存在 / 后缀不是 ``.xlsx``/``.xlsm``）。
         """
-        if not str(path or "").strip():
-            import webview
-
-            result = self._window.create_file_dialog(
-                webview.OPEN_DIALOG, allow_multiple=False, file_types=FILE_DIALOG_FILTERS)
-            path = result[0] if isinstance(result, (list, tuple)) and result else ""
-        else:
-            path = str(path).strip()
+        path = str(path or "").strip()
+        if not path:
+            return {"path": "", "error": "请通过服务器端文件浏览器选择 Excel 文件"}
         error = _excel_field_error(path)
         return {"path": path, "error": error}
 
     def new_template(self, mode: str = "order", path: str = "") -> dict[str, Any]:
-        """弹出保存框并生成空白模板（``mode="order"`` 生成排单表，否则生成闪时送表）。
+        """在服务端目录生成空白模板（``mode="order"`` 排单表，否则闪时送表）。
 
-        用户取消时返回 ``{"path": "", "error": ""}``（**不算错误**）；没有 Excel 后缀会
-        自动补 ``.xlsx``；写盘失败返回 ``{"path": "", "error": "无法写入模板文件：…"}``。
-
-        传入 ``path`` 时跳过系统对话框，直接写到该路径——网页版由服务器的文件浏览器
-        给出手机上的落盘位置（客户端的文件系统不是运行任务的那台机器），桌面端不传该
-        参数，行为与以前完全一致。
+        ``path`` 必填，由前端服务器端文件浏览器选好落盘位置（客户端自己的文件系统
+        不是运行任务的那台机器）。没有 Excel 后缀会自动补 ``.xlsx``；写盘失败返回
+        ``{"path": "", "error": "无法写入模板文件：…"}``。
         """
-        save_name = "排单.xlsx" if mode == "order" else "闪时送.xlsx"
-        if str(path or "").strip():
-            path = str(path).strip()
-        else:
-            import webview
-
-            result = self._window.create_file_dialog(
-                webview.SAVE_DIALOG, file_types=FILE_DIALOG_FILTERS, save_filename=save_name)
-            path = result if isinstance(result, str) else (result[0] if isinstance(result, (list, tuple)) and result else "")
+        path = str(path or "").strip()
         if not path:
-            return {"path": "", "error": ""}
+            return {"path": "", "error": "请通过服务器端文件浏览器选择保存位置"}
         dest = _with_excel_suffix(_Path(path))
         try:
             if mode == "order":
@@ -1018,20 +992,20 @@ class Bridge:
         if "test_drive_id" in payload:
             cfg.wps_test_drive_id = str(payload.get("test_drive_id") or "").strip()
         if "test_tables" in payload:
-            from .config import normalize_wps_test_tables
+            from app.core.config import normalize_wps_test_tables
             cfg.wps_test_tables = normalize_wps_test_tables(payload.get("test_tables"))
         if "marker_enabled" in payload:
             cfg.wps_marker_enabled = bool(payload.get("marker_enabled"))
         if "sort_enabled" in payload:
             cfg.wps_sort_enabled = bool(payload.get("sort_enabled"))
         if "address_order" in payload:
-            from .config import normalize_wps_address_order
+            from app.core.config import normalize_wps_address_order
             # 以**当前配置**为底：界面只回传部分子表时，没提到的子表保持原样。
             # （原实现以出厂默认为底，会把用户自定义的表 ID/地址顺序静默重置。）
             cfg.wps_address_order = normalize_wps_address_order(
                 payload.get("address_order"), base=cfg.wps_address_order)
         if "tables" in payload:
-            from .config import normalize_wps_tables
+            from app.core.config import normalize_wps_tables
             cfg.wps_tables = normalize_wps_tables(
                 payload.get("tables"), base=cfg.wps_tables)
         try:
@@ -1045,7 +1019,7 @@ class Bridge:
         backup = self._config.wps_production_tables or {}
         if not backup:
             return {"ok": False, "reason": "没有保存正式表备份"}
-        from .config import normalize_wps_tables
+        from app.core.config import normalize_wps_tables
         self._config.wps_tables = normalize_wps_tables(backup, base=backup)
         try:
             self._config.save()
@@ -1088,7 +1062,7 @@ class Bridge:
 
         target = target_date_for(start_hour=cfg.wps_target_hour_start,
                                  end_hour=cfg.wps_target_hour_end)
-        from .wps_cloud import weekday_number
+        from app.wps.sync import weekday_number
         status["target_date"] = target.isoformat()
         # 通讯记号写的是**运行日**的周几（实测目标表：周四晚跑记 5、周五晚跑记 6）
         status["weekday_number"] = weekday_number(_dt.date.today())
@@ -1415,13 +1389,11 @@ class Bridge:
         try:
             release = check_for_update()
             if release:
-                # can_auto_install 恒为 False：本项目只跑网页版（源码运行），
-                # 没有可替换的打包产物，前端据此不显示「立即安装」按钮。
                 self._emit_event("update:available", {
                     "tag": release.tag_name,
                     "current": __version__,
                     "body": release.body or "（暂无更新说明）",
-                    "can_auto_install": False,
+                    "html_url": release.release_url,
                 })
             elif manual:
                 self._set_status("ready")
@@ -1434,22 +1406,6 @@ class Bridge:
             self._emit_event("update:error", {"message": str(exc)})
         finally:
             self._update_checking = False
-
-    def install_update(self) -> dict[str, Any]:
-        """网页版不支持就地自动安装（保留方法签名以兼容前端契约）。
-
-        原实现会下载新版 .exe、校验签名、替换二进制并重启进程 —— 那是 Windows
-        打包版的路径，网页版（源码运行在 Termux）不适用。前端只在 ``frozen`` 时
-        才显示「立即安装」按钮，所以这个分支在实际部署里不会被点到。
-
-        升级方式：``cd ~/yikou-light-food-server && git pull && sv restart yikou-light-food``
-        """
-        return {
-            "ok": False,
-            "reason": "web_mode",
-            "message": "网页版请用 git pull 更新，然后 sv restart yikou-light-food",
-            "release_url": "https://github.com/zimu5683/yikou-light-food-desktop/releases",
-        }
 
     def open_external(self, url: str) -> dict[str, Any]:
         """用系统默认程序打开外链。
@@ -1484,31 +1440,8 @@ class Bridge:
     # ------------------------------------------------------------------
     # js_api：窗口动作与关闭保护
     # ------------------------------------------------------------------
-    def window_action(self, action: str) -> dict[str, Any]:
-        """标题栏按钮动作：``minimize`` / ``toggle_maximize`` / ``close``。
-
-        ``toggle_maximize`` 靠 ``_maximized`` 自己记状态（pywebview 没有「是否最大化」查询），
-        在 maximize 与 restore 之间交替；``close`` 转交 :meth:`request_close`。
-        没有窗口时返回 ``{"ok": False}``。
-        """
-        if self._window is None:
-            return {"ok": False}
-        if action == "minimize":
-            self._window.minimize()
-        elif action == "toggle_maximize":
-            # pywebview 无「最大化/还原」状态查询；maximize 与 restore 成对调用。
-            if getattr(self, "_maximized", False):
-                self._window.restore()
-                self._maximized = False
-            else:
-                self._window.maximize()
-                self._maximized = True
-        elif action == "close":
-            return self.request_close()
-        return {"ok": True}
-
     def request_close(self) -> dict[str, Any]:
-        """标题栏 ✕ / Alt+F4 共用的关闭入口，带任务运行保护。"""
+        """「停止服务」入口：有任务运行时先确认，空闲时关闭服务进程。"""
         if self.worker_alive():
             # 先唤醒 captcha/普通 decision，避免它们继续阻塞 worker；保留
             # close_confirm 自身，防止重复点击关闭时自唤醒。
@@ -1531,7 +1464,7 @@ class Bridge:
         self._closing = True
         self._stop_event.set()
         self._cancel_pending_interactions("停止并关闭")
-        self.log("正在停止并清理浏览器，请稍候...")
+        self.log("正在停止任务并关闭服务，请稍候...")
         def watcher() -> None:
             while self._worker is not None and self._worker.is_alive():
                 time.sleep(0.1)
@@ -1541,16 +1474,6 @@ class Bridge:
             except Exception:
                 pass
         threading.Thread(target=watcher, daemon=True).start()
-
-    def on_native_closing(self) -> bool:
-        """pywebview closing 事件回调：返回 False 取消默认关闭。"""
-        if self._closing or not self.worker_alive():
-            return True
-        # 原生关闭时 JS 可能已不可用；先取消等待中的交互，避免 worker 永久
-        # 阻塞在 captcha/decision 上，再由 request_close 的有限等待收尾。
-        self._cancel_pending_interactions("原生窗口关闭", except_kinds=frozenset({"close_confirm"}))
-        threading.Thread(target=self.request_close, daemon=True).start()
-        return False
 
     def _destroy_soon(self) -> None:
         # 让 request_close 的返回值先送达前端再销毁窗口。
@@ -1575,7 +1498,7 @@ class Bridge:
 # 模块级工具
 # ----------------------------------------------------------------------
 def _excel_field_error(path: str) -> str:
-    """与旧 GUI 的 Excel 字段校验完全一致：存在 + 后缀。空路径视为「未选择」。"""
+    """Excel 字段校验：路径非空、文件存在、后缀为 .xlsx/.xlsm。"""
     if not path:
         return "请选择存在的 Excel 文件"
     candidate = _Path(path)
@@ -1602,7 +1525,6 @@ def _apply_order_payload(cfg: AppConfig, p: dict[str, Any]) -> None:
     cfg.order_date = str(p.get("date", cfg.order_date) or "").strip()
     if "count" in p:
         cfg.order_count = p["count"]  # None 表示「处理全部」，其余为 int|None
-    cfg.api_mode = bool(p.get("api_mode", cfg.api_mode))
 
 
 def _apply_sss_payload(cfg: AppConfig, p: dict[str, Any]) -> None:
@@ -1636,4 +1558,3 @@ def _apply_sss_payload(cfg: AppConfig, p: dict[str, Any]) -> None:
         cfg.sss_fixed_address_detail = str(p.get("fixed_address_detail", cfg.sss_fixed_address_detail) or "").strip()
     cfg.sss_dry_run = bool(p.get("dry_run", cfg.sss_dry_run))
     cfg.sss_preflight = bool(p.get("preflight", cfg.sss_preflight))
-    cfg.api_mode = bool(p.get("api_mode", cfg.api_mode))

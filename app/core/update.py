@@ -2,14 +2,8 @@
 
 为什么单独一个模块
 ------------------
-原来这里有一整套 ``app/updater.py``（约 1700 行）负责**自动下载并安装**新版：
-解析签名清单、校验 Ed25519 签名、差分补丁（``bspatch``）、替换二进制并重启。
-那套东西只对 **Windows 打包版（.exe）** 有意义 —— 它认的资产是
-``yikou-light-food.exe`` 和 Authenticode 发布者签名，而本项目现在只跑网页版
-（源码方式运行在 Termux 上），那条链路永远不会被走到。
-
-网页版真正需要的只是「有新版本时提示一下」。所以这里保留检查、去掉安装：
-查 GitHub Release 的 tag，与 ``__version__`` 比较，仅此而已。
+本项目只做一件事：查 GitHub Release 的 tag，与 ``__version__`` 比较，
+在界面上提示「有新版本」。
 
 **明确不做的**：不下载、不校验签名、不替换文件、不重启进程。
 要在手机上升级，方式是对着仓库 ``git pull`` 后 ``sv restart yikou-light-food``。
@@ -18,15 +12,15 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from . import __version__
+from app import __version__
 
 #: 发布仓库。与 README / git remote 保持一致。
-REPOSITORY = "zimu5683/yikou-light-food-desktop"
+REPOSITORY = "zimu5683/yikou-light-food-server"
 RELEASES_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 
 #: 版本号必须形如 3.5.0（允许 v 前缀）。非 SemVer 一律拒绝比较，避免误判。
@@ -45,7 +39,6 @@ class ReleaseInfo:
     name: str = ""
     body: str = ""
     html_url: str = ""
-    assets: tuple[dict[str, Any], ...] = field(default_factory=tuple)
 
     @property
     def version(self) -> str:
@@ -104,7 +97,6 @@ def fetch_latest_release(*, timeout: float = 10.0) -> ReleaseInfo:
         name=str(payload.get("name") or ""),
         body=str(payload.get("body") or ""),
         html_url=str(payload.get("html_url") or ""),
-        assets=tuple(payload.get("assets") or []),
     )
 
 
