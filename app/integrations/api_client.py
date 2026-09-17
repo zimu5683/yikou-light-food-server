@@ -76,16 +76,31 @@ def origin_from_url(url: str) -> str:
 
 
 def _browser_headers(origin: str, *, admin: bool = True) -> dict[str, str]:
-    """构造能通过管理后台 WAF 的浏览器特征请求头。"""
+    """构造能通过管理后台 WAF 的浏览器特征请求头。
+
+    2026-09 实测：阿里云 ESA 的 ``http_bot_simple`` 会在缺少浏览器指纹时直接
+    返回 403。这里补齐 UA / Sec-Fetch / sec-ch-ua 等头，并在登录前先访问
+    ``/admin/`` 拿 ``acw_tc`` cookie，尽量贴近真实浏览器首访行为。
+    """
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Linux; Android 15; Pixel 9 Build/AP3A.240905.015) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 "
+            "Mobile Safari/537.36"
         ),
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
         "Origin": origin,
         "X-Requested-With": "XMLHttpRequest",
+        "Connection": "keep-alive",
+        "sec-ch-ua": '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"',
+        "sec-ch-ua-mobile": "?1",
+        "sec-ch-ua-platform": '"Android"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "Priority": "u=1, i",
     }
     headers["Referer"] = (origin + "/admin/") if admin else (origin + "/takeout")
     return headers
@@ -137,19 +152,50 @@ class AdminApiClient:
         self.token = ""
         self.uniacid = ""
 
-    def login(self) -> None:
-        """账号密码登录，保存 token 与 uniacid。"""
+    def _warm_up_waf(self) -> None:
+        """先访问一次管理后台页面，让 WAF 下发 ``acw_tc`` 等会话 cookie。"""
         try:
-            resp = self.session.post(
-                self.origin + "/channel/login",
-                json={"username": self.username, "password": self.password, "remember": False},
-                timeout=self.timeout,
-            )
+            self.session.get(self.origin + "/admin/", timeout=self.timeout,
+                             allow_redirects=True)
+        except requests.RequestException:
+            # 预热失败不直接报错，后续 POST 可能仍然能成功；错误在 POST 阶段统一处理。
+            pass
+
+    def _post_login(self):
+        return self.session.post(
+            self.origin + "/channel/login",
+            json={"username": self.username, "password": self.password, "remember": False},
+            timeout=self.timeout,
+        )
+
+    def login(self) -> None:
+        """账号密码登录，保存 token 与 uniacid。
+
+        遇到 WAF 403 时，先清掉旧 cookie 重新访问站点，再换新会话重试一次；
+        这是浏览器首访会自动完成的行为，纯 requests 客户端需要显式模拟。
+        """
+        self._warm_up_waf()
+        try:
+            resp = self._post_login()
         except requests.RequestException as exc:
             raise ApiError(f"管理后台登录请求失败：{exc}") from exc
 
         if resp.status_code == 403:
-            raise ApiError("管理后台拒绝了纯接口登录（HTTP 403），请改用浏览器备用模式")
+            # 403 大概率是 http_bot_simple：换全新 Session + 重新预热再试一次。
+            self.session.close()
+            self.session = requests.Session()
+            self.session.headers.update(_browser_headers(self.origin, admin=True))
+            self._warm_up_waf()
+            try:
+                resp = self._post_login()
+            except requests.RequestException as exc:
+                raise ApiError(f"管理后台登录请求失败：{exc}") from exc
+
+        if resp.status_code == 403:
+            raise ApiError(
+                "管理后台 WAF 拒绝了登录（HTTP 403，Denied by http_bot_simple）。"
+                "已自动按浏览器特征重试一次；请关闭 VPN/代理后重试，或稍后再试。"
+            )
 
         try:
             payload = resp.json()

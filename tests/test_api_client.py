@@ -12,8 +12,10 @@ from __future__ import annotations
 import pytest
 
 from app.integrations.api_client import (AUTH_ERROR_CODES, AUTH_MESSAGE_KEYWORDS,
+                            AdminApiClient, ApiError, _browser_headers,
                             auth_error_message, is_auth_expired_payload,
                             origin_from_url)
+from app.integrations import api_client as api_client_module
 
 
 # ----------------------------------------------------------------------
@@ -125,3 +127,100 @@ def test_origin_from_url_rejects_urls_without_scheme_or_host(url):
 def test_origin_from_url_error_message_quotes_the_input():
     with pytest.raises(ValueError, match="无法从网址提取源"):
         origin_from_url("m.icall.me/x")
+
+
+# ----------------------------------------------------------------------
+# 管理后台 WAF 兼容：登录前预热 + 403 换新会话重试
+# ----------------------------------------------------------------------
+class _FakeResponse:
+    def __init__(self, status_code: int, payload=None, text: str = "") -> None:
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("not json")
+        return self._payload
+
+
+class _FakeSession:
+    """记录 GET/POST 顺序的最小 requests.Session 替身。"""
+
+    instances: list["_FakeSession"] = []
+    post_statuses: list[int] = []
+
+    def __init__(self) -> None:
+        self.headers: dict[str, str] = {}
+        self.calls: list[tuple[str, str]] = []
+        self.closed = False
+        _FakeSession.instances.append(self)
+
+    def get(self, url, **kwargs):
+        self.calls.append(("GET", url))
+        return _FakeResponse(200, {"ok": True})
+
+    def post(self, url, **kwargs):
+        self.calls.append(("POST", url))
+        status = _FakeSession.post_statuses.pop(0) if _FakeSession.post_statuses else 200
+        if status == 403:
+            return _FakeResponse(403, None, "Denied by http_bot_simple")
+        return _FakeResponse(200, {"code": 200, "data": {"token": "t", "uniacid": "u"}})
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_browser_headers_include_waf_fingerprint():
+    headers = _browser_headers("https://m.icall.me", admin=True)
+    assert "Mozilla/5.0" in headers["User-Agent"]
+    assert headers["Origin"] == "https://m.icall.me"
+    assert headers["Referer"] == "https://m.icall.me/admin/"
+    assert headers["X-Requested-With"] == "XMLHttpRequest"
+    assert headers["Sec-Fetch-Mode"] == "cors"
+
+
+def test_admin_login_warms_waf_before_post(monkeypatch):
+    _FakeSession.instances = []
+    _FakeSession.post_statuses = []
+    monkeypatch.setattr(api_client_module.requests, "Session", _FakeSession)
+
+    client = AdminApiClient("https://m.icall.me/admin/#/login", "u", "p", timeout=5)
+    client.login()
+
+    session = _FakeSession.instances[0]
+    assert session.calls[0] == ("GET", "https://m.icall.me/admin/")
+    assert session.calls[1] == ("POST", "https://m.icall.me/channel/login")
+    assert client.token == "t" and client.uniacid == "u"
+
+
+def test_admin_login_retries_403_with_fresh_session(monkeypatch):
+    _FakeSession.instances = []
+    _FakeSession.post_statuses = [403, 200]
+    monkeypatch.setattr(api_client_module.requests, "Session", _FakeSession)
+
+    client = AdminApiClient("https://m.icall.me/admin/#/login", "u", "p", timeout=5)
+    client.login()
+
+    assert len(_FakeSession.instances) == 2
+    first, second = _FakeSession.instances
+    assert first.closed is True
+    assert first.calls[0] == ("GET", "https://m.icall.me/admin/")
+    assert first.calls[1] == ("POST", "https://m.icall.me/channel/login")
+    assert second.calls[0] == ("GET", "https://m.icall.me/admin/")
+    assert second.calls[1] == ("POST", "https://m.icall.me/channel/login")
+
+
+def test_admin_login_reports_waf_after_retry(monkeypatch):
+    _FakeSession.instances = []
+    _FakeSession.post_statuses = [403, 403]
+    monkeypatch.setattr(api_client_module.requests, "Session", _FakeSession)
+
+    client = AdminApiClient("https://m.icall.me/admin/#/login", "u", "p", timeout=5)
+    try:
+        client.login()
+    except ApiError as exc:
+        assert "HTTP 403" in str(exc)
+        assert "VPN" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("连续 403 必须抛 ApiError")
