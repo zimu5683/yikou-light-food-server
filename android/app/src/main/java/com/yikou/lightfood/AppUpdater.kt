@@ -205,12 +205,8 @@ object AppUpdater {
         val signatures: Array<android.content.pm.Signature> =
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 val signingInfo = info.signingInfo ?: return emptySet()
-                if (signingInfo.hasMultipleSigners()) {
-                    signingInfo.apkContentsSigners
-                } else {
-                    val certificate = signingInfo.signingCertificate ?: return emptySet()
-                    arrayOf(certificate)
-                }
+                // apkContentsSigners 在单签名/多签名下都能给出覆盖安装所需的证书集合。
+                signingInfo.apkContentsSigners
             } else {
                 info.signatures ?: return emptySet()
             }
