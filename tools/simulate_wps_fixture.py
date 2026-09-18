@@ -11,12 +11,15 @@
 仿真不联网、不改夹具文件：把试验田拷进内存工作簿当"云端"，跑
 build_plan + apply_plan，然后按**需求逐条验收**：
 
-1. 每个本地订单都在表里，且日期格 = 1、总餐次 = 本地餐次；
+1. 计划里每个人都在表里；**总餐次 = 云端原值 + 本地餐次**（累加，不是绝对值）；
+   **日期格**：协作者已经写了 0（当天不送）的必须原样保留，其余写 1；
 2. 列B 的顺序符合规定顺序（清单外的排最后）；
 3. 新行底色 = 模板行底色（经济餐）/ 整行金黄（豪华餐）；
 4. 新行公式 = SUM(日期区间)，不含协作者的标记列；
 5. 协作者的标记格（第 2 行第 17 列）原样不动；我们的记号写在第 18 列；
 6. 行数 = 原人数 + 新客户数；排序辅助列已删除。
+7. 同一批**第二次上传零改动**（账本按行记住"本批已同步的本地餐次"）。
+8. 同一个人一天下两单（本地两行）时，云端占两行、各标当天 1（这天送两餐）。
 
 用法：.venv/bin/python tools/simulate_wps_fixture.py [夹具路径]
 """
@@ -25,6 +28,7 @@ from __future__ import annotations
 import datetime as dt
 import re
 import sys
+import tempfile
 from copy import copy
 from pathlib import Path
 
@@ -33,9 +37,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import openpyxl
 from openpyxl.styles import PatternFill
 
-from app import wps_cloud as wc
 from app.core.config import default_wps_address_order
-from app.wps.sync import apply_plan, build_plan, person_key
+from app.wps import sync as wc
+from app.wps.sync import CloudOrder, SyncLedger, apply_plan, build_plan, person_key
 
 FIXTURE_DEFAULT = Path("/home/zimu/文档/测试东湖中餐.xlsx")
 SHEET_TEST = "东湖中餐（试验田）"
@@ -64,6 +68,17 @@ def col_index(letter: str) -> int:
     for char in str(letter).upper():
         value = value * 26 + (ord(char) - 64)
     return value                      # 1-based 列号
+
+
+def content_last_col(ws) -> int:
+    """**有内容**的最后一列（1-based）；空表返回 0。
+
+    不能用 ``ws.max_column``：这个夹具云的 ``read_grid`` 用 ``ws.cell()`` 读格子，
+    openpyxl 会顺手把空格子也创建出来 —— 探测排序区时读过一次右侧 40 列，
+    ``max_column`` 就虚涨到 58，会把"辅助列没删干净"误报成失败。
+    """
+    return max((col for (_row, col), cell in ws._cells.items()
+                if cell.value not in (None, "")), default=0)
 
 
 class FixtureCloud:
@@ -229,17 +244,31 @@ def main() -> int:
     cloud = FixtureCloud(src[SHEET_TEST])
 
     orders = wc.read_local_orders(tmp_xlsx, sheets=["东湖中餐"])["东湖中餐"]
+    # 额外场景（验收第 8 条）：同一个人一天下两单 → 本地两行、云端两行、各标当天 1。
+    # 用一个真实本地订单复制出"第二单"（模拟 2026-09-18 那批的雷丝淇/柟）。
+    twin_source = orders[0] if orders else None
+    if twin_source is not None:
+        orders.append(CloudOrder(
+            sheet=twin_source.sheet, name=twin_source.name, address=twin_source.address,
+            phone=twin_source.phone, meal_type=twin_source.meal_type,
+            meal_kind=twin_source.meal_kind, meals=1, row=twin_source.row + 1000,
+            order_no=f"{twin_source.order_no}+第二单", rows=(twin_source.row + 1000,),
+            weekday_marks=twin_source.weekday_marks))
+        print(f"额外场景：{twin_source.name} 同一天两单（第 1 单 {twin_source.meals} 餐 + 第 2 单 1 餐）")
     people_before = [cloud.ws.cell(r, 1).value for r in range(3, cloud.ws.max_row + 1)]
     people_before = [str(n) for n in people_before if n]
-    columns_before = cloud.ws.max_column
+    columns_before = content_last_col(cloud.ws)
     mark_before = cloud.ws.cell(2, MARK_COL).value
+    totals_before: dict[tuple[str, str], int] = {}
+    marks_before: dict[tuple[str, str], str] = {}
     print(f"云端（试验田）：{len(people_before)} 人；本地订单：{len(orders)} 个")
 
     order_list = default_wps_address_order()["东湖中餐"]
+    ledger = SyncLedger(Path(tempfile.mkdtemp()) / "sim_state.json")
     plans = build_plan(
         cloud, local_orders={"东湖中餐": orders},
         tables={"东湖中餐": {"file_id": "FIXTURE", "drive_id": ""}},
-        target=TARGET_DATE, ledger=None, marker_enabled=True, run_date=RUN_DATE,
+        target=TARGET_DATE, ledger=ledger, marker_enabled=True, run_date=RUN_DATE,
         address_order={"东湖中餐": order_list}, sort_enabled=True,
         log=lambda m: print(f"  [log] {m}"))
     plan = plans[0]
@@ -253,7 +282,19 @@ def main() -> int:
     template_fills = {c: cell_fill_hex(cloud.ws.cell(template_row, c))
                       for c in range(1, 16)} if template_row else {}
 
-    result = apply_plan(cloud, plans, ledger=None, marker_enabled=True,
+    # 写之前的云端快照（此刻还没写，计划是只读的）：验收要用它当基准。
+    # 排序会把行搬走，所以按（姓名, 电话）记。
+    for r in range(3, cloud.ws.max_row + 1):
+        name = cloud.ws.cell(r, 1).value
+        if not name:
+            continue
+        key = person_key(name, cloud.ws.cell(r, 3).value)
+        totals_before[key] = int(float(cloud.ws.cell(r, plan.columns["total"]).value or 0))
+        if plan.target_col:
+            marks_before[key] = norm(cloud.ws.cell(r, plan.target_col).value)
+    kept_zero = sum(1 for value in marks_before.values() if value == "0")
+
+    result = apply_plan(cloud, plans, ledger=ledger, marker_enabled=True,
                         log=lambda m: print(f"  [log] {m}"))
     print(f"\napply 结果：{result['sheets']}")
     if result["failed"]:
@@ -262,26 +303,47 @@ def main() -> int:
 
     problems: list[str] = []
     new_changes = [c for c in plan.changes if c.kind == "new"]
-    # 索引键必须是（姓名, 电话）——表里有重名的人（「李」「陈」都出现多次）
-    by_person: dict[tuple[str, str], int] = {}
+    # 索引键必须是（姓名, 电话）——表里有重名的人（「李」「陈」都出现多次）；
+    # 一个人可能有多行（一天两单），所以记**行号列表**，第 i 行 = 第 i 个槽位。
+    by_person: dict[tuple[str, str], list[int]] = {}
     for r in range(3, cloud.ws.max_row + 1):
         name = cloud.ws.cell(r, 1).value
         if name:
-            by_person.setdefault(
-                person_key(name, cloud.ws.cell(r, 3).value), r)
+            rows = by_person.setdefault(
+                person_key(name, cloud.ws.cell(r, 3).value), [])
+            if r not in rows:
+                rows.append(r)
+    for rows in by_person.values():
+        rows.sort()
 
-    # 1) 每个本地订单都在表里，且日期格/总餐次正确
-    for order in orders:
-        row = by_person.get(person_key(order.name, order.phone))
+    def row_of(key, slot: int) -> int:
+        rows = by_person.get(key) or []
+        return rows[slot - 1] if len(rows) >= slot else 0
+
+    # 1) 计划里的每个人都在表里；总餐次 = 云端原值 + 本次增量；日期格按约定
+    for change in plan.changes:
+        key = person_key(change.name, change.phone)
+        row = row_of(key, change.slot)
         if not row:
-            problems.append(f"{order.name} 不在表里")
+            problems.append(f"{change.name} 不在表里")
             continue
         got_mark = norm(cloud.ws.cell(row, plan.target_col).value)
         got_total = norm(cloud.ws.cell(row, plan.columns["total"]).value)
-        if got_mark != wc.CELL_MARK:
-            problems.append(f"{order.name}：日期格应为 1，实际 {got_mark!r}")
-        if got_total != str(order.meals):
-            problems.append(f"{order.name}：总餐次应为 {order.meals}，实际 {got_total!r}")
+        before_mark = marks_before.get(key, "")
+        if change.kind == "new":
+            want_mark = wc.CELL_MARK          # 新建的行，日期格是我们写的 1
+        else:
+            # 老行：协作者已经写了别的值（0 = 当天不送）就保持原样，其余写 1
+            want_mark = before_mark if before_mark not in ("", wc.CELL_MARK) else wc.CELL_MARK
+        if got_mark != want_mark:
+            problems.append(f"{change.name}：日期格应为 {want_mark!r}，实际 {got_mark!r}")
+        want_total = totals_before.get(key, 0) + change.local_meals
+        if change.kind == "existing" and got_total != str(want_total):
+            problems.append(f"{change.name}：总餐次应为 云端 {totals_before.get(key, 0)} "
+                            f"+ 本地 {change.local_meals} = {want_total}，实际 {got_total!r}")
+        if change.kind == "new" and got_total != str(change.total_after):
+            problems.append(f"{change.name}：新客户总餐次应为 {change.total_after}，"
+                            f"实际 {got_total!r}")
 
     # 2) 列B 顺序符合规定顺序（清单外的排最后）
     ranks, tail = wc.build_address_ranks(order_list, [])
@@ -310,9 +372,9 @@ def main() -> int:
                         plan.columns["left"]) if c}
     plain_range = range(1, (plan.columns["remark"] or 15) + 1)
     for change in new_changes:
-        row = by_person.get(person_key(change.name, change.phone))
+        row = row_of(person_key(change.name, change.phone), change.slot)
         if not row:
-            problems.append(f"新客户 {change.name} 不在表里")
+            problems.append(f"新客户 {change.name}（第 {change.slot} 行）不在表里")
             continue
         luxury = str(change.meal_kind).strip() == "豪华"
         for c in plain_range:
@@ -332,7 +394,7 @@ def main() -> int:
     # 4) 新行公式：只统计真实日期列
     date_lo, date_hi = min(plan.date_cols), max(plan.date_cols)
     for change in new_changes:
-        row = by_person.get(person_key(change.name, change.phone))
+        row = row_of(person_key(change.name, change.phone), change.slot)
         if not row:
             continue
         want_served = (f"=SUM({wc.column_name(date_lo)}{row}:"
@@ -352,11 +414,16 @@ def main() -> int:
         problems.append(f"通讯记号应为 {plan.weekday_number}，实际 {got_marker!r}")
 
     # 6) 行数与辅助列
-    if len(by_person) != len(people_before) + len(new_changes):
-        problems.append(f"人数不对：原 {len(people_before)} + 新 {len(new_changes)} "
+    total_rows = sum(len(rows) for rows in by_person.values())
+    if total_rows != len(people_before) + len(new_changes):
+        problems.append(f"行数不对：原 {len(people_before)} + 新 {len(new_changes)} "
+                        f"≠ 实际 {total_rows}")
+    new_people = len({person_key(c.name, c.phone) for c in new_changes})
+    if len(by_person) != len(people_before) + new_people:
+        problems.append(f"人数不对：原 {len(people_before)} + 新客户 {new_people} "
                         f"≠ 实际 {len(by_person)}")
-    if cloud.ws.max_column > columns_before:
-        problems.append(f"列数变多了（{columns_before} → {cloud.ws.max_column}），"
+    if content_last_col(cloud.ws) > columns_before:
+        problems.append(f"列数变多了（{columns_before} → {content_last_col(cloud.ws)}），"
                         f"辅助列可能没删干净")
     leftovers = [cloud.ws.cell(r, c).value
                  for r in range(3, cloud.ws.max_row + 1)
@@ -364,6 +431,27 @@ def main() -> int:
                  if re.fullmatch(r"\d{4}", str(cloud.ws.cell(r, c).value or ""))]
     if leftovers:
         problems.append(f"辅助列残留排序键：{leftovers[:5]}")
+
+    # 7) 幂等：同一批第二次上传零改动（账本记住"本批已同步的本地餐次"）
+    snapshot = {(r, c): cloud.ws.cell(r, c).value
+                for r in range(1, cloud.ws.max_row + 1)
+                for c in range(1, cloud.ws.max_column + 1)}
+    plans2 = build_plan(
+        cloud, local_orders={"东湖中餐": orders},
+        tables={"东湖中餐": {"file_id": "FIXTURE", "drive_id": ""}},
+        target=TARGET_DATE, ledger=ledger, marker_enabled=True, run_date=RUN_DATE,
+        address_order={"东湖中餐": order_list}, sort_enabled=True)
+    plan2 = plans2[0]
+    pending2 = [c for c in plan2.changes if c.needs_write]
+    if pending2:
+        problems.append(f"第二次上传仍有 {len(pending2)} 条待写变更（幂等被破坏）")
+    apply_plan(cloud, plans2, ledger=ledger, marker_enabled=True)
+    after = {(r, c): cloud.ws.cell(r, c).value
+             for r in range(1, cloud.ws.max_row + 1)
+             for c in range(1, cloud.ws.max_column + 1)}
+    if after != snapshot:
+        changed = [k for k in after if after[k] != snapshot.get(k)]
+        problems.append(f"第二次上传改动了云端内容：{changed[:5]}")
 
     print("\n---- 最终顺序（前 25 行）----")
     for r, addr, rank in sequence[:25]:
@@ -376,8 +464,11 @@ def main() -> int:
         for item in problems[:40]:
             print(f"  ❌ {item}")
         return 1
-    print(f"\n✅ 仿真通过：{len(people_before)} 人 + {len(new_changes)} 个新客户，"
-          f"顺序/底色/公式/记号/标记列全部符合要求")
+    twins = [c for c in new_changes if c.slot > 1]
+    print(f"\n✅ 仿真通过：{len(people_before)} 人 + {len(new_changes)} 行新增"
+          f"（其中同日第二单 {len(twins)} 行）；"
+          f"总餐次=云端原值+本地餐次、协作者写的 {kept_zero} 个 0 原样保留、"
+          f"顺序/底色/公式/记号/标记列全部符合要求，第二次上传零改动")
     return 0
 
 

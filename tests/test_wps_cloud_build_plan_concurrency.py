@@ -13,6 +13,10 @@
 
 注意：改动前 ``tests/test_wps_cloud.py`` 里的 ~50 处 ``build_plan`` 调用**全部是
 单表场景**，多子表顺序完全没被覆盖 —— 本文件补上这一块。
+
+夹具里的 ``CloudOrder`` 都带 ``weekday_marks``（= ``TARGET`` 的周几）：本地排单表
+每一行都有「周一~周日」标记，``build_plan`` 会用它核对"本地表是不是这一天的批次"，
+不带标记的夹具会多出一条"无法核对批次日期"的警告（真实数据不会）。
 """
 from __future__ import annotations
 
@@ -110,7 +114,7 @@ def _scenario(n_sheets=None, *, people_per_sheet=3, unreadable=(), fail_read=())
                              f"1380000{idx}{i:03d}") for i in range(people_per_sheet)])
         tables[sheet] = {"file_id": fid, "drive_id": ""}
         orders[sheet] = [CloudOrder(sheet, f"客户{idx}0", "小", f"1380000{idx}000",
-                                    "中餐", "经济", 6)]
+                                    "中餐", "经济", 6, weekday_marks=("周五",))]
     cli = FakeCli(grids, unreadable=unreadable, fail_read=fail_read)
     return sheets, tables, orders, cli
 
@@ -142,7 +146,7 @@ def test_order_is_preserved_even_when_completion_is_reversed():
         grids[fid] = _grid([(f"人{idx}", "小", f"13800000000{idx}")])
         tables[sheet] = {"file_id": fid, "drive_id": ""}
         orders[sheet] = [CloudOrder(sheet, f"人{idx}", "小", f"13800000000{idx}",
-                                    "中餐", "经济", 3)]
+                                    "中餐", "经济", 3, weekday_marks=("周五",))]
 
     class ReversedCli(FakeCli):
         def sheets_info(self, file_id):
@@ -196,7 +200,8 @@ def test_sheets_without_file_id_are_skipped_without_any_call():
     wps_cloud.WPS_PLAN_WORKERS = 2
     _, tables, orders, cli = _scenario(3)
     tables["东湖晚餐"] = {"file_id": "", "drive_id": ""}   # 配置缺 file_id
-    orders["幽灵表"] = [CloudOrder("幽灵表", "鬼", "小", "13000000000", "中餐", "经济", 1)]
+    orders["幽灵表"] = [CloudOrder("幽灵表", "鬼", "小", "13000000000", "中餐", "经济", 1,
+                                   weekday_marks=("周五",))]
 
     plans = build_plan(cli, local_orders=orders, tables=tables, target=TARGET,
                        ledger=None, address_order={}, sort_enabled=True)

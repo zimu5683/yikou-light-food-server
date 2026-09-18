@@ -1230,7 +1230,11 @@ class Bridge:
             self.log(f"[云同步] 目标日期 {target.isoformat()}，"
                      f"{'测试模式（只写测试文件）' if cfg.wps_test_mode else '正式模式'}"
                      + ("；按地址顺序重排整表" if cfg.wps_sort_enabled else "；已关闭排序"))
-            if not any(p.target_col for p in plans):
+            blocked = [p for p in plans if p.blocked_reason]
+            if blocked:
+                self.log(f"[云同步] {len(blocked)} 张表因本地表批次日期不符被拒绝写入："
+                         f"{'、'.join(p.sheet for p in blocked)}", "ERROR")
+            if not any(p.target_col or p.blocked_reason for p in plans):
                 self.log("[云同步] 所有表都没有找到目标日期列，未写入任何内容", "WARN")
             result = apply_plan(cli, plans, ledger=ledger,
                                 marker_enabled=cfg.wps_marker_enabled and not cfg.wps_test_mode,
@@ -1250,6 +1254,10 @@ class Bridge:
                              f"（{'; '.join(item.get('problems', [])[:3])}）", "ERROR")
                 elif status == "failed":
                     self.log(f"[云同步] ✘ {item['sheet']}：{item.get('reason', '写入失败')}", "ERROR")
+                elif status == "stale_batch":
+                    # 本地表批次日期与目标日期不符：整张表拒绝写入（一个格子都没动）。
+                    self.log(f"[云同步] ✘ {item['sheet']}：本地表批次日期不符，已拒绝写入"
+                             f"（{item.get('reason', '')}）", "ERROR")
                 elif status == "skipped":
                     # 协作者还没加当天的列属于正常状态，用 INFO 而非 WARN。
                     self.log(f"[云同步] — {item['sheet']}：{item.get('reason', '跳过')}")
@@ -1257,13 +1265,15 @@ class Bridge:
                     self.log(f"[云同步] {item['sheet']}：云端实际排序位置与预测略有出入，"
                              f"已按实际行号写入（数据无误）", "WARN")
             level = "OK" if result["failed"] == 0 else "ERROR"
-            self.log(f"[云同步] 完成：更新 {summary['to_update']} 人、新增 {summary['to_append']} 人、"
-                     f"已完成 {summary['unchanged']} 人"
+            self.log(f"[云同步] 完成：更新 {summary['to_update']} 行、新增 {summary['to_append']} 行、"
+                     f"不用动 {summary['unchanged']} 行"
+                     + (f"、跳过 {summary['skipped']} 人（日期格是协作者写的）"
+                        if summary.get("skipped") else "")
                      + (f"、注意 {summary['warned']} 项" if summary["warned"] else "")
                      + f"；成功 {result['written']} 张表，失败 {result['failed']} 张", level)
             self._set_status("ready")
             failed = [item["sheet"] for item in result["sheets"]
-                      if item.get("status") in ("failed", "verify_failed")]
+                      if item.get("status") in ("failed", "verify_failed", "stale_batch")]
             return {"ok": result["failed"] == 0, "target_date": target.isoformat(),
                     "summary": summary, "result": result,
                     "text": format_plan(plans),

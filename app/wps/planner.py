@@ -25,6 +25,7 @@ from app.wps.common import (
     SORT_FLAG_BLANK,
     SORT_FLAG_EXISTING,
     SORT_FLAG_NEW,
+    WEEKDAYS,
     WPS_PLAN_WORKERS,
     _address_key,
     _as_int,
@@ -67,11 +68,105 @@ def formula_cells_for_new_rows(plan: SheetPlan, rows: Sequence[int]) -> list[dic
         ))
     return cells
 
+def _batch_date_check(orders: Sequence[CloudOrder],
+                      target: _dt.date) -> tuple[str, str]:
+    """核对本地表的批次日期，返回 ``(拒绝原因, 警告)``（两者最多一个非空）。
+
+    本地排单表每一行都标着「这批要送的那天是周几」（`app/order/runner.py` 写入
+    运行日+1 的周几；实测 2026-09-18 那批全是「周六」，目标日期 9.19 正是周六）。
+
+    为什么必须核对：总餐次改成"云端 + 本次增量"之后，拿**别的日期**的本地表去
+    上传会把同一批餐重复加一遍。所以出现**明确矛盾**时整张表拒绝写入：
+
+    * 有星期标记的行**一行都不标目标周几** → 返回拒绝原因；
+    * 部分行不符 → 只警告（可能是个别行来自别的批次）；
+    * 一行标记都没有（人工做的表）→ 只警告，照常写入。
+    """
+    expected = WEEKDAYS[target.weekday()]
+    marked = [order for order in orders if order.weekday_marks]
+    if not marked:
+        if not orders:
+            return "", ""
+        return "", (f"本地表里没有星期标记，无法核对批次日期"
+                    f"（目标日期 {target.isoformat()} 是{expected}），已照常写入")
+    mismatched = [order for order in marked if expected not in order.weekday_marks]
+    if not mismatched:
+        return "", ""
+    seen: list[str] = []
+    for order in mismatched:
+        for mark in order.weekday_marks:
+            if mark not in seen:
+                seen.append(mark)
+    shown = "、".join(seen[:3])
+    if len(mismatched) == len(marked):
+        reason = (f"本地排单表的星期标记是「{shown}」，与本次目标日期 "
+                  f"{target.isoformat()}（{expected}）不符：这张本地表是**别的日期**的批次，"
+                  f"上传会把同一批餐重复加到云端。已拒绝写入本表 —— "
+                  f"请先在「订单处理」里重跑当天订单，再点上传。")
+        return reason, reason
+    names = "、".join(order.name for order in mismatched[:3])
+    return "", (f"本地表里 {len(mismatched)} 行的星期标记不是「{expected}」"
+                f"（{names}…），这些行可能来自别的批次，已按目标日期写入，请核对")
+
+
+def _group_rows_per_person(orders: Sequence[CloudOrder],
+                           ) -> tuple[list[list[CloudOrder]], list[str]]:
+    """把本地同一子表的行按【姓名 + 电话】分组，**一人一组**（组内保持表内顺序）。
+
+    用户 2026-09-18 明确：同一个人本地有几行，**云端就写几行**，每行各标当天 1 ——
+
+    * 一晚下了两单（实测「雷丝淇」W25 + W5，各 1 餐）；
+    * 一单两份被 ``app/order/runner.py`` 按份数写成两行（实测「柟」W33 两行）。
+
+    两种都算"这一天吃两餐"：两行 = 两个槽位，各自的餐次记在各自那一行上，
+    日期格都写 1。这样「闪时送下单」（``app/ordering/roster.py`` 按"日期格 == 1"出单、
+    每单固定 1 份）会给她下两单、真的送两餐。
+
+    槽位顺序 = 组内顺序 = 本地表的行顺序；云端同一个人的多行按**表内从上到下**对应。
+    """
+    groups: dict[tuple[str, str], list[CloudOrder]] = {}
+    result: list[list[CloudOrder]] = []
+    for order in orders:
+        key = person_key(order.name, order.phone)
+        if not key[0]:
+            result.append([order])
+            continue
+        group = groups.get(key)
+        if group is None:
+            groups[key] = [order]
+            result.append(groups[key])
+        else:
+            group.append(order)
+    warnings: list[str] = []
+    for group in result:
+        if len(group) < 2:
+            continue
+        first = group[0]
+        rows = "、".join(
+            str(row) for order in group
+            for row in (order.rows or ((order.row,) if order.row else ())))
+        total = sum(order.meals for order in group)
+        warnings.append(
+            f"「{first.name}」（{first.phone}）在本地表里有 {len(group)} 行"
+            f"（第 {rows} 行）：云端写 {len(group)} 行、各标当天 1，这天共 {total} 餐")
+        for order in group[1:]:
+            for label, mine, theirs in (("地址", first.address, order.address),
+                                        ("类型", first.meal_type, order.meal_type),
+                                        ("餐种", first.meal_kind, order.meal_kind)):
+                if mine and theirs and mine != theirs:
+                    warnings.append(
+                        f"「{first.name}」多行的{label}不一致（「{mine}」/「{theirs}」），"
+                        f"每一行各按自己的值写入，请核对")
+                    break
+    return result, warnings
+
+
 def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder],
                       conf: Mapping[str, str], target: _dt.date,
                       run_date: _dt.date | None,
                       order_map: Mapping[str, Sequence[str]],
-                      sort_enabled: bool) -> SheetPlan:
+                      sort_enabled: bool,
+                      ledger: SyncLedger | None = None) -> SheetPlan:
     """为**单个**子表生成写入计划（只读云端，不写任何东西）。
 
     本函数是把 ``build_plan`` 的循环体**原样搬出来**的，除下列两点外没有任何改动：
@@ -82,12 +177,24 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
       现在统一 ``return plan``。
 
     只读写自己的局部变量与入参，不碰任何共享可变状态，因此不同子表之间完全独立，
-    可以安全地在工作线程里并发执行。
+    可以安全地在工作线程里并发执行（``ledger`` 只用只读访问器，见 ``SyncLedger``）。
     """
     plan = SheetPlan(sheet=sheet, file_id=conf["file_id"],
                      drive_id=conf.get("drive_id", ""),
                      target_date=target,
                      weekday_number=weekday_number(run_date or target))
+    # 批次日期核对放在**任何云端调用之前**：被拒绝的子表一个请求都不发（省额度）。
+    block_reason, batch_warning = _batch_date_check(orders, target)
+    if batch_warning:
+        plan.warnings.append(batch_warning)
+    if block_reason:
+        plan.blocked_reason = block_reason
+        return plan
+    if ledger is not None:
+        previous = ledger.batch_summary(target.isoformat(), plan.file_id)
+        if previous:
+            plan.previous_batch = (f"{previous['people']} 人"
+                                   f"（{previous['synced_at'] or '时间未知'}）")
     infos = cli.sheets_info(plan.file_id)
     if not infos:
         plan.warnings.append("云端文件不可读或不是在线表格")
@@ -156,8 +263,10 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
             f"（请人工核对云端表结构）")
         return plan
 
-    # 客户索引 + 追加行
-    people: dict[tuple[str, str], int] = {}
+    # 客户索引 + 追加行。
+    # 一个人可能有**多行**（多买的那几餐各自一行）：按表内从上到下的顺序记下来，
+    # 本地第 i 行就写在他的第 i 行上（见 _group_rows_per_person）。
+    people: dict[tuple[str, str], list[int]] = {}
     last_used = FIRST_DATA_ROW - 1
     for (row, col), text in grid.items():
         if row < FIRST_DATA_ROW - 1 or col != plan.columns["name"] - 1:
@@ -166,7 +275,9 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
         phone = grid.get((row, plan.columns["phone"] - 1), "")
         key = person_key(text, phone)
         if key[0]:
-            people.setdefault(key, row + 1)
+            people.setdefault(key, []).append(row + 1)
+    for rows in people.values():
+        rows.sort()
     plan.append_row = last_used + 1
 
     # 数据行（有姓名的行）与逐行地址 —— 排序要用。
@@ -227,59 +338,99 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
         plan.format_fills = fills
 
     total_col = plan.columns["total"]
+    type_col = plan.columns.get("type") or 0
+    kind_col = plan.columns.get("kind") or 0
+    served_col = plan.columns.get("served") or 0
+    left_col = plan.columns.get("left") or 0
+    date_key = target.isoformat()
     existing_changes: list[Change] = []
-    new_orders: list[CloudOrder] = []
-    for order in orders:
-        key = person_key(order.name, order.phone)
+    # 需要**新建**的云端行：(本地行, 槽位, 人键, 该人是否完全不在云端)
+    new_rows: list[tuple[CloudOrder, int, tuple[str, str], bool]] = []
+    groups, group_warnings = _group_rows_per_person(orders)
+    plan.warnings.extend(group_warnings)
+    for group in groups:
+        first_order = group[0]
+        key = person_key(first_order.name, first_order.phone)
         if not key[0]:
             continue
-        row = people.get(key)
-        if row:
-            before = _as_int(grid.get((row - 1, total_col - 1))) if total_col else 0
-            already = str(grid.get((row - 1, plan.target_col - 1), "")).strip() == CELL_MARK
-            # 总餐次 = 本地「餐次」的绝对值（不是累加）。
-            # 本地表就是网站当前的完整状态，云端总餐次应当与之一致；
-            # 写成绝对值天然幂等：重复运行不会翻倍。
-            want = order.meals
-            change = Change(kind="existing", name=order.name, phone=order.phone,
-                            row=row, delta=want - before, target_col=plan.target_col,
-                            total_before=before, total_after=want, target_ok=already,
-                            address=str(order.address or "").strip(),
-                            meal_type=order.meal_type, meal_kind=order.meal_kind)
-            # 半成品行自愈：上次中断可能留下缺「类型/餐种/公式」的行，本次补齐。
-            type_col = plan.columns.get("type") or 0
-            kind_col = plan.columns.get("kind") or 0
-            served_col = plan.columns.get("served") or 0
-            left_col = plan.columns.get("left") or 0
-            change.fill_type = bool(
-                type_col and order.meal_type
-                and not str(grid.get((row - 1, type_col - 1), "")).strip())
-            change.fill_kind = bool(
-                kind_col and order.meal_kind
-                and not str(grid.get((row - 1, kind_col - 1), "")).strip())
-            change.fill_formula = bool(
-                served_col and left_col and plan.date_cols
-                and not str(grid.get((row - 1, served_col - 1), "")).strip()
-                and not str(grid.get((row - 1, left_col - 1), "")).strip())
-            if want == before:
-                change.detail = "总餐次已一致"
-            elif want < before:
-                change.detail = (f"本地 {want} 餐 < 云端 {before} 餐，"
-                                 "按本地值覆盖（如非预期请人工核对）")
-                plan.warnings.append(f"{order.name}：{change.detail}")
-            existing_changes.append(change)
-        else:
-            new_orders.append(order)
+        cloud_rows = people.get(key, [])
+        is_new_person = not cloud_rows
+        prev_slots = (ledger.synced_slots(date_key, plan.file_id, *key)
+                      if ledger is not None else None)
+        if is_new_person and any(name == first_order.name for name, _phone in people):
+            plan.warnings.append(
+                f"{first_order.name}：云端已有同名的人（电话不同），本次会新增 "
+                f"{len(group)} 行，请核对是不是同一个人（重复行会让总餐次被加两次）")
+        for slot, order in enumerate(group, start=1):
+            local_rows = tuple(order.rows) or ((order.row,) if order.row else ())
+            local_note = "、".join(str(row) for row in local_rows) or "?"
+            if order.meals <= 0:
+                # 本地「餐次」为空/0：既不能加餐，也不能写日期格 1（那会白送一餐）。
+                plan.warnings.append(
+                    f"{order.name}（{order.phone}）：本地第 {local_note} 行的「餐次」是空的"
+                    f"（按 0 计），已跳过这一行：不写日期格、不动总餐次")
+                continue
+            # 账本按**槽位**记"本批已同步的本地餐次"：本地第 i 行对应账本第 i 个槽位。
+            prev = (prev_slots[slot - 1]
+                    if prev_slots is not None and slot - 1 < len(prev_slots) else None)
+            added = order.meals - prev if prev is not None else order.meals
+            if added < 0:
+                plan.warnings.append(
+                    f"{order.name}（第 {slot} 行）：本地 {order.meals} 餐少于账本里本批"
+                    f"已同步的 {prev} 餐（可能退单），本次不动云端总餐次，请人工核对")
+                added = 0
+            if slot <= len(cloud_rows):
+                # 云端已有这一行：总餐次 = 现值 + 本次增量（累加，不是绝对值）
+                row = cloud_rows[slot - 1]
+                before = _as_int(grid.get((row - 1, total_col - 1))) if total_col else 0
+                raw_mark = str(grid.get((row - 1, plan.target_col - 1), "") or "").strip()
+                already = raw_mark == CELL_MARK
+                # 协作者写的其它值（例如 0 = 当天不送）是他的明确决定，只读不写。
+                occupied = "" if (already or not raw_mark) else raw_mark
+                want = before + added
+                change = Change(kind="existing", name=order.name, phone=order.phone,
+                                row=row, delta=want - before, target_col=plan.target_col,
+                                total_before=before, total_after=want, target_ok=already,
+                                address=str(order.address or "").strip(),
+                                meal_type=order.meal_type, meal_kind=order.meal_kind,
+                                local_meals=order.meals, ledger_prev=prev,
+                                target_occupied=occupied, local_rows=local_rows,
+                                slot=slot)
+                # 半成品行自愈：上次中断可能留下缺「类型/餐种/公式」的行，本次补齐。
+                change.fill_type = bool(
+                    type_col and order.meal_type
+                    and not str(grid.get((row - 1, type_col - 1), "")).strip())
+                change.fill_kind = bool(
+                    kind_col and order.meal_kind
+                    and not str(grid.get((row - 1, kind_col - 1), "")).strip())
+                change.fill_formula = bool(
+                    served_col and left_col and plan.date_cols
+                    and not str(grid.get((row - 1, served_col - 1), "")).strip()
+                    and not str(grid.get((row - 1, left_col - 1), "")).strip())
+                if occupied:
+                    plan.warnings.append(
+                        f"{order.name}：{plan.target_header or '目标日期'}那格协作者已经写了"
+                        f"「{occupied}」（表示当天不送），本次不改这一格；总餐次仍按付款累加。"
+                        f"若这天确实要送，请先在云端把那格改回 1")
+                existing_changes.append(change)
+                continue
+            # 云端这个人还没有这一"行"（新客户，或本地又多下了一单）→ 新建一行
+            if prev is not None:
+                plan.warnings.append(
+                    f"{order.name}（第 {slot} 行）：账本说这一行本批已同步 {prev} 餐，"
+                    f"但云端没有这一行（可能被协作者删了），本次按本地 {order.meals} 餐重建")
+            new_rows.append((order, slot, key, is_new_person))
 
     # ---- 新增客户：统一插到第 3 行与第 4 行之间，再按列B 顺序重排整张表 ----
     order_list = [str(item).strip() for item in (order_map.get(sheet) or [])]
-    written: list[tuple[CloudOrder, str]] = [
-        (order, canonical_address(order.address, order_list)) for order in new_orders]
+    written: list[tuple[CloudOrder, str, int, tuple[str, str]]] = [
+        (order, canonical_address(order.address, order_list), slot, key)
+        for order, slot, key, _is_new in new_rows]
 
     ranks, tail_rank = build_address_ranks(
-        order_list, [*address_of.values(), *(addr for _o, addr in written)])
+        order_list, [*address_of.values(), *(addr for _o, addr, _s, _k in written)])
     unknown = sorted({addr for addr in
-                      [*address_of.values(), *(a for _o, a in written)]
+                      [*address_of.values(), *(a for _o, a, _s, _k in written)]
                       if _address_key(addr) and _address_key(addr) not in ranks})
     plan.unknown_addresses = unknown[:5]
     for addr in unknown[:5]:
@@ -330,7 +481,7 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
 
     entries: list[tuple[int, int]] = []
     if sort_on:
-        for idx, (_order, addr) in enumerate(written):
+        for idx, (_order, addr, _slot, _key) in enumerate(written):
             rank = ranks.get(_address_key(addr), tail_rank)
             entries.append((sort_key_value(rank, SORT_FLAG_NEW), first_insert_row + idx))
         # 表中间的空行（没有姓名的行，通常是分组之间的空行）：跟着**上一行**的
@@ -360,11 +511,14 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
             final_row_of[first_insert_row + idx] = first_insert_row + idx
         plan.last_data_row = FIRST_DATA_ROW + len(data_rows) + new_count - 1
 
+    # 预测行号按 (人, 槽位) 记：一个人多行时第 i 行 = 他的第 i 个槽位。
+    final_rows_by_key: dict[tuple[str, str], dict[int, int]] = {}
     for change in existing_changes:
         change.row = final_row_of.get(pre_insert_row(change.row), change.row)
-        plan.final_rows[person_key(change.name, change.phone)] = change.row
+        final_rows_by_key.setdefault(
+            person_key(change.name, change.phone), {})[change.slot] = change.row
 
-    for idx, (order, addr) in enumerate(written):
+    for idx, (order, addr, slot, key) in enumerate(written):
         pre_row = first_insert_row + idx
         row = final_row_of.get(pre_row, pre_row)
         if sort_on:
@@ -381,9 +535,15 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
                         target_ok=False,
                         address=addr, meal_type=order.meal_type,
                         meal_kind=order.meal_kind,
-                        detail=where, fill_formula=True)
+                        detail=where, fill_formula=True,
+                        local_meals=order.meals,
+                        ledger_prev=None,
+                        local_rows=tuple(order.rows) or ((order.row,) if order.row else ()),
+                        slot=slot)
         plan.changes.append(change)
-        plan.final_rows[person_key(order.name, order.phone)] = row
+        final_rows_by_key.setdefault(key, {})[slot] = row
+    plan.final_rows = {key: tuple(rows[i] for i in sorted(rows))
+                       for key, rows in final_rows_by_key.items()}
     plan.changes = existing_changes + plan.changes
     if sort_on:
         plan.sort_enabled = True
@@ -423,7 +583,8 @@ def build_plan(cli: KdocsCli, *, local_orders: Mapping[str, Sequence[CloudOrder]
         sheet, orders, conf = item
         return _build_sheet_plan(cli, sheet=sheet, orders=orders, conf=conf,
                                  target=target, run_date=run_date,
-                                 order_map=order_map, sort_enabled=sort_enabled)
+                                 order_map=order_map, sort_enabled=sort_enabled,
+                                 ledger=ledger)
 
     if len(items) <= 1:
         # 没有可重叠的往返，直接顺序执行，省掉线程池开销。
@@ -442,20 +603,65 @@ def build_plan(cli: KdocsCli, *, local_orders: Mapping[str, Sequence[CloudOrder]
     return plans
 
 def summarize_plan(plans: Iterable[SheetPlan]) -> dict[str, int]:
-    """汇总计划：用于界面展示与日志。"""
-    update = new = unchanged = warn = 0
+    """汇总计划：用于界面展示与日志。
+
+    * ``to_update``：本次要更新的**老行**（总餐次变了，或要补类型/餐种/公式）
+    * ``to_append``：本次要**新增的行**（新客户每人一行；同一天多下的单各占一行）
+    * ``unchanged``：本次一个字都不用写的行
+    * ``warned``：差额为负（本地比账本少，可能退单）的槽位数
+    * ``skipped``：日期格被协作者写了别的值（例如 0 = 当天不送）而没动的行数
+
+    计数单位是**行**不是人：一天下两单的客户会有两行（两餐各一行）。
+    
+    """
+    update = new = unchanged = warn = skipped = 0
     for plan in plans:
         for change in plan.changes:
             if change.kind == "new":
                 new += 1
-            elif change.delta == 0 and change.target_ok:
-                unchanged += 1
-            else:
+            elif change.needs_write:
                 update += 1
+            else:
+                unchanged += 1
+            if change.target_blocked:
+                skipped += 1
             if change.delta < 0:
                 warn += 1
     return {"to_update": update, "to_append": new,
-            "unchanged": unchanged, "warned": warn}
+            "unchanged": unchanged, "warned": warn, "skipped": skipped}
+
+def _local_rows_text(change: Change) -> str:
+    """预览里的本地出处，例如「本地第 19 行共 6 餐」。"""
+    rows = "、".join(str(row) for row in change.local_rows) or "?"
+    return f"本地第 {rows} 行共 {change.local_meals} 餐"
+
+def _change_lines(change: Change) -> list[str]:
+    """把一条变更渲染成 1~2 行预览文字（用户靠它决定"要不要真的上传"）。"""
+    if change.kind == "new":
+        # 同一个人的第 2、3…行是"这天多加的餐"，写清第几行，用户核对方便。
+        slot_note = f"第 {change.slot} 行：" if change.slot > 1 else ""
+        return [f"    + 新增 {change.name}（{change.phone}）{slot_note}"
+                f"总餐次 {change.total_after}（{_local_rows_text(change)}）"
+                f"、日期格 {CELL_MARK} → {change.detail}"]
+    if not change.needs_write:
+        lines = [f"    ≈ {change.name}：本次不需要改动（总餐次 {change.total_after}）"]
+    else:
+        added = change.total_after - change.total_before
+        if change.ledger_prev is None:
+            why = f"本批首次同步 +{added}" if added else "总餐次已一致"
+        elif added:
+            why = f"本批本地 {change.ledger_prev}→{change.local_meals} 餐，+{added}"
+        else:
+            why = f"本批本地 {change.local_meals} 餐已同步过，+0"
+        cell = "" if (change.target_ok or change.target_blocked) else f"，日期格 {CELL_MARK}"
+        slot_note = f"第 {change.slot} 行 " if change.slot > 1 else ""
+        lines = [f"    · {change.name}（{change.phone}）{slot_note}"
+                 f"总餐次 {change.total_before}→{change.total_after}"
+                 f"（{why}；{_local_rows_text(change)}）{cell}"]
+    if change.target_blocked:
+        lines.append(f"        ⛔ 日期格协作者已写「{change.target_occupied}」"
+                     f"（当天不送），本次不改这一格；要送请先在云端改回 1")
+    return lines
 
 def format_plan(plans: Iterable[SheetPlan]) -> str:
     """把计划渲染成人类可读的多行文本（给预览用）。"""
@@ -465,32 +671,30 @@ def format_plan(plans: Iterable[SheetPlan]) -> str:
         if plan.target_col:
             head += f"→ 第 {plan.target_col} 列（{plan.target_header}）"
         lines.append(head)
+        if plan.blocked_reason:
+            lines.append("    ⛔ 本次未写入这张表（一个格子都没动）")
+            lines.append(f"    {plan.blocked_reason}")
+            for warning in plan.warnings:
+                if warning != plan.blocked_reason:
+                    lines.append(f"    ⚠ {warning}")
+            continue
+        if plan.previous_batch:
+            lines.append(f"    本批已同步过 {plan.previous_batch}：重复上传只补差额")
         for warning in plan.warnings:
             lines.append(f"    ⚠ {warning}")
         new_count = sum(1 for c in plan.changes if c.kind == "new")
         if new_count:
             if plan.sort_enabled:
                 lines.append(
-                    f"    本次新增 {new_count} 人：先插到第 {FIRST_DATA_ROW + 1} 行起，"
+                    f"    本次新增 {new_count} 行：先插到第 {FIRST_DATA_ROW + 1} 行起，"
                     f"再按地址顺序重排整张表"
                     f"（第 {FIRST_DATA_ROW}~{plan.last_data_row} 行）")
             else:
                 lines.append(
-                    f"    本次新增 {new_count} 人：插到第 {FIRST_DATA_ROW + 1} 行起"
+                    f"    本次新增 {new_count} 行：插到第 {FIRST_DATA_ROW + 1} 行起"
                     f"（已关闭排序，新行会留在表格最上面）")
         for change in plan.changes:
-            if change.kind == "new":
-                lines.append(f"    + 新增 {change.name}（{change.phone}）"
-                             f"总餐次 {change.total_after}、日期格 {CELL_MARK}"
-                             f" → {change.detail}")
-            elif change.delta == 0 and change.target_ok:
-                lines.append(f"    ≈ {change.name}：已完成（总餐次 {change.total_before}，日期格已填）")
-            else:
-                need_cell = "" if change.target_ok else f"，日期格 {CELL_MARK}"
-                lines.append(f"    · {change.name}（{change.phone}）"
-                             f"总餐次 {change.total_before}→{change.total_after}{need_cell}")
-                if change.detail:
-                    lines.append(f"        {change.detail}")
+            lines.extend(_change_lines(change))
         if not plan.changes:
             lines.append("    （无变更）")
     return "\n".join(lines)

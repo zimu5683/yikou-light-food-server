@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Callable
 
-from app.wps.common import FIRST_DATA_ROW, normalize_phone
+from app.wps.common import FIRST_DATA_ROW, WEEKDAYS, normalize_phone
 from app.wps.errors import WpsCloudError
 from app.wps.models import CloudOrder
 
@@ -17,13 +17,31 @@ LOCAL_SHEETS = ("东湖中餐", "衣锦中餐", "医学院中餐",
 
 LOCAL_COL = {
     "order": 1, "name": 2, "address": 3, "phone": 4,
+    # 周一~周日 七列（1-based）：记录的是**这一批要送的那天**是周几，
+    # 云同步用它核对"本地表是不是这次目标日期的批次"（见 planner）。
+    "weekdays": (5, 6, 7, 8, 9, 10, 11),
     "type": 12, "kind": 13, "meals": 14,
 }
+
+
+def _weekday_marks(cells: Iterable[Any]) -> tuple[str, ...]:
+    """从一行的「周一~周日」七格里读出标记（只为真值格；``0``/空格都不算）。"""
+    values = list(cells)
+    marks: list[str] = []
+    for name, raw in zip(WEEKDAYS, values):
+        text = str(raw if raw is not None else "").strip()
+        if text and text != "0":
+            marks.append(name)
+    return tuple(marks)
+
 
 def read_local_orders(excel_path: str | os.PathLike[str], *,
                       sheets: Iterable[str] = LOCAL_SHEETS,
                       log: Callable[[str], Any] | None = None) -> dict[str, list[CloudOrder]]:
-    """读取本地排单工作簿，返回 {子表名: [CloudOrder, ...]}。
+    """读取本地排单工作簿，返回 {子表名: [CloudOrder, ...]}（**一行一条**）。
+
+    同一个人的多行**在这里保持原样**（不合并不去重）：由 ``planner`` 按
+    "每行算 1 餐"相加并给出提示（见 ``planner._sum_rows_per_person``）。
 
     只读取，绝不修改本地文件。
     """
@@ -64,6 +82,10 @@ def read_local_orders(excel_path: str | os.PathLike[str], *,
                     meal_kind=str(cells[LOCAL_COL["kind"] - 1] or "").strip(),
                     meals=meals,
                     row=row_idx,
+                    order_no=str(cells[LOCAL_COL["order"] - 1] or "").strip(),
+                    rows=(row_idx,),
+                    weekday_marks=_weekday_marks(
+                        cells[col - 1] for col in LOCAL_COL["weekdays"]),
                 ))
             result[sheet] = orders
     finally:

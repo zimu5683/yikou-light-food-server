@@ -108,6 +108,8 @@ export interface WpsPlanSummary {
   to_append: number
   unchanged: number
   warned: number
+  /** 日期格已被协作者写了别的值（例如 0 = 当天不送），本次没动这一格的人数。 */
+  skipped?: number
 }
 
 export interface WpsCopyCheckItem {

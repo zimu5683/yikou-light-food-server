@@ -44,6 +44,12 @@ HEADER_REMARK = ("备注",)
 CELL_MARK = "1"
 
 
+# 本地排单表里「周一~周日」七列的名字（下标 = ``datetime.date.weekday()``）。
+# 排除「当天不送」的 0 之前必须先知道协作者写的 0 是什么意思：日期格里的 0 是
+# 协作者的明确决定，程序只读不写（见 planner/executor）。
+WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+
 FIRST_DATA_ROW = 3
 
 

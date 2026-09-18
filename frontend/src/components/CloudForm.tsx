@@ -4,7 +4,10 @@
  * 设计（详见 design/WPS-CLOUD-SYNC-PLAN.md）：
  * - 默认开启「测试模式」，只写测试文件，绝不碰正式排单表；
  * - 写入前必须先点「预览」，看清"会改谁、改成几"再确认上传；
- * - 总餐次写的是本地餐次的**绝对值**，因此重复上传不会翻倍；
+ * - 总餐次 = 云端现有的 + 本地本次的餐次（累加），靠本地账本 wps_sync_state.json
+ *   按行（槽位）记住"这批已经同步过多少餐"，因此同一批重复上传不会翻倍；
+ * - 同一个人一天下两单（含一单两份）→ 云端也两行、各标当天 1，这天送两餐；
+ * - 协作者已经在日期格里写的 0（当天不送）只读不写；
  * - 「地址排序」按子表维护列B 的顺序：新增客户先插到第 3、4 行之间再整表重排；
  * - 任何失败都只记日志，不影响本地排单任务。
  */
@@ -230,7 +233,10 @@ export function CloudForm({ logReveal }: { logReveal?: LogReveal }) {
         <p className="font-medium text-foreground">把本地排单表同步到 WPS 云端</p>
         <p className="mt-1 text-muted-foreground">
           只写入"日期格 1"和"总餐次"，不改动云端其它内容（公式、排序、颜色都保留）。
-          总餐次取本地表的绝对值，重复上传不会翻倍。
+          总餐次 = 云端现有的 + 本地这次的餐次（例如云端 5 餐 + 本地新下 6 餐 = 11 餐）；
+          同一天下了两单（含一单两份）会在云端占两行、各标当天 1 —— 这样这天送两餐；
+          本地账本按行记住"这批已同步过多少餐"，同一批重复上传不会翻倍。
+          协作者已经在日期格里写的 0（当天不送）一个字节都不改。
         </p>
       </div>
 
@@ -517,8 +523,9 @@ export function CloudForm({ logReveal }: { logReveal?: LogReveal }) {
 
       {summary ? (
         <p className="mt-2 text-xs text-muted-foreground">
-          本次：需更新 <b>{summary.to_update}</b> 人，新增 <b>{summary.to_append}</b> 人，
-          已完成 <b>{summary.unchanged}</b> 人
+          本次：需更新 <b>{summary.to_update}</b> 行，新增 <b>{summary.to_append}</b> 行，
+          不用动 <b>{summary.unchanged}</b> 行
+          {summary.skipped ? `，跳过 ${summary.skipped} 行（日期格是协作者写的）` : ''}
           {summary.warned > 0 ? `，注意 ${summary.warned} 项` : ''}
           {pending === 0 ? '（云端已经是这个样子，上传不会产生改动）' : ''}
         </p>

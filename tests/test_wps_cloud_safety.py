@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 
 import pytest
 
@@ -128,6 +129,60 @@ def _plans(cli, *, name="新人", sort=True, address_order=None):
 def _existing_rows():
     return [{0: "老客户", 1: "小", 2: "111", 7: "3"},
             {0: "老客户二", 1: "b2", 2: "222", 7: "3"}]
+
+
+# ----------------------------------------------------------------------
+# 新增红线：本地表批次日期不符 → 整张表一个格子都不写
+# ----------------------------------------------------------------------
+def test_stale_batch_writes_nothing_and_records_nothing(tmp_path):
+    """本地表的星期标记与目标日期不符：连通讯记号都不写，账本也不记。
+
+    这是"拿错本地表会把同一批餐重复加到云端"的唯一防线；一旦它漏写一个格子，
+    协作者的正式表就被污染，而账本记错会让下一次上传再加一遍。
+    """
+    cli = FakeCli(make_grid(BASE_HEADER, _existing_rows()))
+    wrong = [CloudOrder("东湖中餐", "老客户", "小", "111", "中餐", "经济", 6,
+                        weekday_marks=("周六",))]
+    plans = build_plan(cli, local_orders={"东湖中餐": wrong},
+                       tables={"东湖中餐": {"file_id": "F1"}},
+                       target=dt.date(2026, 9, 11),       # 周五
+                       ledger=None, address_order={}, sort_enabled=True)
+    ledger = _ledger(tmp_path)
+    messages: list[str] = []
+
+    result = apply_plan(cli, plans, ledger=ledger, marker_enabled=True,
+                        log=lambda *a: messages.append(str(a[0])))
+
+    assert result["sheets"][0]["status"] == "stale_batch"
+    assert result["failed"] == 1 and result["written"] == 0
+    assert cli.inserts == [] and cli.sorts == [] and cli.deleted_rows == []
+    assert (1, 13) not in cli.grid, "通讯记号格（备注+3）不许写"
+    assert cli.grid.get((1, 10)) == "备注", "原有的表头格不该被动过"
+    assert cli.grid[(2, 7)] == "3", "老客户的总餐次一个字都不能动"
+    assert ledger.data.get("batches", {}) == {}, "被拒绝的表绝不能记账本"
+    assert any("别的日期" in m for m in messages), messages
+
+
+# ----------------------------------------------------------------------
+# 新增红线：计划阶段只读账本（否则预览会写盘、并发会互相踩）
+# ----------------------------------------------------------------------
+def test_building_a_plan_never_mutates_the_ledger(tmp_path):
+    """``build_plan`` 查账本必须是纯读：预览不落盘，6 张表并发也不会改状态。"""
+    ledger = _ledger(tmp_path)
+    ledger.record("2026-09-11", "F1", {"老客户\u0000111": {"local": 3, "total": 6}})
+    snapshot = json.loads(json.dumps(ledger.data))
+    cli = FakeCli(make_grid(BASE_HEADER, _existing_rows()))
+    orders = [CloudOrder("东湖中餐", "老客户", "小", "111", "中餐", "经济", 6),
+              CloudOrder("东湖中餐", "老客户二", "b2", "222", "中餐", "经济", 6)]
+
+    plans = build_plan(cli, local_orders={"东湖中餐": orders},
+                       tables={"东湖中餐": {"file_id": "F1"}},
+                       target=dt.date(2026, 9, 11), ledger=ledger,
+                       address_order={}, sort_enabled=False)
+
+    assert ledger.data == snapshot, "计划阶段不得改动账本（预览是只读的）"
+    assert plans[0].changes[0].ledger_prev == 3
+    assert plans[0].previous_batch
 
 
 # ----------------------------------------------------------------------

@@ -46,10 +46,12 @@ def _rollback_inserts(cli: KdocsCli, plan: SheetPlan, worksheet_id: int,
     emit(f"[云同步] {plan.sheet}：已回滚 {len(inserted)} 处插入，云端恢复原状")
 
 def read_person_rows(cli: KdocsCli, plan: SheetPlan, worksheet_id: int, *,
-                     last_row: int) -> dict[tuple[str, str], int]:
-    """回读「姓名+电话」列，返回 ``{(姓名, 电话): 行号}``（1-based）。
+                     last_row: int) -> dict[tuple[str, str], list[int]]:
+    """回读「姓名+电话」列，返回 ``{(姓名, 电话): [行号, ...]}``（1-based，按表内顺序）。
 
     整表排序后人行号全变了，必须靠这个重新定位到每个人的新行号。
+    **一个人可能有多行**（一天两单）：第 i 个元素就是他的第 i 个槽位 ——
+    排序是稳定的，所以同一个人的多行相对顺序与排序前一致。
     只读 3 列，一次调用。
     """
     name_col = plan.columns.get("name") or 1
@@ -58,13 +60,34 @@ def read_person_rows(cli: KdocsCli, plan: SheetPlan, worksheet_id: int, *,
     row_from = FIRST_DATA_ROW if last_row >= FIRST_DATA_ROW else FIRST_DATA_ROW
     grid = cli.read_grid(plan.file_id, worksheet_id,
                          row_from - 1, max(last_row, row_from) - 1, lo - 1, hi - 1)
-    index: dict[tuple[str, str], int] = {}
+    index: dict[tuple[str, str], list[int]] = {}
     for (row, col), text in grid.items():
         if col != name_col - 1 or not str(text).strip():
             continue
         phone = grid.get((row, phone_col - 1), "")
-        index.setdefault(person_key(text, phone), row + 1)
+        key = person_key(text, phone)
+        if row + 1 not in index.setdefault(key, []):
+            index[key].append(row + 1)
+    for rows in index.values():
+        rows.sort()
     return index
+
+def _ledger_entries(pending: Sequence[Change]) -> dict[str, dict[str, Any]]:
+    """账本条目：``{姓名+电话: {"local": 合计, "slots": [每行餐次], "total": ...}}``。
+
+    ``slots`` 是**幂等锚点**：本地第 i 行 = 云端这个人的第 i 行 = 第 i 个槽位，
+    下次上传时增量 = 本地第 i 行餐次 − 账本第 i 个槽位，所以同一批重复上传
+    增量为 0，一个格子都不写。``total`` 只作审计/排查。
+    """
+    grouped: dict[str, dict[str, Any]] = {}
+    for change in sorted(pending, key=lambda item: item.slot):
+        key = f"{change.name}\u0000{change.phone}"
+        entry = grouped.setdefault(key, {"slots": [], "total": 0})
+        entry["slots"].append(change.local_meals)
+        entry["total"] += change.total_after
+    for entry in grouped.values():
+        entry["local"] = sum(entry["slots"])
+    return grouped
 
 def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
                ledger: SyncLedger | None = None,
@@ -87,6 +110,14 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
     emit = log or (lambda _msg, _level="INFO": None)
     result: dict[str, Any] = {"sheets": [], "written": 0, "failed": 0}
     for plan in plans:
+        # 整张表被拒绝（本地表批次日期与目标日期不符）：一个格子都不写，
+        # 连通讯记号都不写 —— 否则会在别人的正式表里留下"今天传过"的痕迹。
+        if plan.blocked_reason:
+            emit(f"[云同步] {plan.sheet}：{plan.blocked_reason}", "ERROR")
+            result["sheets"].append({"sheet": plan.sheet, "status": "stale_batch",
+                                     "reason": plan.blocked_reason})
+            result["failed"] += 1
+            continue
         if not plan.target_col:
             result["sheets"].append({"sheet": plan.sheet, "status": "skipped",
                                      "reason": "未找到目标日期列"})
@@ -259,7 +290,7 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
                 result["failed"] += 1
                 continue
             missing = [c for c in plan.changes
-                       if person_key(c.name, c.phone) not in actual_rows]
+                       if len(actual_rows.get(person_key(c.name, c.phone), ())) < c.slot]
             if missing:
                 names = "、".join(c.name for c in missing[:5])
                 emit(f"[云同步] {plan.sheet} 排序后定位不到这些人：{names}，已停止写入",
@@ -271,12 +302,13 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
             drift = 0
             for change in plan.changes:
                 key = person_key(change.name, change.phone)
-                row = actual_rows[key]
-                if plan.final_rows.get(key, row) != row:
+                row = actual_rows[key][change.slot - 1]
+                predicted = plan.final_rows.get(key, ())
+                if len(predicted) >= change.slot and predicted[change.slot - 1] != row:
                     drift += 1
                     if drift <= 3:
-                        emit(f"[云同步] {plan.sheet}：{change.name} 实际排在第 {row} 行，"
-                             f"与预测不符（按实际行号写入）", "WARN")
+                        emit(f"[云同步] {plan.sheet}：{change.name} 第 {change.slot} 行"
+                             f"实际排在第 {row} 行，与预测不符（按实际行号写入）", "WARN")
                 change.row = row
             if drift:
                 plan.sort_mismatch = True
@@ -300,7 +332,9 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
                 if change.fill_kind and plan.columns.get("kind"):
                     cells.append({"row": change.row, "col": plan.columns["kind"],
                                   "value": change.meal_kind})
-            if not change.target_ok:
+            if not change.target_ok and not change.target_blocked:
+                # 协作者写了 0（当天不送）等值时只读不写：那是他的明确决定，
+                # 不是"这一格还没填"。覆盖它会让「闪时送下单」多送一份餐。
                 cells.append({"row": change.row, "col": change.target_col, "value": CELL_MARK})
         formula_cells = formula_cells_for_new_rows(
             plan, [c.row for c in pending if c.kind == "new"])
@@ -350,7 +384,7 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
                 if ledger is not None and pending:
                     # 数据已写入，账本仍要记，避免下次重复写入
                     ledger.record(plan.target_date.isoformat(), plan.file_id,
-                                  {f"{c.name}\u0000{c.phone}": c.total_after for c in pending})
+                                  _ledger_entries(pending))
                 result["written"] += 1
                 continue
             problems: list[str] = []
@@ -366,8 +400,10 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
                         problems.append(f"第 {change.row} 行应为「{change.name}」，"
                                         f"实际「{got_name}」")
                 got_mark = str(back.get((change.row - 1, plan.target_col - 1), "")).strip()
-                if got_mark != CELL_MARK:
-                    problems.append(f"{change.name}: 目标列应为 {CELL_MARK}，实际 {got_mark!r}")
+                # 目标格被协作者占用的（写了 0 等）：期望值就是**原样不动**，不是 1。
+                want_mark = change.target_occupied or CELL_MARK
+                if got_mark != want_mark:
+                    problems.append(f"{change.name}: 目标列应为 {want_mark}，实际 {got_mark!r}")
                 if plan.columns.get("total"):
                     got_total = _as_int(back.get((change.row - 1, plan.columns["total"] - 1)))
                     if got_total != change.total_after:
@@ -388,9 +424,9 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
                 result["failed"] += 1
                 continue
         if ledger is not None and pending:
-            # 账本仅作留痕/审计：记录本次写入后每人的总餐次与目标日期格状态
-            entries = {f"{c.name}\u0000{c.phone}": c.total_after for c in pending}
-            ledger.record(plan.target_date.isoformat(), plan.file_id, entries)
+            # 账本不只是留痕：它是"本次该加几餐"的幂等锚点，必须与写入结果一致。
+            ledger.record(plan.target_date.isoformat(), plan.file_id,
+                          _ledger_entries(pending))
         result["sheets"].append({"sheet": plan.sheet, "status": "ok",
                                  "cells": len(cells), "people": len(pending),
                                  "sorted": bool(plan.sort_enabled),
@@ -400,7 +436,8 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
         try:
             ledger.save()
         except OSError as exc:
-            emit(f"[云同步] 账本保存失败：{exc}")
+            emit(f"[云同步] 账本保存失败（{exc}）：下次上传可能把同一批餐再加一遍，"
+                 f"请先点「预览」核对「本次 +N」再决定是否上传", "ERROR")
     return result
 
 def learn_row_format(cli: "KdocsCli", file_id: str, worksheet_id: int, *,
