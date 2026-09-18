@@ -144,10 +144,10 @@ export const LOG_REVEAL_ORIGIN =
   `calc(100% - var(--safe-right) - ${FAB.rightPx + FAB.sizePx / 2}px) ` +
   `calc(var(--safe-top) + ${FAB.sizePx / 2}px)`
 
-/** 2 倍视口长边一定大于屏幕对角线，足够从右上角盖住全屏。 */
-export const LOG_REVEAL_RADIUS = '200vmax'
+/** 屏幕对角线最大值是 141.42vmax；142vmax 刚好盖满全屏，不做过多的无效扩大。 */
+export const LOG_REVEAL_RADIUS = '142vmax'
 
-/** 展开：半径 0 → 200vmax，圆心始终固定在右上角日志按钮中心。 */
+/** 展开：半径 0 → LOG_REVEAL_RADIUS（142vmax），圆心始终固定在右上角日志按钮中心。 */
 export function openFramesCss(): RevealFrames {
   return {
     from: circleClipCss('0px'),
@@ -155,7 +155,7 @@ export function openFramesCss(): RevealFrames {
   }
 }
 
-/** 收回：半径 200vmax → 0，圆心不变。 */
+/** 收回：半径 LOG_REVEAL_RADIUS（142vmax）→ 0，圆心不变。 */
 export function closeFramesCss(): RevealFrames {
   const opened = openFramesCss()
   return { from: opened.to, to: opened.from }

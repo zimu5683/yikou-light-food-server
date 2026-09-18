@@ -10,7 +10,7 @@ import type { AddressInputRequest } from '@/lib/bridge'
 import { statusLabel, useApp } from '@/hooks/appContext'
 import { cn } from '@/lib/utils'
 import { formatLogMsg, isOrderSummary, splitOrderSummary } from '@/lib/format'
-import { REVEAL_TIMING, canAnimate, closeFramesCss, openFramesCss, prefersReducedMotion } from '@/lib/reveal'
+import { LOG_REVEAL_ORIGIN, REVEAL_TIMING, canAnimate, closeFramesCss, openFramesCss, prefersReducedMotion } from '@/lib/reveal'
 import type { LogReveal } from '@/lib/useLogReveal'
 
 const LEVEL_CLASS: Record<string, string> = {
@@ -215,6 +215,9 @@ function currentClipPath(element: HTMLElement, fallback: string): string {
   return fallback
 }
 
+/** 关闭后的基础裁剪：半径为 0，面板常驻但不显示、不响应点击。 */
+const CLOSED_CLIP = `circle(0px at ${LOG_REVEAL_ORIGIN})`
+
 function PhoneLogSheet({ reveal }: { reveal: LogReveal }) {
   const { addressInput } = useApp()
   const [phase, setPhase] = useState<'closed' | 'open' | 'closing'>('closed')
@@ -283,6 +286,10 @@ function PhoneLogSheet({ reveal }: { reveal: LogReveal }) {
     revealAnimation.current = animation
     animation.onfinish = () => {
       if (revealAnimation.current === animation) revealAnimation.current = null
+      // 动画结束时没有 fill，computed clip-path 会短暂回到基础值；这里直接把
+      // 基础值写成 circle(0)，保证从「动画最后一帧」到「React 卸载/隐藏」之间
+      // 不会闪出完整日志。
+      element.style.clipPath = frames.to
       setPhase('closed')
     }
     animation.oncancel = () => {
@@ -291,8 +298,6 @@ function PhoneLogSheet({ reveal }: { reveal: LogReveal }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reveal.open, phase])
 
-  if (!reveal.open && phase === 'closed') return null
-
   return (
     <section
       id="phone-log-sheet"
@@ -300,14 +305,28 @@ function PhoneLogSheet({ reveal }: { reveal: LogReveal }) {
       role="dialog"
       aria-label="运行日志"
       aria-modal={reveal.open}
+      aria-hidden={phase === 'closed'}
       inert={phase !== 'open'}
       className={cn(
         'fixed inset-0 z-30 flex flex-col bg-background',
         // 收起动画进行中允许点击透传回原界面，避免面板还挡着操作
         phase !== 'open' && 'pointer-events-none',
       )}
-      // 全屏 clip-path 动画要单独提升为合成层，否则 Android WebView 容易逐帧重绘整页。
-      style={{ willChange: 'clip-path', transform: 'translateZ(0)', contain: 'paint' }}
+      // 面板常驻（关闭时 visibility:hidden + circle(0) 裁剪），这样：
+      // 1. 打开时布局/绘制已经预热，不再在第一帧现搭 DOM；
+      // 2. 关闭动画结束后基础 clipPath 仍是 circle(0)，不会瞬间恢复成完整日志而闪烁。
+      // clipPath / visibility 只做合成层上的裁剪，不再逐帧重排整页。
+      style={{
+        // 关闭动画期间不能提前设 circle(0)，否则反向水波会从半径 0 开始收缩；
+        // 关闭完成时由 onfinish 直接写基础样式，再切到 phase='closed'。
+        clipPath: phase === 'closed' ? CLOSED_CLIP : undefined,
+        visibility: reveal.open || phase !== 'closed' ? 'visible' : 'hidden',
+        pointerEvents: phase === 'open' ? 'auto' : 'none',
+        willChange: 'clip-path',
+        transform: 'translateZ(0)',
+        backfaceVisibility: 'hidden',
+        contain: 'layout paint style',
+      }}
     >
       <div
         className="flex min-h-0 flex-1 flex-col px-2.5"

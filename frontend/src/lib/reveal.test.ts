@@ -253,7 +253,7 @@ test('LOG_REVEAL_ORIGIN 直接定位到右上角日志按钮中心', () => {
   assert.ok(LOG_REVEAL_ORIGIN.includes('20px'))
 })
 
-test('openFramesCss 从半径 0 扩到 200vmax，圆心不变', () => {
+test('openFramesCss 从半径 0 扩到 LOG_REVEAL_RADIUS（142vmax），圆心不变', () => {
   const frames = openFramesCss()
   assert.equal(frames.from, `circle(0px at ${LOG_REVEAL_ORIGIN})`)
   assert.equal(frames.to, `circle(${LOG_REVEAL_RADIUS} at ${LOG_REVEAL_ORIGIN})`)
