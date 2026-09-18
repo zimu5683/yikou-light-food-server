@@ -67,10 +67,9 @@ export default function App() {
   const { config, setSplitRatio, authError, workerAlive } = useApp()
   const layout = useLayout()
   const [ratio, setRatio] = useState(config?.split_ratio ?? 0.38)
-  // 手机端日志：开合与圆形水波圆心由 useLogReveal 管。
-  // 点右上角日志按钮、「开始处理/开始下单」、「确认上传」都从各自的按钮扩散。
-  const fabRef = useRef<HTMLButtonElement>(null)
-  const reveal = useLogReveal(fabRef)
+  // 手机端日志：开合由 useLogReveal 管；水波圆心固定在右上角日志按钮，
+  // 由 LogConsole 的 CSS keyframes 直接表达，不再做 DOM 坐标测量。
+  const reveal = useLogReveal()
   const containerRef = useRef<HTMLDivElement>(null)
   const dragging = useRef(false)
 
@@ -123,7 +122,6 @@ export default function App() {
           </main>
           {/* 日志的唯一入口：固定在右上角，收起/全屏时都保持可见 */}
           <LogFab
-            ref={fabRef}
             open={reveal.open}
             running={workerAlive}
             onToggle={() => reveal.toggleFrom(null)}

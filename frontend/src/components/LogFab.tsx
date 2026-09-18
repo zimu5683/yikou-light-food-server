@@ -10,20 +10,16 @@
  * 层级 z-40：高于全屏日志面板(z-30)，低于对话框与 Toast(z-50)，
  * 保证全屏日志时仍能点它收起，弹窗出现时也不会被按钮压住。
  */
-import type { Ref } from 'react'
 import { ScrollText } from 'lucide-react'
 
 import { FAB } from '@/lib/reveal'
 import { cn } from '@/lib/utils'
 
 export function LogFab({
-  ref,
   open,
   running,
   onToggle,
 }: {
-  /** 由 App 持有：扩散圆心要读这颗按钮的位置。React 19 允许 ref 当普通 prop 传。 */
-  ref?: Ref<HTMLButtonElement>
   open: boolean
   /** 任务运行中（LED 呼吸）。 */
   running: boolean
@@ -31,7 +27,6 @@ export function LogFab({
 }) {
   return (
     <button
-      ref={ref}
       type="button"
       aria-label={open ? '收起运行日志' : '展开运行日志'}
       aria-expanded={open}

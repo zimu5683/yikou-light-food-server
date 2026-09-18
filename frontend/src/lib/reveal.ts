@@ -133,6 +133,38 @@ export function closeFrames(origin: Point, rect: RectLike): RevealFrames {
   return { from: opened.to, to: opened.from }
 }
 
+/**
+ * 纯 CSS 圆心表达式：固定在右上角日志按钮中心。
+ *
+ * 不再由 JS 测量 `getBoundingClientRect()`，而是直接使用与 LogFab 相同的
+ * CSS 布局规则（right = safe-right + 12px，宽 40px；top = safe-top，高 40px）。
+ * 这样圆心由浏览器布局引擎决定，彻底避免 JS 测量/坐标系差异。
+ */
+export const LOG_REVEAL_ORIGIN =
+  `calc(100% - var(--safe-right) - ${FAB.rightPx + FAB.sizePx / 2}px) ` +
+  `calc(var(--safe-top) + ${FAB.sizePx / 2}px)`
+
+/** 2 倍视口长边一定大于屏幕对角线，足够从右上角盖住全屏。 */
+export const LOG_REVEAL_RADIUS = '200vmax'
+
+/** 展开：半径 0 → 200vmax，圆心始终固定在右上角日志按钮中心。 */
+export function openFramesCss(): RevealFrames {
+  return {
+    from: circleClipCss('0px'),
+    to: circleClipCss(LOG_REVEAL_RADIUS),
+  }
+}
+
+/** 收回：半径 200vmax → 0，圆心不变。 */
+export function closeFramesCss(): RevealFrames {
+  const opened = openFramesCss()
+  return { from: opened.to, to: opened.from }
+}
+
+function circleClipCss(radius: string): string {
+  return `circle(${radius} at ${LOG_REVEAL_ORIGIN})`
+}
+
 /** `window.matchMedia` 的最小可用形状（注入以便测试）。 */
 export type MatchMediaLike = (query: string) => { matches: boolean } | null | undefined
 

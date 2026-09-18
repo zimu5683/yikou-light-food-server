@@ -11,13 +11,17 @@ import test from 'node:test'
 
 import {
   FAB,
+  LOG_REVEAL_ORIGIN,
+  LOG_REVEAL_RADIUS,
   REVEAL_TIMING,
   canAnimate,
   centerOfRect,
   circleClip,
   closeFrames,
+  closeFramesCss,
   cornerRadius,
   openFrames,
+  openFramesCss,
   pointFromEvent,
   prefersReducedMotion,
   resolveOrigin,
@@ -236,4 +240,28 @@ test('日志按钮精确适配标题栏高度，且离右缘有安全间距', ()
   // 标题栏内容高度为 40px；再大会溢出边界，再小会显得单薄。
   assert.equal(FAB.sizePx, 40)
   assert.ok(FAB.rightPx >= 8)
+})
+
+// ----------------------------------------------------------------------
+// CSS 圆心：完全由布局表达式决定，不再依赖 JS 测量
+// ----------------------------------------------------------------------
+test('LOG_REVEAL_ORIGIN 直接定位到右上角日志按钮中心', () => {
+  assert.ok(LOG_REVEAL_ORIGIN.includes('100%'))
+  assert.ok(LOG_REVEAL_ORIGIN.includes('var(--safe-right)'))
+  assert.ok(LOG_REVEAL_ORIGIN.includes('var(--safe-top)'))
+  assert.ok(LOG_REVEAL_ORIGIN.includes('32px'))
+  assert.ok(LOG_REVEAL_ORIGIN.includes('20px'))
+})
+
+test('openFramesCss 从半径 0 扩到 200vmax，圆心不变', () => {
+  const frames = openFramesCss()
+  assert.equal(frames.from, `circle(0px at ${LOG_REVEAL_ORIGIN})`)
+  assert.equal(frames.to, `circle(${LOG_REVEAL_RADIUS} at ${LOG_REVEAL_ORIGIN})`)
+})
+
+test('closeFramesCss 是 openFramesCss 的倒放', () => {
+  const opened = openFramesCss()
+  const closed = closeFramesCss()
+  assert.equal(closed.from, opened.to)
+  assert.equal(closed.to, opened.from)
 })

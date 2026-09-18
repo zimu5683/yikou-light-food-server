@@ -10,7 +10,7 @@ import type { AddressInputRequest } from '@/lib/bridge'
 import { statusLabel, useApp } from '@/hooks/appContext'
 import { cn } from '@/lib/utils'
 import { formatLogMsg, isOrderSummary, splitOrderSummary } from '@/lib/format'
-import { REVEAL_TIMING, canAnimate, closeFrames, openFrames, prefersReducedMotion } from '@/lib/reveal'
+import { REVEAL_TIMING, canAnimate, closeFramesCss, openFramesCss, prefersReducedMotion } from '@/lib/reveal'
 import type { LogReveal } from '@/lib/useLogReveal'
 
 const LEVEL_CLASS: Record<string, string> = {
@@ -244,7 +244,7 @@ function PhoneLogSheet({ reveal }: { reveal: LogReveal }) {
     cancelReveal(revealAnimation)
     setPhase('open')
     if (!canAnimate(element) || prefersReducedMotion()) return
-    const frames = openFrames(reveal.origin, element.getBoundingClientRect())
+    const frames = openFramesCss()
     try {
       revealAnimation.current = element.animate(
         [{ clipPath: frames.from }, { clipPath: frames.to }],
@@ -268,7 +268,7 @@ function PhoneLogSheet({ reveal }: { reveal: LogReveal }) {
     }
     // 先记录「当前水波半径」再取消旧动画：如果用户展开到一半就点收起，
     // 收起要从当前可见半径继续缩，而不是跳回全屏再缩。
-    const frames = closeFrames(reveal.origin, element.getBoundingClientRect())
+    const frames = closeFramesCss()
     const startClip = currentClipPath(element, frames.from)
     cancelReveal(revealAnimation)
     setPhase('closing')
@@ -289,7 +289,7 @@ function PhoneLogSheet({ reveal }: { reveal: LogReveal }) {
       if (revealAnimation.current === animation) revealAnimation.current = null
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reveal.open, reveal.origin, phase])
+  }, [reveal.open, phase])
 
   if (!reveal.open && phase === 'closed') return null
 
