@@ -168,11 +168,44 @@ class AdminApiClient:
             timeout=self.timeout,
         )
 
+    def _apply_login_payload(self, payload: dict[str, Any]) -> None:
+        """校验并保存后端登录响应中的 token/uniacid。"""
+        if payload.get("code") not in (200, None):
+            raise ApiError(payload.get("msg") or f"管理后台登录失败（{payload.get('code')}）")
+
+        data = payload.get("data") or {}
+        user_info = data.get("user_info") or {}
+        self.token = str(data.get("token") or "")
+        self.uniacid = str(data.get("uniacid") or user_info.get("uniacid") or "")
+        if not self.token:
+            raise ApiError("管理后台登录响应中没有 token")
+        if not self.uniacid:
+            raise ApiError("管理后台登录响应中没有 uniacid")
+
+    def _android_webview_login(self) -> dict[str, Any] | None:
+        """APK 内优先用系统 WebView 登录，绕过 WAF 对 Python TLS 指纹的识别。
+
+        非 Android 环境或 WebView 兜底不可用时返回 ``None``，调用方继续走
+        requests 的换会话重试路径。
+        """
+        from app.integrations import android_web_login
+
+        if not android_web_login.is_android():
+            return None
+        try:
+            return android_web_login.webview_login(
+                self.origin, self.username, self.password,
+                timeout_ms=int(max(5.0, float(self.timeout)) * 1000),
+            )
+        except android_web_login.AndroidWebLoginError:
+            return None
+
     def login(self) -> None:
         """账号密码登录，保存 token 与 uniacid。
 
-        遇到 WAF 403 时，先清掉旧 cookie 重新访问站点，再换新会话重试一次；
-        这是浏览器首访会自动完成的行为，纯 requests 客户端需要显式模拟。
+        优先普通 requests（先预热拿 WAF cookie）。如果仍被 ``http_bot_simple``
+        403，APK 内改用系统 WebView 的 Chromium 环境执行同源 fetch；桌面/Termux
+        则换新 Session 重试一次。
         """
         self._warm_up_waf()
         try:
@@ -181,7 +214,13 @@ class AdminApiClient:
             raise ApiError(f"管理后台登录请求失败：{exc}") from exc
 
         if resp.status_code == 403:
-            # 403 大概率是 http_bot_simple：换全新 Session + 重新预热再试一次。
+            # APK：WebView 是真实 Chromium，TLS/JS 指纹能过 WAF。
+            webview_payload = self._android_webview_login()
+            if webview_payload is not None:
+                self._apply_login_payload(webview_payload)
+                return
+
+            # 桌面/Termux：换全新 Session + 重新预热再试一次。
             self.session.close()
             self.session = requests.Session()
             self.session.headers.update(_browser_headers(self.origin, admin=True))
@@ -194,25 +233,14 @@ class AdminApiClient:
         if resp.status_code == 403:
             raise ApiError(
                 "管理后台 WAF 拒绝了登录（HTTP 403，Denied by http_bot_simple）。"
-                "已自动按浏览器特征重试一次；请关闭 VPN/代理后重试，或稍后再试。"
+                "已尝试浏览器特征重试；请关闭 VPN/代理后重试，或稍后再试。"
             )
 
         try:
             payload = resp.json()
         except ValueError as exc:
             raise ApiError(f"管理后台登录返回非 JSON（HTTP {resp.status_code}）") from exc
-
-        if payload.get("code") not in (200, None):
-            raise ApiError(payload.get("msg") or f"管理后台登录失败（{payload.get('code')}）")
-
-        data = payload.get("data") or {}
-        user_info = data.get("user_info") or {}
-        self.token = str(data.get("token") or "")
-        self.uniacid = str(data.get("uniacid") or user_info.get("uniacid") or "")
-        if not self.token:
-            raise ApiError("管理后台登录响应中没有 token")
-        if not self.uniacid:
-            raise ApiError("管理后台登录响应中没有 uniacid")
+        self._apply_login_payload(payload)
 
     def get_json(self, path: str) -> dict[str, Any]:
         """带鉴权 GET 并解析 JSON，401 按登录失效处理。"""

@@ -224,3 +224,45 @@ def test_admin_login_reports_waf_after_retry(monkeypatch):
         assert "VPN" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("连续 403 必须抛 ApiError")
+
+
+# ----------------------------------------------------------------------
+# Android WebView 登录兜底
+# ----------------------------------------------------------------------
+def test_android_web_login_parses_native_envelope(monkeypatch):
+    from app.integrations import android_web_login
+
+    class _FakeJava:
+        def loginJson(self, origin, username, password, timeout_ms):
+            assert origin == "https://m.icall.me"
+            assert username == "u" and password == "p"
+            assert timeout_ms == 30_000
+            return '{"ok": true, "status": 200, ' \
+                   '"body": "{\\"code\\":200,\\"data\\":{\\"token\\":\\"t\\",\\"uniacid\\":\\"x\\"}}"}'
+
+    monkeypatch.setattr(android_web_login, "is_android", lambda: True)
+    monkeypatch.setattr(android_web_login, "_java_class", lambda: _FakeJava())
+
+    payload = android_web_login.webview_login(
+        "https://m.icall.me", "u", "p", timeout_ms=30_000)
+
+    assert payload["code"] == 200
+    assert payload["data"]["token"] == "t"
+
+
+def test_admin_login_uses_webview_fallback_on_403(monkeypatch):
+    _FakeSession.instances = []
+    _FakeSession.post_statuses = [403]
+    monkeypatch.setattr(api_client_module.requests, "Session", _FakeSession)
+
+    client = AdminApiClient("https://m.icall.me/admin/#/login", "u", "p", timeout=5)
+    monkeypatch.setattr(client, "_android_webview_login", lambda: {
+        "code": 200,
+        "data": {"token": "wv-token", "uniacid": "wv-uniacid"},
+    })
+    client.login()
+
+    assert client.token == "wv-token"
+    assert client.uniacid == "wv-uniacid"
+    # 成功走 WebView 后不应再创建新 Session 做第二次 requests 重试。
+    assert len(_FakeSession.instances) == 1
