@@ -34,8 +34,11 @@ def test_apk_version_matches_python_version():
     assert props["versionName"] == __version__, (
         "android/version.properties 与 app/__init__.py 版本不一致；"
         "发版时必须一起改，否则应用内更新会误判")
-    major, minor, patch = (int(part) for part in __version__.split("."))
-    assert int(props["versionCode"]) == major * 10000 + minor * 100 + patch
+    parts = [int(part) for part in __version__.split(".")]
+    assert len(parts) in (3, 4), f"版本号必须是 x.y.z 或 x.y.z.w：{__version__}"
+    major, minor, patch = parts[0], parts[1], parts[2]
+    build = parts[3] if len(parts) == 4 else 0
+    assert int(props["versionCode"]) == major * 1_000_000 + minor * 10_000 + patch * 100 + build
 
 
 def test_gradle_targets_only_arm64_and_python_313():

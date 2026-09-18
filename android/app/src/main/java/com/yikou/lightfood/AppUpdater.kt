@@ -158,7 +158,7 @@ object AppUpdater {
     // 纯函数 / 兼容旧测试
     // ------------------------------------------------------------------
 
-    /** 语义化版本比较，兼容 ``v3.5.0`` 与 ``3.5.0``；不可比时返回 -1。 */
+    /** 语义化版本比较，兼容 ``v3.5.0`` / ``3.6.6.1``；不可比时返回 -1。 */
     fun compareVersions(left: String, right: String): Int {
         val lhs = parseVersion(left) ?: return -1
         val rhs = parseVersion(right) ?: return -1
@@ -173,7 +173,7 @@ object AppUpdater {
     private fun parseVersion(value: String): List<Int>? {
         val parts = value.removePrefix("v").split(".")
         val numbers = parts.map { it.toIntOrNull() ?: return null }
-        return if (numbers.size == 3) numbers else null
+        return if (numbers.size in 3..4) numbers else null
     }
 
     @Suppress("DEPRECATION")

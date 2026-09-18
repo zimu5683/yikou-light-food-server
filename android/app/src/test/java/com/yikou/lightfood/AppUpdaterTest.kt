@@ -10,6 +10,9 @@ class AppUpdaterTest {
         assertEquals(1, AppUpdater.compareVersions("v3.6.0", "3.5.0"))
         assertEquals(-1, AppUpdater.compareVersions("v3.5.0", "3.5.1"))
         assertEquals(1, AppUpdater.compareVersions("4.0.0", "3.99.99"))
+        assertEquals(1, AppUpdater.compareVersions("3.6.6.1", "3.6.6"))
+        assertEquals(0, AppUpdater.compareVersions("3.6.6.0", "3.6.6"))
+        assertEquals(-1, AppUpdater.compareVersions("3.6.6.1", "3.6.6.2"))
         assertEquals(-1, AppUpdater.compareVersions("not-version", "3.5.0"))
     }
 }

@@ -642,10 +642,8 @@ function SourceButton({
  * （横向内边距由自己给）。底部安全区不在这里加：手机最底部是 tab 栏。
  */
 function BottomDock({ children }: { children: ReactNode }) {
-  // data-task-dock：`useDockHeight` 靠它量出操作栏高度，好把悬浮按钮摆在
-  // 操作栏上方（压在「停止/更多」上就点不到了）。见 lib/useDockHeight.ts。
   return (
-    <div data-task-dock className="shrink-0 border-t bg-background px-3 pb-3 pt-2.5 sm:px-5">
+    <div className="shrink-0 border-t bg-background px-3 pb-3 pt-2.5 sm:px-5">
       {children}
     </div>
   )

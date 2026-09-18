@@ -3,7 +3,7 @@
  *
  * 为什么单独抽出来：圆形扩散**算错不会报错**，只会表现为「水波没盖住面板，
  * 角落露出空白」或「半径太小，日志内容被切掉」。抽成纯函数后可以用
- * `node --test` 直接覆盖，不依赖 jsdom（和 `logSheet.ts` 同一套路数）。
+ * `node --test` 直接覆盖，不依赖 jsdom。
  *
  * ## 这个圆是怎么来的
  *
@@ -13,21 +13,18 @@
  * react-theme-switch-animation 内部用的是同一个套路，区别只是我们不做
  * View Transitions 快照（那会让流式日志在动画期间停止刷新）。
  *
- * ## 为什么起始半径是 0，而且展开时面板要「瞬间到目标高度」
+ * ## 起始半径 0
  *
- * 收起状态下面板只剩底部一条 34px 把手条。若让面板高度照常做 200ms 过渡、
- * 同时跑扩散动画，扩散会在面板还没长起来时就把它整个盖住 —— 水波变成一闪
- * 而过（实测半径增长远快于高度增长）。所以展开时高度**直接跳到目标值**、
- * 由圆形裁剪负责揭示，`App` 里主内容区的 `padding-bottom` 另做 200ms 过渡
- * 让表单平滑上移。起始半径取 0 是 Material 圆形揭示的标准做法：水波从按钮
- * 那一点涌出，约三分之一行程时扫过把手条。
+ * 收起状态下面板不存在，展开时面板直接铺满整个视口，只由 `clip-path` 的
+ * 圆形半径从 0 扩到「盖住四角」的最大值。没有高度过渡，也没有自下而上的
+ * 翻滚；`start` 半径取 0 是 Material 圆形揭示的标准做法：水波从按钮那一点
+ * 涌出，逐渐扫过整个屏幕。
  *
- * ## 为什么收起不做圆形动画
+ * ## 收起做反向水波
  *
- * 面板贴底、把手条就是它的最下面一条，而圆心在面板上方 —— 把手条的某个角
- * 往往**就是整个面板的最远角**（`cornerRadius` 两者相等），收缩圆会变成空
- * 操作。收起沿用原有的高度下滑过渡（见 `LogConsole` 的 `PhoneLogSheet`），
- * 平滑且不会出现「把手条啪地弹出来」。
+ * 收起时面板保持全屏尺寸，由 `circleClip` 从「盖住四角的最大半径」缩回
+ * 按钮圆心的半径 0，露出下面的任务界面；日志按钮始终固定在上层，点击它
+ * 即可开合。
  */
 
 /** 视口坐标下的一个点（与 clientX/clientY 同一坐标系）。 */
@@ -44,25 +41,22 @@ export interface RectLike {
   height: number
 }
 
-/** 扩散动画的时长与缓动。 */
+/** 扩散/收回动画的时长与缓动。 */
 export const REVEAL_TIMING = {
   openMs: 360,
   openEase: 'cubic-bezier(0.22, 1, 0.36, 1)',
+  /** 收回稍快，反向水波不拖手。 */
+  closeMs: 260,
+  closeEase: 'cubic-bezier(0.4, 0, 0.2, 1)',
 } as const
 
-/** 悬浮按钮的尺寸与落点。 */
+/** 右上角日志按钮的尺寸与落点。 */
 export const FAB = {
-  sizePx: 48,
-  /** 距屏幕右缘。 */
+  sizePx: 44,
+  /** 距屏幕右缘（在安全区之外，调用方会再叠加 --safe-right）。 */
   rightPx: 12,
-  /** 与下方操作栏之间的空隙。 */
-  gapPx: 10,
-  /**
-   * 量不到操作栏高度时的兜底值（云文档页签没有操作栏）。
-   * 与 `TaskPanel` 里 BottomDock 的实际高度一致：pt-2.5(10) + 按钮 38 +
-   * mt-3(12) + 「更多」一行 18 + pb-3(12) = 90。
-   */
-  fallbackDockPx: 90,
+  /** 量不到按钮位置时的兜底顶边距（正常由 ref 实测中心）。 */
+  fallbackTopPx: 0,
 } as const
 
 /** 从指针事件里取视口坐标。 */
@@ -131,6 +125,12 @@ export function openFrames(origin: Point, rect: RectLike): RevealFrames {
   }
 }
 
+/** 收回：从盖住整个面板的圆缩回按钮那一点。 */
+export function closeFrames(origin: Point, rect: RectLike): RevealFrames {
+  const opened = openFrames(origin, rect)
+  return { from: opened.to, to: opened.from }
+}
+
 /** `window.matchMedia` 的最小可用形状（注入以便测试）。 */
 export type MatchMediaLike = (query: string) => { matches: boolean } | null | undefined
 
@@ -155,16 +155,4 @@ export function prefersReducedMotion(matchMedia?: MatchMediaLike): boolean {
 /** 环境是否支持 Web Animations API（老 WebView 上退化为「直接落终态」）。 */
 export function canAnimate(element?: { animate?: unknown } | null): boolean {
   return typeof element?.animate === 'function'
-}
-
-/**
- * 量到的多个操作栏高度里选一个用。
- *
- * 三个页签常驻挂载、非当前页签是 `display:none`（高度 0），所以取**最大**的
- * 那个可见值；一个都没量到（云文档页签本来就没有操作栏）时退回兜底值，
- * 避免悬浮按钮贴到屏幕最底部。
- */
-export function pickDockHeight(heights: number[], fallback: number = FAB.fallbackDockPx): number {
-  const visible = heights.filter((height) => Number.isFinite(height) && height > 0)
-  return visible.length > 0 ? Math.max(...visible) : fallback
 }

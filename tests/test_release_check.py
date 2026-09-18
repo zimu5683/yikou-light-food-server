@@ -16,6 +16,13 @@ def test_compare_versions_basic():
     assert update_mod.compare_versions("not-semver", "3.5.0") == -1
 
 
+def test_compare_versions_accepts_four_segment_hotfix():
+    assert update_mod.compare_versions("3.6.6.1", "3.6.6") > 0
+    assert update_mod.compare_versions("3.6.6", "3.6.6.0") == 0
+    assert update_mod.compare_versions("3.6.6.1", "3.6.6.2") < 0
+    assert update_mod.compare_versions("v3.6.6.1", "3.6.6.1") == 0
+
+
 def test_release_urls_point_to_two_distinct_repositories():
     assert update_mod.WEB_REPOSITORY != update_mod.DESKTOP_REPOSITORY
     assert update_mod.releases_url(update_mod.WEB_REPOSITORY).endswith(

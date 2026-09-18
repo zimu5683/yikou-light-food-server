@@ -1,11 +1,10 @@
 /**
- * `lib/reveal.ts` 的回归锁 —— 手机端日志「水波扩散」的几何与降级判定。
+ * `lib/reveal.ts` 的回归锁 —— 手机端日志「水波展开/收回」的几何与降级判定。
  *
- * 这些计算**错了不会报错**，只会表现为别扭或残缺的动画，所以必须靠测试守住。
- * 对应使用者实际能看到的症状：
- * - 「水波扩散完，面板缺一角」→ 半径必须取四角最大，不能只算一角；
- * - 「半径算小了，日志内容被切掉」→ 结束半径必须盖住四个角；
- * - 「系统开了减弱动效还在转」→ prefersReducedMotion 的降级判定。
+ * 这些计算错了不会报错，只会表现为：
+ * - 水波扩散完面板缺一角 → 半径必须取四角最大；
+ * - 半径算小了日志被切掉 → 结束半径必须盖住四个角；
+ * - 收回时反向波不完整 → closeFrames 必须正好是 openFrames 的倒放。
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
@@ -16,9 +15,9 @@ import {
   canAnimate,
   centerOfRect,
   circleClip,
+  closeFrames,
   cornerRadius,
   openFrames,
-  pickDockHeight,
   pointFromEvent,
   prefersReducedMotion,
   resolveOrigin,
@@ -26,26 +25,15 @@ import {
   type RectLike,
 } from './reveal.ts'
 
-/** 手机视口 400×800：日志面板展开后占满宽度、贴底、高 500。 */
+/** 手机视口 400×800；日志展开后铺满整个视口。 */
 const VIEWPORT_W = 400
 const VIEWPORT_H = 800
-const SHEET: RectLike = { left: 0, top: 300, width: VIEWPORT_W, height: 500 }
+const SHEET: RectLike = { left: 0, top: 0, width: VIEWPORT_W, height: VIEWPORT_H }
 
-/** 收起时露出的把手条高度，与 `LOG_SHEET.peekPx` 一致。 */
-const PEEK = 34
-/** 操作栏高度（BottomDock 实测值），与 `FAB.fallbackDockPx` 一致。 */
-const DOCK = FAB.fallbackDockPx
-
-/** 悬浮按钮**收起时**的中心：它停在操作栏上方。点它就是在这个位置扩散。 */
+/** 右上角日志按钮的中心：展开、收回都围绕这个点扩散。 */
 const FAB_CENTER: Point = {
   x: VIEWPORT_W - FAB.rightPx - FAB.sizePx / 2,
-  y: VIEWPORT_H - (PEEK + DOCK + FAB.gapPx) - FAB.sizePx / 2,
-}
-
-/** 悬浮按钮**展开后**的中心：跟着面板上移，此时在面板上边缘之外。 */
-const FAB_CENTER_OPEN: Point = {
-  x: FAB_CENTER.x,
-  y: VIEWPORT_H - (SHEET.height + DOCK + FAB.gapPx) - FAB.sizePx / 2,
+  y: FAB.fallbackTopPx + FAB.sizePx / 2,
 }
 
 function corners(rect: RectLike): Point[] {
@@ -67,37 +55,27 @@ function radiusOf(clip: string): number {
   return Number.parseInt(matched[1], 10)
 }
 
-// ----------------------------------------------------------------------
-// 真实几何自检：这组坐标就是手机上会发生的情形
-// ----------------------------------------------------------------------
-test('自检：收起时悬浮按钮在面板展开区域之内，展开后跑到面板上边缘之外', () => {
-  assert.ok(FAB_CENTER.y > SHEET.top && FAB_CENTER.y < VIEWPORT_H, '收起时按钮应在面板区域内')
-  assert.ok(FAB_CENTER_OPEN.y < SHEET.top, '展开后按钮应浮在面板上方')
+test('自检：日志按钮固定在视口右上角，且圆心到最远角足够远', () => {
+  assert.ok(FAB_CENTER.x > VIEWPORT_W * 0.75)
+  assert.ok(FAB_CENTER.y < VIEWPORT_H * 0.25)
+  assert.ok(cornerRadius(FAB_CENTER, SHEET) > 500)
 })
 
 // ----------------------------------------------------------------------
-// cornerRadius：必须盖住四个角（「面板缺一角」的根治点）
+// cornerRadius：必须盖住四个角
 // ----------------------------------------------------------------------
-test('cornerRadius 盖住矩形的四个角（圆心在矩形内部，即收起时点悬浮按钮）', () => {
+test('cornerRadius 盖住全屏日志的四个角', () => {
   const radius = cornerRadius(FAB_CENTER, SHEET)
   for (const corner of corners(SHEET)) {
     assert.ok(radius >= distance(FAB_CENTER, corner), `角落 ${JSON.stringify(corner)} 露在圆外`)
   }
 })
 
-test('cornerRadius 盖住矩形的四个角（圆心在矩形上方，即展开后点悬浮按钮）', () => {
-  const radius = cornerRadius(FAB_CENTER_OPEN, SHEET)
-  for (const corner of corners(SHEET)) {
-    assert.ok(radius >= distance(FAB_CENTER_OPEN, corner), `角落 ${JSON.stringify(corner)} 露在圆外`)
-  }
-})
-
 test('cornerRadius 取四角最大而不是最近的那个角', () => {
-  // 圆心偏右下：左上角最远。只算右下角会得到一个小得多的值。
-  const origin = { x: 380, y: 780 }
-  const far = distance(origin, { x: 0, y: 300 })
+  const origin = { x: 380, y: 20 }
+  const far = distance(origin, { x: 0, y: 800 })
   assert.equal(cornerRadius(origin, SHEET), Math.ceil(far))
-  assert.ok(cornerRadius(origin, SHEET) > distance(origin, { x: 400, y: 800 }))
+  assert.ok(cornerRadius(origin, SHEET) > distance(origin, { x: 400, y: 0 }))
 })
 
 test('cornerRadius 圆心在矩形正中心时等于半对角线', () => {
@@ -119,7 +97,6 @@ test('cornerRadius 对含 NaN 的矩形不产生 NaN，且仍盖住能算出来�
   const broken: RectLike = { left: 0, top: 0, width: Number.NaN, height: 10 }
   const radius = cornerRadius(FAB_CENTER, broken)
   assert.ok(Number.isFinite(radius), '半径不能是 NaN')
-  // 有效的那两个角（x=0 的上下角）仍要在圆内，否则会露出空白
   assert.ok(radius >= distance(FAB_CENTER, { x: 0, y: 0 }))
   assert.ok(radius >= distance(FAB_CENTER, { x: 0, y: 10 }))
 })
@@ -132,29 +109,26 @@ test('cornerRadius 向上取整（亚像素半径会让 clip-path 边缘发虚�
 })
 
 // ----------------------------------------------------------------------
-// openFrames：从按钮那一点扩到盖住整个面板
+// openFrames / closeFrames：展开和反向收回
 // ----------------------------------------------------------------------
-test('openFrames 从半径 0（按钮那一点）开始', () => {
+test('openFrames 从日志按钮那一点（半径 0）开始', () => {
   const frames = openFrames(FAB_CENTER, SHEET)
   assert.equal(frames.from, circleClip(FAB_CENTER, 0))
   assert.equal(radiusOf(frames.from), 0)
 })
 
-test('openFrames 的结束圆盖住整个面板（否则日志会被切掉一角）', () => {
-  for (const origin of [FAB_CENTER, FAB_CENTER_OPEN]) {
-    const frames = openFrames(origin, SHEET)
-    const endRadius = radiusOf(frames.to)
-    assert.equal(endRadius, cornerRadius(origin, SHEET))
-    for (const corner of corners(SHEET)) {
-      assert.ok(endRadius >= distance(origin, corner), `角落 ${JSON.stringify(corner)} 没被盖住`)
-    }
-    assert.ok(endRadius > radiusOf(frames.from), '结束半径必须大于起始半径，否则水波看不见')
+test('openFrames 的结束圆盖住整个全屏日志', () => {
+  const frames = openFrames(FAB_CENTER, SHEET)
+  const endRadius = radiusOf(frames.to)
+  assert.equal(endRadius, cornerRadius(FAB_CENTER, SHEET))
+  for (const corner of corners(SHEET)) {
+    assert.ok(endRadius >= distance(FAB_CENTER, corner), `角落 ${JSON.stringify(corner)} 没被盖住`)
   }
+  assert.ok(endRadius > radiusOf(frames.from), '结束半径必须大于起始半径，否则水波看不见')
 })
 
 test('openFrames 的半径增长足够明显（不是一闪而过）', () => {
-  // 从悬浮按钮扩散时，结束半径至少要比起始大 300px，否则肉眼几乎看不出水波
-  assert.ok(cornerRadius(FAB_CENTER, SHEET) - 0 >= 300)
+  assert.ok(cornerRadius(FAB_CENTER, SHEET) >= 300)
 })
 
 test('openFrames 在退化的矩形上也不产生 NaN', () => {
@@ -162,6 +136,13 @@ test('openFrames 在退化的矩形上也不产生 NaN', () => {
   const frames = openFrames({ x: 100, y: 100 }, degenerate)
   assert.equal(frames.from, 'circle(0px at 100px 100px)')
   assert.equal(frames.to, 'circle(0px at 100px 100px)')
+})
+
+test('closeFrames 正好是 openFrames 的倒放', () => {
+  const opened = openFrames(FAB_CENTER, SHEET)
+  const closed = closeFrames(FAB_CENTER, SHEET)
+  assert.equal(closed.from, opened.to)
+  assert.equal(closed.to, opened.from)
 })
 
 // ----------------------------------------------------------------------
@@ -196,7 +177,7 @@ test('resolveOrigin 优先用点击点（「从被点的按钮扩散」）', () 
   assert.deepEqual(resolveOrigin({ x: 5, y: 6 }, { x: 1, y: 1 }), { x: 5, y: 6 })
 })
 
-test('resolveOrigin 在点击点缺失或非法时退回悬浮按钮中心', () => {
+test('resolveOrigin 在点击点缺失或非法时退回日志按钮中心', () => {
   const fallback = { x: 100, y: 200 }
   assert.deepEqual(resolveOrigin(null, fallback), fallback)
   assert.deepEqual(resolveOrigin(undefined, fallback), fallback)
@@ -244,32 +225,14 @@ test('canAnimate 只在元素真的带 animate 方法时为真', () => {
 })
 
 // ----------------------------------------------------------------------
-// 操作栏高度
+// 常量本身要合理
 // ----------------------------------------------------------------------
-test('pickDockHeight 取可见操作栏的最大高度（隐藏页签量到 0）', () => {
-  assert.equal(pickDockHeight([0, 90, 0]), 90)
-  assert.equal(pickDockHeight([60, 90]), 90)
-})
-
-test('pickDockHeight 一个都没量到时退回兜底值（云文档页签没有操作栏）', () => {
-  assert.equal(pickDockHeight([]), FAB.fallbackDockPx)
-  assert.equal(pickDockHeight([0, 0]), FAB.fallbackDockPx)
-  assert.equal(pickDockHeight([Number.NaN, -1]), FAB.fallbackDockPx)
-})
-
-test('pickDockHeight 允许调用方指定兜底值', () => {
-  assert.equal(pickDockHeight([0], 123), 123)
-})
-
-// ----------------------------------------------------------------------
-// 常量本身要合理（改坏了这里先报）
-// ----------------------------------------------------------------------
-test('扩散时长是有限正数且不至于长到卡手', () => {
+test('展开/收回动画时长都是有限正数且不至于长到卡手', () => {
   assert.ok(REVEAL_TIMING.openMs > 0 && REVEAL_TIMING.openMs <= 600)
+  assert.ok(REVEAL_TIMING.closeMs > 0 && REVEAL_TIMING.closeMs <= 600)
 })
 
-test('悬浮按钮触达目标不小于 44px，且离右缘有安全间距', () => {
+test('日志按钮触达目标不小于 44px，且离右缘有安全间距', () => {
   assert.ok(FAB.sizePx >= 44)
   assert.ok(FAB.rightPx >= 8)
-  assert.ok(FAB.gapPx >= 0)
 })

@@ -34,8 +34,8 @@ REPOSITORY = WEB_REPOSITORY
 _USER_AGENT = f"yikou-light-food/{__version__}"
 _CHUNK_SIZE = 256 * 1024
 
-#: 版本号必须形如 3.5.0（允许 v 前缀）。非 SemVer 一律拒绝比较，避免误判。
-_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+#: 版本号形如 3.5.0 或 3.6.6.1（允许 v 前缀）；第四段用于补丁/热修版本。
+_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?$")
 
 
 def releases_url(repository: str) -> str:
@@ -90,11 +90,13 @@ class ReleaseInfo:
         return self.html_url or f"https://github.com/{self.repository}/releases"
 
 
-def _version_tuple(text: str) -> tuple[int, int, int] | None:
+def _version_tuple(text: str) -> tuple[int, int, int, int] | None:
     match = _VERSION_RE.match((text or "").strip())
     if not match:
         return None
-    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    # 第四段缺省按 0 处理：3.6.6 == 3.6.6.0，便于和热修版本比较。
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)),
+            int(match.group(4) or 0))
 
 
 def compare_versions(left: str, right: str) -> int:

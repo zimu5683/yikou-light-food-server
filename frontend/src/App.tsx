@@ -2,8 +2,8 @@
  * 应用根组件（网页版）。
  *
  * 三种布局，按视口宽度切换：
- * - **phone**（<640px）：一次只占一屏，底部 tab 在「任务 / 日志」间切换。
- *   手机上左右分栏或上下堆叠都会让两块内容互相挤，各给一整屏才够用。
+ * - **phone**（<640px）：任务面板常驻，日志是右上角按钮触发的**全屏水波层**。
+ *   手机窄屏放不下并排布局，日志全屏覆盖能给出最大的阅读区域。
  * - **tablet**（640–1023px）：任务在上、日志在下，上下堆叠。
  * - **desktop**（≥1024px）：左右分栏，分隔条可拖拽，比例持久化到 AppConfig。
  *
@@ -25,10 +25,7 @@ import {
 } from '@/components/dialogs'
 import { LogConsole } from '@/components/LogConsole'
 import { LogFab } from '@/components/LogFab'
-import { useDockHeight } from '@/lib/useDockHeight'
 import { useLogReveal } from '@/lib/useLogReveal'
-import { useLogSheetDrag } from '@/lib/useLogSheetDrag'
-import { FAB } from '@/lib/reveal'
 import { TaskPanel } from '@/components/TaskPanel'
 import { TitleBar } from '@/components/TitleBar'
 import { useApp } from '@/hooks/appContext'
@@ -70,14 +67,10 @@ export default function App() {
   const { config, setSplitRatio, authError, workerAlive } = useApp()
   const layout = useLayout()
   const [ratio, setRatio] = useState(config?.split_ratio ?? 0.38)
-  // 手机端日志面板：开合与高度由 hook 统一管理，扩散圆心由 useLogReveal 管
-  // （点悬浮按钮、点「开始处理/开始下单」、点「确认上传」都从各自的按钮扩散）。
-  const logSheet = useLogSheetDrag()
+  // 手机端日志：开合与圆形水波圆心由 useLogReveal 管。
+  // 点右上角日志按钮、「开始处理/开始下单」、「确认上传」都从各自的按钮扩散。
   const fabRef = useRef<HTMLButtonElement>(null)
-  const reveal = useLogReveal(logSheet, fabRef)
-  // 悬浮按钮要浮在操作栏上方，而操作栏高度随权限（有没有「更多」）与页签变化，
-  // 所以实测而不是写死；非手机布局不量。
-  const dockHeight = useDockHeight(layout === 'phone')
+  const reveal = useLogReveal(fabRef)
   const containerRef = useRef<HTMLDivElement>(null)
   const dragging = useRef(false)
 
@@ -120,33 +113,22 @@ export default function App() {
 
       {layout === 'phone' ? (
         <>
-          {/* paddingBottom = 面板当前高度：收起时约 34px（只露把手），展开时等于
-              面板高度，于是底部的开始/停止按钮永远在面板之上，点得到。
-              展开时面板高度是**瞬间**到位的（揭示交给圆形扩散动画），这里单独给
-              padding 做 200ms 过渡，表单才是平滑上移而不是猛地跳一下；
-              拖把手调高度时必须关掉过渡，否则 padding 会跟不上手指。 */}
-          <main
-            className={cn(
-              'flex min-h-0 flex-1 flex-col',
-              !logSheet.dragging && 'transition-[padding-bottom] duration-200 ease-out',
-            )}
-            style={{ paddingBottom: logSheet.height }}
-          >
+          {/* 日志是全屏覆盖层，不再占用主内容区的高度，任务表单保持原位。 */}
+          <main className="flex min-h-0 flex-1 flex-col">
             {/* 任务面板常驻：日志是它上面的面板，不再是与它并列的一屏。
                 常驻也避免了「切走再切回」把表单里未落盘的输入清掉。 */}
             <div className="flex min-h-0 flex-1">
               <TaskPanel logReveal={reveal} />
             </div>
           </main>
-          {/* 日志的唯一入口：浮在操作栏上方，点一下从它这里扩散出日志面板 */}
+          {/* 日志的唯一入口：固定在右上角，收起/全屏时都保持可见 */}
           <LogFab
             ref={fabRef}
-            open={logSheet.open}
+            open={reveal.open}
             running={workerAlive}
-            bottomPx={logSheet.height + dockHeight + FAB.gapPx}
             onToggle={() => reveal.toggleFrom(null)}
           />
-          <LogConsole layout="phone" drag={logSheet} reveal={reveal} />
+          <LogConsole layout="phone" reveal={reveal} />
         </>
       ) : (
         <main

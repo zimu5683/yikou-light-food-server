@@ -10,8 +10,7 @@ import type { AddressInputRequest } from '@/lib/bridge'
 import { statusLabel, useApp } from '@/hooks/appContext'
 import { cn } from '@/lib/utils'
 import { formatLogMsg, isOrderSummary, splitOrderSummary } from '@/lib/format'
-import { REVEAL_TIMING, canAnimate, openFrames, prefersReducedMotion } from '@/lib/reveal'
-import type { LogSheetDrag } from '@/lib/useLogSheetDrag'
+import { REVEAL_TIMING, canAnimate, closeFrames, openFrames, prefersReducedMotion } from '@/lib/reveal'
 import type { LogReveal } from '@/lib/useLogReveal'
 
 const LEVEL_CLASS: Record<string, string> = {
@@ -35,31 +34,23 @@ function statusBadgeMeta(status: string): { label: string; live: boolean } {
 /**
  * 日志控制台入口。
  *
- * ``layout === 'phone'`` 时改用**底部面板**：点右下角悬浮按钮从下往上展开
- * （展开过程是**从按钮圆心扩散的圆形水波**，见 `PhoneLogSheet`），点上方
- * 非日志区域自动退回底部，也可以拖把手自由调高度。
- * 平板/桌面维持原来的并排布局（`LogConsoleBody` 直接铺满容器），不受影响。
+ * ``layout === 'phone'`` 时改用**全屏水波层**：点右上角日志按钮，日志直接铺满
+ * 视口，由圆形 `clip-path` 从按钮圆心扩散；再次点击按钮反向收回。
+ * 没有底部抽屉、把手或高度拖拽。平板/桌面维持原来的并排布局
+ * （`LogConsoleBody` 直接铺满容器），不受影响。
  */
 export function LogConsole({
   layout = 'desktop',
-  drag,
   reveal,
-  onHeightChange,
 }: {
   layout?: 'phone' | 'tablet' | 'desktop'
-  /** 手机端拖拽状态机（由 App 通过 useLogSheetDrag 创建）。 */
-  drag?: LogSheetDrag
-  /** 手机端扩散动画的圆心与触发次数（由 App 的 useLogReveal 创建）。 */
+  /** 手机端全屏水波扩散的开合状态（由 App 的 useLogReveal 创建）。 */
   reveal?: LogReveal
-  /** 上报抽屉当前高度，App 用它给主内容区留白（避免挡住底部按钮）。 */
-  onHeightChange?: (px: number) => void
 }) {
   return (
     <>
-      {(layout !== 'phone' || !drag) && <LogConsoleBody />}
-      {layout === 'phone' && drag && (
-        <PhoneSheetHost drag={drag} reveal={reveal} onHeightChange={onHeightChange} />
-      )}
+      {layout !== 'phone' && <LogConsoleBody />}
+      {layout === 'phone' && (reveal ? <PhoneLogSheet reveal={reveal} /> : <LogConsoleBody />)}
     </>
   )
 }
@@ -103,7 +94,7 @@ function LogConsoleBody() {
         shrink-0，被压到近 0 宽后 CJK 字符只能逐个换行，标题变成竖排。
         现在用 flex-wrap 排两行：标题+状态 / （过滤框 + 工具按钮同排）。
         过滤框在窄屏自适应收窄（flex-1），宽屏才固定 w-44 并靠右。
-        抽屉里头部越矮越好，因为收起时露出的就是这部分。
+        全屏层顶部空间有限，头部越紧凑越好，日志区越宽。
       */}
       <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
         <h2 className="shrink-0 whitespace-nowrap font-serif text-base font-semibold tracking-[1px]">
@@ -198,100 +189,62 @@ function LogConsoleBody() {
 }
 
 /**
- * 手机端日志「底部面板」——**纯展示**：开合、高度、拖拽都由 `useLogSheetDrag`
- * 在 App 层统一管理，扩散圆心由 `useLogReveal` 提供。
+ * 手机端日志全屏层。
  *
  * 交互（按需求）：
- * - 点右下角悬浮按钮 → 从按钮圆心**圆形水波扩散**展开（见 `PhoneLogSheet`）；
- * - 点上方非日志区域（遮罩）→ 退回底部；
- * - 拖顶部把手 → **自由调节到任意高度**（不做吸附），仅夹在「收起」与
- *   「视口高度 − 顶部留白」之间；
- * - 拖到接近底部即收起；其它高度原样记住（含刷新后）。
+ * - 点右上角日志按钮 / 任务启动 → 全屏面板**瞬间到位**，圆形水波从触发按钮扩散；
+ * - 不再有底部抽屉、把手和高度拖拽；日志直接铺满整个视口；
+ * - 再次点右上角日志按钮 → 反向水波从按钮圆心收回，露出原来的任务界面；
+ * - 收/展全程没有高度过渡和从下往上的翻滚，只有 `clip-path` 圆形变化。
  *
- * 三处踩过的坑，都是特意保留下来的：
- * 1. 高度曾经用 `vh` 表示，而拖拽换算用 `innerHeight` —— 手机上这两个值不相等，
- *    导致「拖到一半看不到内容」「拖到最大时把手被顶出屏幕」。现在全程像素。
- * 2. 顶部留白（topGapPx）保证拖到最大也**不会铺满全屏**：下巴留着可以拖回来，
- *    把手也始终可见。
- * 3. 面板会盖住任务面板，所以高度通过 onHeightChange 上报给 App，
- *    由 App 给主内容区留出等高的底部内边距，按钮不会被压住点不到。
- *
- * 已展开时才渲染遮罩并拦截点击 —— 收起时遮罩不能存在，否则会把上面的任务界面
- * 全部点不动。
+ * 日志按钮由 `LogFab` 固定在右上角，层级高于本面板（z-30），所以展开后不会消失。
  */
-/**
- * 把面板高度上报给 App。
- *
- * 刻意用 effect 而不是在渲染期间直接调用父组件的 setState：后者是 React 反模式
- * （渲染必须纯净），在并发渲染下可能重复调用或与渲染结果不一致。卸载时归零，
- * 免得切到平板/桌面后主内容区还留着一段空白。
- */
-function PhoneSheetHost({
-  drag,
-  reveal,
-  onHeightChange,
-}: {
-  drag: LogSheetDrag
-  reveal?: LogReveal
-  onHeightChange?: (px: number) => void
-}) {
-  const height = drag.height
-  useEffect(() => {
-    onHeightChange?.(height)
-  }, [height, onHeightChange])
-  useEffect(() => () => onHeightChange?.(0), [onHeightChange])
-
-  return <PhoneLogSheet drag={drag} reveal={reveal} />
-}
-
-/** 取消还在跑的扩散动画（展开到一半又收起时必须做，否则会停在一半的裁剪里）。 */
 function cancelReveal(animation: { current: Animation | null }) {
   animation.current?.cancel()
   animation.current = null
 }
 
-function PhoneLogSheet({ drag, reveal }: { drag: LogSheetDrag; reveal?: LogReveal }) {
+/** 读取当前动画中的 clip-path；取不到时回退到给定值。 */
+function currentClipPath(element: HTMLElement, fallback: string): string {
+  try {
+    const value = getComputedStyle(element).clipPath
+    if (value && value !== 'none' && value.startsWith('circle(')) return value
+  } catch {
+    /* 读取失败时用 fallback */
+  }
+  return fallback
+}
+
+function PhoneLogSheet({ reveal }: { reveal: LogReveal }) {
   const { addressInput } = useApp()
-  const { open, height, dragging, setOpen, onPointerDown, onPointerMove, onPointerUp } = drag
+  const [phase, setPhase] = useState<'closed' | 'open' | 'closing'>('closed')
   const sheetRef = useRef<HTMLElement>(null)
-  /** 正在跑的扩散动画。**只留这一条引用**：不能用 `el.getAnimations()` 全清，
-   *  那会把高度过渡（CSS transition）一起取消掉，收起就变成瞬间跳回底部。 */
+  /** 正在跑的水波动画。只留这一条引用，避免 cancel 时误伤其它 CSS 动画。 */
   const revealAnimation = useRef<Animation | null>(null)
   /** 已经播过扩散动画的那一次 nonce，避免重复渲染时重播。 */
   const handledNonce = useRef(0)
+
+  useEffect(() => () => cancelReveal(revealAnimation), [])
 
   // 待确认地址输入框就在日志区里：收起时若来了输入请求必须自动弹出，
   // 否则任务会卡在等输入，而用户看不到输入框。
   useEffect(() => {
     if (!addressInput) return
-    if (reveal) reveal.openFrom(null)
-    else setOpen(true)
+    reveal.openFrom(null)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [addressInput?.id])
 
-  /**
-   * 水波扩散：面板**瞬间到目标高度**，由圆形裁剪负责揭示。
-   *
-   * 为什么必须用 `useLayoutEffect` + 临时掐掉高度过渡：
-   * - 布局阶段跑，动画在浏览器首次绘制前就已生效，看不到「先闪一下整块面板」；
-   * - 高度是内联样式 + class 里的 `transition-[height]`，若直接量尺寸会量到
-   *   过渡的**起点**（34px 的把手条），算出来的半径小一大截，扩散完露不全
-   *   面板。先 `transition-property: none` 强制回流拿到目标尺寸，再还原。
-   *   主内容区的 `padding-bottom` 由 App 单独做 200ms 过渡，表单仍平滑上移。
-   */
+  // 展开：面板已经在完整尺寸，只由圆形 clip-path 从按钮圆心扩到全屏。
   useLayoutEffect(() => {
+    if (!reveal.open) return
     const element = sheetRef.current
-    if (!element || !reveal || reveal.nonce === handledNonce.current) return
+    if (!element) return
+    if (reveal.nonce === handledNonce.current) return
     handledNonce.current = reveal.nonce
-    if (reveal.nonce === 0) return
-
-    element.style.transitionProperty = 'none'
-    const rect = element.getBoundingClientRect()
-    element.style.transitionProperty = ''
-
-    if (!canAnimate(element) || prefersReducedMotion()) return
-    const frames = openFrames(reveal.origin, rect)
     cancelReveal(revealAnimation)
+    setPhase('open')
+    if (!canAnimate(element) || prefersReducedMotion()) return
+    const frames = openFrames(reveal.origin, element.getBoundingClientRect())
     try {
       revealAnimation.current = element.animate(
         [{ clipPath: frames.from }, { clipPath: frames.to }],
@@ -301,61 +254,68 @@ function PhoneLogSheet({ drag, reveal }: { drag: LogSheetDrag; reveal?: LogRevea
       // 个别 WebView 对 clip-path 关键帧挑剔：动画失败不影响功能，面板已可见
       revealAnimation.current = null
     }
-    // 刻意不填 fill：动画结束后不再参与裁剪，面板自然回到「完全可见」
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reveal?.nonce, reveal?.origin])
+  }, [reveal.open, reveal.nonce])
 
-  // 收起：打断还在跑的扩散动画，否则面板会带着一半裁剪往下滑
+  // 收起：反向水波缩回右上角日志按钮，露出原本界面后再卸载。
   useLayoutEffect(() => {
-    if (open) return
+    if (reveal.open) return
+    if (phase !== 'open') return
+    const element = sheetRef.current
+    if (!element) {
+      setPhase('closed')
+      return
+    }
+    // 先记录「当前水波半径」再取消旧动画：如果用户展开到一半就点收起，
+    // 收起要从当前可见半径继续缩，而不是跳回全屏再缩。
+    const frames = closeFrames(reveal.origin, element.getBoundingClientRect())
+    const startClip = currentClipPath(element, frames.from)
     cancelReveal(revealAnimation)
-  }, [open])
+    setPhase('closing')
+    if (!canAnimate(element) || prefersReducedMotion()) {
+      setPhase('closed')
+      return
+    }
+    const animation = element.animate(
+      [{ clipPath: startClip }, { clipPath: frames.to }],
+      { duration: REVEAL_TIMING.closeMs, easing: REVEAL_TIMING.closeEase },
+    )
+    revealAnimation.current = animation
+    animation.onfinish = () => {
+      if (revealAnimation.current === animation) revealAnimation.current = null
+      setPhase('closed')
+    }
+    animation.oncancel = () => {
+      if (revealAnimation.current === animation) revealAnimation.current = null
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reveal.open, reveal.origin, phase])
+
+  if (!reveal.open && phase === 'closed') return null
 
   return (
-    <>
-      {open && (
-        <button
-          type="button"
-          aria-label="收起日志"
-          onClick={() => setOpen(false)}
-          className="fixed inset-x-0 top-0 z-30 bg-black/20"
-          style={{ bottom: height }}
-        />
+    <section
+      id="phone-log-sheet"
+      ref={sheetRef}
+      role="dialog"
+      aria-label="运行日志"
+      aria-modal={reveal.open}
+      inert={phase !== 'open'}
+      className={cn(
+        'fixed inset-0 z-30 flex flex-col bg-background',
+        // 收起动画进行中允许点击透传回原界面，避免面板还挡着操作
+        phase !== 'open' && 'pointer-events-none',
       )}
-      <section
-        id="phone-log-sheet"
-        ref={sheetRef}
-        role="dialog"
-        aria-label="运行日志"
-        aria-modal={open}
-        style={{ height }}
-        className={cn(
-          'fixed inset-x-0 bottom-0 z-40 flex flex-col border-t bg-background',
-          'pb-[var(--safe-bottom)]',
-          !dragging && 'transition-[height] duration-200 ease-out',
-        )}
+    >
+      <div
+        className="flex min-h-0 flex-1 flex-col px-2.5"
+        style={{ paddingTop: 'var(--safe-top)', paddingBottom: 'var(--safe-bottom)' }}
       >
-        {/* 把手：始终可见（因为顶部留白，最大高度也到不了屏幕外） */}
-        <div
-          onPointerDown={onPointerDown}
-          onPointerMove={onPointerMove}
-          onPointerUp={onPointerUp}
-          onPointerCancel={onPointerUp}
-          className="flex h-7 shrink-0 cursor-grab touch-none select-none items-center justify-center active:cursor-grabbing"
-        >
-          <span className="h-1 w-12 rounded-full bg-border" />
-        </div>
-        <div className="flex min-h-0 flex-1 flex-col px-2.5 pb-1.5">
-          {/* 收起时隐藏内容（保留 DOM 以免日志滚动位置丢失），并禁止聚焦 */}
-          <div className={cn('flex min-h-0 flex-1 flex-col', !open && 'invisible')} inert={!open}>
-            <LogConsoleBody />
-          </div>
-        </div>
-      </section>
-    </>
+        <LogConsoleBody />
+      </div>
+    </section>
   )
 }
-
 
 /** 日志区内的待确认地址输入框：不弹窗，直接在原地址下面换地址 */
 function InlineAddressInput({
