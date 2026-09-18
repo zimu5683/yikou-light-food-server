@@ -306,6 +306,8 @@ function PhoneLogSheet({ reveal }: { reveal: LogReveal }) {
         // 收起动画进行中允许点击透传回原界面，避免面板还挡着操作
         phase !== 'open' && 'pointer-events-none',
       )}
+      // 全屏 clip-path 动画要单独提升为合成层，否则 Android WebView 容易逐帧重绘整页。
+      style={{ willChange: 'clip-path', transform: 'translateZ(0)', contain: 'paint' }}
     >
       <div
         className="flex min-h-0 flex-1 flex-col px-2.5"

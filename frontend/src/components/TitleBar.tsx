@@ -30,7 +30,7 @@ export function TitleBar() {
 
   return (
     <header
-      className="flex h-10 shrink-0 select-none items-center gap-2.5 border-b bg-background pl-3 pr-[calc(4rem+var(--safe-right))] sm:px-4"
+      className="flex h-10 shrink-0 select-none items-center gap-2.5 border-b bg-background pl-3 pr-[calc(3.75rem+var(--safe-right))] sm:px-4"
       // 刘海屏 / 圆角屏：状态栏高度不能压在内容上
       style={{ paddingTop: 'var(--safe-top)', height: 'calc(2.5rem + var(--safe-top))' }}
     >

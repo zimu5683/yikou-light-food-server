@@ -43,16 +43,18 @@ export interface RectLike {
 
 /** 扩散/收回动画的时长与缓动。 */
 export const REVEAL_TIMING = {
-  openMs: 360,
-  openEase: 'cubic-bezier(0.22, 1, 0.36, 1)',
+  // 两端慢、中间快的缓动，让大面积 clip-path 每帧变化更均匀，减少跳帧感。
+  openMs: 480,
+  openEase: 'cubic-bezier(0.4, 0, 0.2, 1)',
   /** 收回稍快，反向水波不拖手。 */
-  closeMs: 260,
+  closeMs: 320,
   closeEase: 'cubic-bezier(0.4, 0, 0.2, 1)',
 } as const
 
 /** 右上角日志按钮的尺寸与落点。 */
 export const FAB = {
-  sizePx: 44,
+  // 40px = 标题栏内容高度，多 1px 都会溢出标题栏边界。
+  sizePx: 40,
   /** 距屏幕右缘（在安全区之外，调用方会再叠加 --safe-right）。 */
   rightPx: 12,
   /** 量不到按钮位置时的兜底顶边距（正常由 ref 实测中心）。 */

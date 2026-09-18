@@ -232,7 +232,8 @@ test('展开/收回动画时长都是有限正数且不至于长到卡手', () =
   assert.ok(REVEAL_TIMING.closeMs > 0 && REVEAL_TIMING.closeMs <= 600)
 })
 
-test('日志按钮触达目标不小于 44px，且离右缘有安全间距', () => {
-  assert.ok(FAB.sizePx >= 44)
+test('日志按钮精确适配标题栏高度，且离右缘有安全间距', () => {
+  // 标题栏内容高度为 40px；再大会溢出边界，再小会显得单薄。
+  assert.equal(FAB.sizePx, 40)
   assert.ok(FAB.rightPx >= 8)
 })
