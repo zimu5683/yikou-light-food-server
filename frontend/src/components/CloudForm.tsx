@@ -15,6 +15,8 @@ import { Switch } from '@/components/ui/switch'
 import { Field, TextInput } from '@/components/fields'
 import { useApp } from '@/hooks/appContext'
 import { api, isApiReady, type WpsCopyCheck, type WpsResult, type WpsStatus } from '@/lib/bridge'
+import { pointFromEvent } from '@/lib/reveal'
+import type { LogReveal } from '@/lib/useLogReveal'
 import { cn } from '@/lib/utils'
 import { splitAddressLines } from '@/lib/format'
 
@@ -39,7 +41,7 @@ const addressTextareaClass = cn(
   'focus-visible:ring-[3px] focus-visible:ring-ring/50',
 )
 
-export function CloudForm() {
+export function CloudForm({ logReveal }: { logReveal?: LogReveal }) {
   const { config, isAdmin } = useApp()
   const [status, setStatus] = useState<WpsStatus | null>(null)
   const [preview, setPreview] = useState<WpsResult | null>(null)
@@ -454,7 +456,13 @@ export function CloudForm() {
         </Button>
         <Button
           size="sm"
-          onClick={onUpload}
+          onClick={(event) => {
+            // 上传是**同步**接口（只把状态置成 updating，不会让 workerAlive 变
+            // true），所以这里必须自己把日志叫出来 —— 它是「确认写入云端」这种
+            // 不可逆动作，用户需要立刻看到过程与结果。圆心用这颗按钮的位置。
+            logReveal?.openFrom(pointFromEvent(event))
+            void onUpload()
+          }}
           disabled={busy !== '' || !enabled || !preview?.ok}
           title={preview?.ok ? undefined : '请先预览'}
         >

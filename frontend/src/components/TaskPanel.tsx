@@ -3,7 +3,7 @@
  * 校验结果由桥接层返回（start_order/start_sss 的 fields），前端渲染字段错误态。
  */
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { MoreHorizontal, ScrollText } from 'lucide-react'
+import { MoreHorizontal } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { CloudForm } from '@/components/CloudForm'
@@ -24,7 +24,7 @@ import {
 import { Switch } from '@/components/ui/switch'
 import { DateField, Field, GhostButton, Stepper, TextInput } from '@/components/fields'
 import { FileBrowserDialog } from '@/components/FileBrowserDialog'
-import { statusLabel, useApp, type FieldErrors, type TaskMode } from '@/hooks/appContext'
+import { useApp, type FieldErrors, type TaskMode } from '@/hooks/appContext'
 import {
   api,
   isApiReady,
@@ -32,12 +32,12 @@ import {
   type OrderFormPayload,
   type SssFormPayload,
 } from '@/lib/bridge'
-import type { StatusState } from '@/lib/bridge'
-import type { LogSheetDrag } from '@/lib/useLogSheetDrag'
+import { pointFromEvent } from '@/lib/reveal'
+import type { LogReveal } from '@/lib/useLogReveal'
 import { cn } from '@/lib/utils'
 import { modeError } from '@/lib/format'
 
-export function TaskPanel({ logToggle }: { logToggle?: LogToggleProps }) {
+export function TaskPanel({ logReveal }: { logReveal?: LogReveal }) {
   const { mode, setMode, workerAlive, config } = useApp()
   const formKey = config ? 'ready' : 'loading'
   return (
@@ -72,13 +72,13 @@ export function TaskPanel({ logToggle }: { logToggle?: LogToggleProps }) {
           每个表单自己管「字段区滚动 + 底部操作条」，所以这里必须是能撑满的
           flex 列容器（不能是 block）。 */}
       <div className={cn('min-w-0 min-h-0 flex-1 flex-col', mode === 'order' ? 'flex' : 'hidden')}>
-        <OrderForm key={formKey} logToggle={logToggle} />
+        <OrderForm key={formKey} logReveal={logReveal} />
       </div>
       <div className={cn('min-w-0 min-h-0 flex-1 flex-col', mode === 'cloud' ? 'flex' : 'hidden')}>
-        <CloudForm key={formKey} />
+        <CloudForm key={formKey} logReveal={logReveal} />
       </div>
       <div className={cn('min-w-0 min-h-0 flex-1 flex-col', mode === 'sss' ? 'flex' : 'hidden')}>
-        <SssForm key={formKey} logToggle={logToggle} />
+        <SssForm key={formKey} logReveal={logReveal} />
       </div>
       {workerAlive && (
         <p className="shrink-0 border-t px-3 py-1.5 text-[11px] text-muted-foreground sm:px-5">
@@ -121,7 +121,7 @@ function ModeTab({
 /* 订单处理                                                             */
 /* ------------------------------------------------------------------ */
 
-function OrderForm({ logToggle }: { logToggle?: LogToggleProps }) {
+function OrderForm({ logReveal }: { logReveal?: LogReveal }) {
   const { config, passwords, startOrder, workerAlive, isAdmin } = useApp()
   const [url, setUrl] = useState(config?.target_url ?? '')
   const [phone, setPhone] = useState(config?.phone_number ?? '')
@@ -284,7 +284,7 @@ function OrderForm({ logToggle }: { logToggle?: LogToggleProps }) {
           onStart={onStart}
           startBusy={busy}
           startDisabled={workerAlive}
-          logToggle={logToggle}
+          logReveal={logReveal}
         />
         <ToolsMenu mode="order" />
       </BottomDock>
@@ -305,7 +305,7 @@ function OrderForm({ logToggle }: { logToggle?: LogToggleProps }) {
 /* 闪时送下单                                                           */
 /* ------------------------------------------------------------------ */
 
-function SssForm({ logToggle }: { logToggle?: LogToggleProps }) {
+function SssForm({ logReveal }: { logReveal?: LogReveal }) {
   const { config, passwords, startSss, workerAlive, isAdmin } = useApp()
   const [url, setUrl] = useState(config?.sss_url ?? '')
   const [account, setAccount] = useState(config?.sss_account ?? '')
@@ -584,7 +584,7 @@ function SssForm({ logToggle }: { logToggle?: LogToggleProps }) {
           onStart={onStart}
           startBusy={busy}
           startDisabled={workerAlive}
-          logToggle={logToggle}
+          logReveal={logReveal}
         />
         <ToolsMenu mode="sss" />
       </BottomDock>
@@ -642,8 +642,10 @@ function SourceButton({
  * （横向内边距由自己给）。底部安全区不在这里加：手机最底部是 tab 栏。
  */
 function BottomDock({ children }: { children: ReactNode }) {
+  // data-task-dock：`useDockHeight` 靠它量出操作栏高度，好把悬浮按钮摆在
+  // 操作栏上方（压在「停止/更多」上就点不到了）。见 lib/useDockHeight.ts。
   return (
-    <div className="shrink-0 border-t bg-background px-3 pb-3 pt-2.5 sm:px-5">
+    <div data-task-dock className="shrink-0 border-t bg-background px-3 pb-3 pt-2.5 sm:px-5">
       {children}
     </div>
   )
@@ -654,27 +656,33 @@ function ActionBar({
   onStart,
   startBusy,
   startDisabled,
-  logToggle,
+  logReveal,
 }: {
   startLabel: string
   onStart: () => void
   startBusy: boolean
   startDisabled: boolean
-  /** 手机端把「日志」按钮并进操作栏（原来在最底部的 tab 栏里，已移除）。 */
-  logToggle?: LogToggleProps
+  /** 手机端：把「开始」按钮的位置交给日志扩散动画当圆心。 */
+  logReveal?: LogReveal
 }) {
   const { stopTask, workerAlive } = useApp()
   const [confirming, setConfirming] = useState(false)
 
   return (
     <>
-      {/* 顶边与上间距由 BottomDock 提供，这里不再重复画 border-t */}
+      {/* 顶边与上间距由 BottomDock 提供，这里不再重复画 border-t。
+          「日志」按钮已从这里移除：日志入口唯一化到右下角悬浮按钮
+          （见 components/LogFab.tsx），腾出的位置让主按钮更宽。 */}
       <div className="flex gap-2">
-        {logToggle && <LogToggleButton {...logToggle} />}
         <Button
           className="btn-serif-primary h-[38px] flex-1 rounded-[6px] text-sm"
           disabled={startDisabled || startBusy}
-          onClick={onStart}
+          onClick={(event) => {
+            // 只记下圆心，**不立刻展开**：真正展开由 App 在任务跑起来
+            // （workerAlive）时触发，这样表单校验失败时不会弹出日志挡住报错。
+            logReveal?.rememberFrom(pointFromEvent(event))
+            onStart()
+          }}
         >
           {startBusy ? '校验中…' : startLabel}
         </Button>
@@ -690,69 +698,6 @@ function ActionBar({
       <ConfirmStopDialog open={confirming} onOpenChange={setConfirming} onConfirm={stopTask} />
     </>
   )
-}
-
-/**
- * 手机端操作栏里的「日志」按钮。
- *
- * 双重身份：
- * - **点** → 开合日志抽屉；
- * - **拖** → 直接调抽屉高度（不用先打开再去找把手）。
- *
- * 两个关键细节：
- * 1. 必须 `touch-none`。否则手机上竖向拖动会被浏览器当成页面滚动，
- *    随即发出 `pointercancel` 把拖动打断 —— 表现就是「拖不动」。
- * 2. 拖动/点击用位移阈值区分（见 isClick）：拖过就不当成点击，避免松手误切换。
- */
-function LogToggleButton({ open, status, running, drag }: LogToggleProps) {
-  const pressed = useRef(false)
-
-  return (
-    <button
-      type="button"
-      aria-label={open ? '收起日志' : '展开日志'}
-      aria-pressed={open}
-      onPointerDown={(e) => {
-        pressed.current = true
-        // 指针捕获在 hook 内部完成（手指移出按钮范围也要继续收到 move/up）
-        drag.onPointerDown(e)
-      }}
-      onPointerMove={(e) => {
-        if (pressed.current) drag.onPointerMove(e)
-      }}
-      onPointerUp={() => {
-        if (!pressed.current) return
-        pressed.current = false
-        // 开合与「是否算点击」都由 hook 统一判定，避免两处各判一次而不一致
-        drag.onPointerUp()
-      }}
-      onPointerCancel={() => {
-        if (!pressed.current) return
-        pressed.current = false
-        drag.onPointerUp()
-      }}
-      className={cn(
-        'flex h-[38px] w-[58px] shrink-0 touch-none select-none flex-col items-center justify-center',
-        'rounded-[6px] border bg-card text-[10px] transition-colors',
-        open ? 'border-primary/60 text-primary' : 'border-border text-muted-foreground',
-      )}
-    >
-      <span className="flex items-center gap-1">
-        {running && <span className="led-breathe size-[5px] rounded-[1px] bg-primary" />}
-        <ScrollText className="size-3.5" />
-      </span>
-      <span className="leading-tight">{running ? statusLabel(status) : '日志'}</span>
-    </button>
-  )
-}
-
-/** 操作栏日志按钮需要的 props（由 App 透传下来）。 */
-export interface LogToggleProps {
-  open: boolean
-  status: StatusState
-  running: boolean
-  /** 抽屉的拖拽状态机（由 App 的 useLogSheetDrag 提供）。 */
-  drag: LogSheetDrag
 }
 
 function ToolsMenu({ mode }: { mode: TaskMode }) {

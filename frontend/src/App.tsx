@@ -24,7 +24,11 @@ import {
   UpdateAvailableDialog,
 } from '@/components/dialogs'
 import { LogConsole } from '@/components/LogConsole'
+import { LogFab } from '@/components/LogFab'
+import { useDockHeight } from '@/lib/useDockHeight'
+import { useLogReveal } from '@/lib/useLogReveal'
 import { useLogSheetDrag } from '@/lib/useLogSheetDrag'
+import { FAB } from '@/lib/reveal'
 import { TaskPanel } from '@/components/TaskPanel'
 import { TitleBar } from '@/components/TitleBar'
 import { useApp } from '@/hooks/appContext'
@@ -63,25 +67,29 @@ function useLayout(): Layout {
 }
 
 export default function App() {
-  const { config, setSplitRatio, authError, status, workerAlive } = useApp()
+  const { config, setSplitRatio, authError, workerAlive } = useApp()
   const layout = useLayout()
   const [ratio, setRatio] = useState(config?.split_ratio ?? 0.38)
-  // 手机端日志抽屉：开合与高度由 hook 统一管理，操作栏的「日志」按钮
-  // 和抽屉把手共用同一份状态（按钮因此既是开关也是拖拽把手）。
+  // 手机端日志面板：开合与高度由 hook 统一管理，扩散圆心由 useLogReveal 管
+  // （点悬浮按钮、点「开始处理/开始下单」、点「确认上传」都从各自的按钮扩散）。
   const logSheet = useLogSheetDrag()
+  const fabRef = useRef<HTMLButtonElement>(null)
+  const reveal = useLogReveal(logSheet, fabRef)
+  // 悬浮按钮要浮在操作栏上方，而操作栏高度随权限（有没有「更多」）与页签变化，
+  // 所以实测而不是写死；非手机布局不量。
+  const dockHeight = useDockHeight(layout === 'phone')
   const containerRef = useRef<HTMLDivElement>(null)
   const dragging = useRef(false)
 
-  // 手机上按下「开始处理」后自动弹出日志抽屉：这个工具的流程就是
+  // 手机上按下「开始处理」后自动扩散出日志面板：这个工具的流程就是
   // 配置 → 启动 → 盯日志 → 收结果，启动那一刻要看的正是日志。
+  // 圆心是刚才按下的那颗按钮（ActionBar 里 rememberFrom 记下的）。
   const wasRunning = useRef(false)
-  // 取出 setter 再依赖它：setState 的 setter 是稳定引用，
-  // 这样依赖数组里不必放整个 logSheet 对象（每次渲染都是新对象）。
-  const setLogSheetOpen = logSheet.setOpen
+  const openRemembered = reveal.openRemembered
   useEffect(() => {
-    if (layout === 'phone' && workerAlive && !wasRunning.current) setLogSheetOpen(true)
+    if (layout === 'phone' && workerAlive && !wasRunning.current) openRemembered()
     wasRunning.current = workerAlive
-  }, [workerAlive, layout, setLogSheetOpen])
+  }, [workerAlive, layout, openRemembered])
 
   const onDividerDown = useCallback((e: ReactPointerEvent) => {
     dragging.current = true
@@ -112,25 +120,33 @@ export default function App() {
 
       {layout === 'phone' ? (
         <>
-          {/* paddingBottom = 抽屉当前高度：抽屉收起时约 34px（只露把手），
-              展开时等于抽屉高度，于是底部的开始/停止按钮永远在抽屉之上，点得到。 */}
-          <main className="flex min-h-0 flex-1 flex-col" style={{ paddingBottom: logSheet.height }}>
-            {/* 任务面板常驻：日志是它上面的抽屉，不再是与它并列的一屏。
+          {/* paddingBottom = 面板当前高度：收起时约 34px（只露把手），展开时等于
+              面板高度，于是底部的开始/停止按钮永远在面板之上，点得到。
+              展开时面板高度是**瞬间**到位的（揭示交给圆形扩散动画），这里单独给
+              padding 做 200ms 过渡，表单才是平滑上移而不是猛地跳一下；
+              拖把手调高度时必须关掉过渡，否则 padding 会跟不上手指。 */}
+          <main
+            className={cn(
+              'flex min-h-0 flex-1 flex-col',
+              !logSheet.dragging && 'transition-[padding-bottom] duration-200 ease-out',
+            )}
+            style={{ paddingBottom: logSheet.height }}
+          >
+            {/* 任务面板常驻：日志是它上面的面板，不再是与它并列的一屏。
                 常驻也避免了「切走再切回」把表单里未落盘的输入清掉。 */}
             <div className="flex min-h-0 flex-1">
-              {/* 「日志」按钮在操作栏里（原来在最底部 tab 栏，已移除），
-                  它同时是可拖拽把手：见 TaskPanel 的 LogToggleButton。 */}
-              <TaskPanel
-                logToggle={{
-                  open: logSheet.open,
-                  status,
-                  running: workerAlive,
-                  drag: logSheet,
-                }}
-              />
+              <TaskPanel logReveal={reveal} />
             </div>
           </main>
-          <LogConsole layout="phone" drag={logSheet} />
+          {/* 日志的唯一入口：浮在操作栏上方，点一下从它这里扩散出日志面板 */}
+          <LogFab
+            ref={fabRef}
+            open={logSheet.open}
+            running={workerAlive}
+            bottomPx={logSheet.height + dockHeight + FAB.gapPx}
+            onToggle={() => reveal.toggleFrom(null)}
+          />
+          <LogConsole layout="phone" drag={logSheet} reveal={reveal} />
         </>
       ) : (
         <main
@@ -166,11 +182,16 @@ export default function App() {
         </main>
       )}
 
-      {/* 对话框与通知 */}
+      {/* 对话框与通知。
+          手机上 Toast 挪到顶部：右下角被日志悬浮按钮占着，弹出来会盖住它。 */}
       <DecisionDialog />
       <CaptchaDialog />
       <UpdateAvailableDialog />
-      <Toaster position="bottom-right" richColors closeButton />
+      <Toaster
+        position={layout === 'phone' ? 'top-center' : 'bottom-right'}
+        richColors
+        closeButton
+      />
     </div>
   )
 }

@@ -3,14 +3,16 @@
  * 锯齿顶边 + 等宽时间戳/级别 + 虚线裁切线 + 命中价签黄高亮 + 页脚印章小字。
  * 功能：即输即滤（保留命中高亮与无命中提示）、复制、清空、自动滚动。
  */
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { ArrowDownToLine, Copy, Eraser } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import type { AddressInputRequest } from '@/lib/bridge'
 import { statusLabel, useApp } from '@/hooks/appContext'
 import { cn } from '@/lib/utils'
 import { formatLogMsg, isOrderSummary, splitOrderSummary } from '@/lib/format'
+import { REVEAL_TIMING, canAnimate, openFrames, prefersReducedMotion } from '@/lib/reveal'
 import type { LogSheetDrag } from '@/lib/useLogSheetDrag'
+import type { LogReveal } from '@/lib/useLogReveal'
 
 const LEVEL_CLASS: Record<string, string> = {
   OK: 'text-success',
@@ -33,25 +35,31 @@ function statusBadgeMeta(status: string): { label: string; live: boolean } {
 /**
  * 日志控制台入口。
  *
- * ``layout === 'phone'`` 时改用**底部抽屉**：点底部「日志」从下往上弹出占大半屏，
- * 点上方非日志区域自动退回底部，也可以拖把手自由调高度。
- * 平板/桌面维持原来的并排布局（`LogConsoleBody` 直接铺满容器）。
+ * ``layout === 'phone'`` 时改用**底部面板**：点右下角悬浮按钮从下往上展开
+ * （展开过程是**从按钮圆心扩散的圆形水波**，见 `PhoneLogSheet`），点上方
+ * 非日志区域自动退回底部，也可以拖把手自由调高度。
+ * 平板/桌面维持原来的并排布局（`LogConsoleBody` 直接铺满容器），不受影响。
  */
 export function LogConsole({
   layout = 'desktop',
   drag,
+  reveal,
   onHeightChange,
 }: {
   layout?: 'phone' | 'tablet' | 'desktop'
-  /** 手机端拖拽状态机（由 App 通过 useLogSheetDrag 创建并共享给操作栏按钮）。 */
+  /** 手机端拖拽状态机（由 App 通过 useLogSheetDrag 创建）。 */
   drag?: LogSheetDrag
+  /** 手机端扩散动画的圆心与触发次数（由 App 的 useLogReveal 创建）。 */
+  reveal?: LogReveal
   /** 上报抽屉当前高度，App 用它给主内容区留白（避免挡住底部按钮）。 */
   onHeightChange?: (px: number) => void
 }) {
   return (
     <>
       {(layout !== 'phone' || !drag) && <LogConsoleBody />}
-      {layout === 'phone' && drag && <PhoneSheetHost drag={drag} onHeightChange={onHeightChange} />}
+      {layout === 'phone' && drag && (
+        <PhoneSheetHost drag={drag} reveal={reveal} onHeightChange={onHeightChange} />
+      )}
     </>
   )
 }
@@ -190,46 +198,29 @@ function LogConsoleBody() {
 }
 
 /**
- * 手机端日志「底部抽屉」。
+ * 手机端日志「底部面板」——**纯展示**：开合、高度、拖拽都由 `useLogSheetDrag`
+ * 在 App 层统一管理，扩散圆心由 `useLogReveal` 提供。
  *
  * 交互（按需求）：
- * - 点底部「日志」→ 从下往上弹出，占大半屏（高度记住上次拖到的位置）；
- * - 点上方非日志区域（遮罩）→ 退回底部；
- * - 拖把手 → 自由调节高度，松手吸附到 收起/大半屏/全屏 三个停靠位；
- * - 收起状态只露出把手，不占地方（状态在底部 tab 上已有 LED 与文字）。
- *
- * 已展开时才渲染遮罩并拦截点击 —— 收起时遮罩不能存在，否则会把上面的任务界面
- * 全部点不动。
- */
-/**
- * 手机端日志「底部抽屉」。
- *
- * 交互（按需求）：
- * - 点底部操作栏里的「日志」→ 从下往上弹出；
+ * - 点右下角悬浮按钮 → 从按钮圆心**圆形水波扩散**展开（见 `PhoneLogSheet`）；
  * - 点上方非日志区域（遮罩）→ 退回底部；
  * - 拖顶部把手 → **自由调节到任意高度**（不做吸附），仅夹在「收起」与
  *   「视口高度 − 顶部留白」之间；
  * - 拖到接近底部即收起；其它高度原样记住（含刷新后）。
  *
- * 三处踩过的坑，都是这次特意改掉的：
+ * 三处踩过的坑，都是特意保留下来的：
  * 1. 高度曾经用 `vh` 表示，而拖拽换算用 `innerHeight` —— 手机上这两个值不相等，
  *    导致「拖到一半看不到内容」「拖到最大时把手被顶出屏幕」。现在全程像素。
  * 2. 顶部留白（topGapPx）保证拖到最大也**不会铺满全屏**：下巴留着可以拖回来，
  *    把手也始终可见。
- * 3. 抽屉会盖住任务面板，所以高度通过 onHeightChange 上报给 App，
+ * 3. 面板会盖住任务面板，所以高度通过 onHeightChange 上报给 App，
  *    由 App 给主内容区留出等高的底部内边距，按钮不会被压住点不到。
- */
-/**
- * 手机端日志「底部抽屉」——**纯展示**：开合、高度、拖拽都由 `useLogSheetDrag`
- * 在 App 层统一管理，这样操作栏里的「日志」按钮和这里的把手用的是同一份状态。
  *
- * 高度与顶部留白由几何模块保证：
- * - 拖到最大也不铺满全屏（`topGapPx`），把手始终可见、下巴留着能拖回来；
- * - 全程像素，不再混用 `vh` 与 `innerHeight`（混用会导致「拖到一半看不到内容」）；
- * - 拖到哪停到哪，不做吸附。
+ * 已展开时才渲染遮罩并拦截点击 —— 收起时遮罩不能存在，否则会把上面的任务界面
+ * 全部点不动。
  */
 /**
- * 把抽屉高度上报给 App。
+ * 把面板高度上报给 App。
  *
  * 刻意用 effect 而不是在渲染期间直接调用父组件的 setState：后者是 React 反模式
  * （渲染必须纯净），在并发渲染下可能重复调用或与渲染结果不一致。卸载时归零，
@@ -237,9 +228,11 @@ function LogConsoleBody() {
  */
 function PhoneSheetHost({
   drag,
+  reveal,
   onHeightChange,
 }: {
   drag: LogSheetDrag
+  reveal?: LogReveal
   onHeightChange?: (px: number) => void
 }) {
   const height = drag.height
@@ -248,19 +241,75 @@ function PhoneSheetHost({
   }, [height, onHeightChange])
   useEffect(() => () => onHeightChange?.(0), [onHeightChange])
 
-  return <PhoneLogSheet drag={drag} />
+  return <PhoneLogSheet drag={drag} reveal={reveal} />
 }
 
-function PhoneLogSheet({ drag }: { drag: LogSheetDrag }) {
+/** 取消还在跑的扩散动画（展开到一半又收起时必须做，否则会停在一半的裁剪里）。 */
+function cancelReveal(animation: { current: Animation | null }) {
+  animation.current?.cancel()
+  animation.current = null
+}
+
+function PhoneLogSheet({ drag, reveal }: { drag: LogSheetDrag; reveal?: LogReveal }) {
   const { addressInput } = useApp()
   const { open, height, dragging, setOpen, onPointerDown, onPointerMove, onPointerUp } = drag
+  const sheetRef = useRef<HTMLElement>(null)
+  /** 正在跑的扩散动画。**只留这一条引用**：不能用 `el.getAnimations()` 全清，
+   *  那会把高度过渡（CSS transition）一起取消掉，收起就变成瞬间跳回底部。 */
+  const revealAnimation = useRef<Animation | null>(null)
+  /** 已经播过扩散动画的那一次 nonce，避免重复渲染时重播。 */
+  const handledNonce = useRef(0)
 
   // 待确认地址输入框就在日志区里：收起时若来了输入请求必须自动弹出，
   // 否则任务会卡在等输入，而用户看不到输入框。
   useEffect(() => {
-    if (addressInput) setOpen(true)
+    if (!addressInput) return
+    if (reveal) reveal.openFrom(null)
+    else setOpen(true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [addressInput?.id])
+
+  /**
+   * 水波扩散：面板**瞬间到目标高度**，由圆形裁剪负责揭示。
+   *
+   * 为什么必须用 `useLayoutEffect` + 临时掐掉高度过渡：
+   * - 布局阶段跑，动画在浏览器首次绘制前就已生效，看不到「先闪一下整块面板」；
+   * - 高度是内联样式 + class 里的 `transition-[height]`，若直接量尺寸会量到
+   *   过渡的**起点**（34px 的把手条），算出来的半径小一大截，扩散完露不全
+   *   面板。先 `transition-property: none` 强制回流拿到目标尺寸，再还原。
+   *   主内容区的 `padding-bottom` 由 App 单独做 200ms 过渡，表单仍平滑上移。
+   */
+  useLayoutEffect(() => {
+    const element = sheetRef.current
+    if (!element || !reveal || reveal.nonce === handledNonce.current) return
+    handledNonce.current = reveal.nonce
+    if (reveal.nonce === 0) return
+
+    element.style.transitionProperty = 'none'
+    const rect = element.getBoundingClientRect()
+    element.style.transitionProperty = ''
+
+    if (!canAnimate(element) || prefersReducedMotion()) return
+    const frames = openFrames(reveal.origin, rect)
+    cancelReveal(revealAnimation)
+    try {
+      revealAnimation.current = element.animate(
+        [{ clipPath: frames.from }, { clipPath: frames.to }],
+        { duration: REVEAL_TIMING.openMs, easing: REVEAL_TIMING.openEase },
+      )
+    } catch {
+      // 个别 WebView 对 clip-path 关键帧挑剔：动画失败不影响功能，面板已可见
+      revealAnimation.current = null
+    }
+    // 刻意不填 fill：动画结束后不再参与裁剪，面板自然回到「完全可见」
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reveal?.nonce, reveal?.origin])
+
+  // 收起：打断还在跑的扩散动画，否则面板会带着一半裁剪往下滑
+  useLayoutEffect(() => {
+    if (open) return
+    cancelReveal(revealAnimation)
+  }, [open])
 
   return (
     <>
@@ -274,6 +323,8 @@ function PhoneLogSheet({ drag }: { drag: LogSheetDrag }) {
         />
       )}
       <section
+        id="phone-log-sheet"
+        ref={sheetRef}
         role="dialog"
         aria-label="运行日志"
         aria-modal={open}

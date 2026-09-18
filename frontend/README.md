@@ -19,10 +19,22 @@ pnpm lint       # oxlint
 ## 目录
 
 - `src/lib/bridge.ts` — HTTP/桥接传输、事件分发与全部接口类型
-- `src/lib/` — 格式化、主题、日志抽屉几何等纯函数与 hooks
+- `src/lib/` — 格式化、主题、日志面板几何与扩散圆心等纯函数与 hooks
 - `src/hooks/useApp.tsx` — 全局状态与后端事件到 React 的唯一入口
 - `src/components/` — 业务组件；`components/ui/` 为无领域 UI 原子
 - `src/App.tsx` — 手机/平板/桌面三种响应式布局
+
+## 手机端日志：悬浮按钮 + 水波扩散
+
+手机布局（<640px）下日志面板由右下角悬浮按钮 `components/LogFab.tsx` 开合，
+展开时用**圆形 clip-path 从触发按钮的圆心扩散**：
+
+- `lib/reveal.ts` — 纯函数：圆心到面板四角的最大距离（半径）、裁剪值、降级判定；
+- `lib/useLogReveal.ts` — 开合状态机：谁触发、圆心在哪、第几次展开；
+- `lib/useDockHeight.ts` — 实测底部操作栏高度，悬浮按钮据此浮在操作栏上方。
+
+触发点：悬浮按钮；操作栏的「开始处理/开始下单」（点击时只记圆心，任务真的
+起来才展开）；云文档的「确认上传」。平板/桌面仍是日志常驻分栏，不受影响。
 
 接口字段与 Python 返回值的契约由仓库根目录 `tests/test_frontend_contract.py`
 反向校验，改字段名时两边要一起改。
