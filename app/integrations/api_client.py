@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import json
 import random
 from typing import Any
 from urllib.parse import urlsplit
@@ -151,6 +152,9 @@ class AdminApiClient:
         self.session.headers.update(_browser_headers(self.origin, admin=True))
         self.token = ""
         self.uniacid = ""
+        #: Android 上登录后所有管理接口都改走 Chromium WebView，绕开 WAF 对
+        #: Python/OpenSSL TLS 指纹的识别；桌面/Termux 保持 requests。
+        self._native_web_http = False
 
     def _warm_up_waf(self) -> None:
         """先访问一次管理后台页面，让 WAF 下发 ``acw_tc`` 等会话 cookie。"""
@@ -182,6 +186,39 @@ class AdminApiClient:
         if not self.uniacid:
             raise ApiError("管理后台登录响应中没有 uniacid")
 
+    def _android_web_get(self, path: str) -> dict[str, Any] | None:
+        """用 Android WebView 的 Chromium 环境执行管理接口 GET。
+
+        返回解析后的 payload；非 Android / WebView 不可用时返回 None，让调用方
+        退回 requests。403/非 JSON 等明确的接口错误会转成 ApiError。
+        """
+        from app.integrations import android_web_login
+
+        if not android_web_login.is_android():
+            return None
+        try:
+            status, body = android_web_login.webview_fetch(
+                self.origin, path, method="GET",
+                token=self.token, uniacid=self.uniacid,
+                timeout_ms=int(max(5.0, float(self.timeout)) * 1000),
+            )
+        except android_web_login.AndroidWebLoginError:
+            return None
+
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ApiError(
+                f"接口 {path} 在 WebView 中返回非 JSON（HTTP {status}）") from exc
+        if not isinstance(payload, dict):
+            raise ApiError(f"接口 {path} 在 WebView 中返回异常结构")
+        if status == 401 or payload.get("code") == 401:
+            raise ApiError("登录会话已失效（接口 401），请重新运行程序")
+        code = payload.get("code")
+        if code not in (200, None):
+            raise ApiError(f"接口 {path} 返回异常：{payload.get('msg') or code}")
+        return payload
+
     def _android_webview_login(self) -> dict[str, Any] | None:
         """APK 内优先用系统 WebView 登录，绕过 WAF 对 Python TLS 指纹的识别。
 
@@ -207,6 +244,17 @@ class AdminApiClient:
         403，APK 内改用系统 WebView 的 Chromium 环境执行同源 fetch；桌面/Termux
         则换新 Session 重试一次。
         """
+        from app.integrations import android_web_login
+
+        # Android 上优先用系统 WebView 登录：既能过 WAF，也能让 CookieManager
+        # 保存后续管理接口需要的 cookie。
+        if android_web_login.is_android():
+            webview_payload = self._android_webview_login()
+            if webview_payload is not None:
+                self._apply_login_payload(webview_payload)
+                self._native_web_http = True
+                return
+
         self._warm_up_waf()
         try:
             resp = self._post_login()
@@ -218,6 +266,7 @@ class AdminApiClient:
             webview_payload = self._android_webview_login()
             if webview_payload is not None:
                 self._apply_login_payload(webview_payload)
+                self._native_web_http = True
                 return
 
             # 桌面/Termux：换全新 Session + 重新预热再试一次。
@@ -241,16 +290,41 @@ class AdminApiClient:
         except ValueError as exc:
             raise ApiError(f"管理后台登录返回非 JSON（HTTP {resp.status_code}）") from exc
         self._apply_login_payload(payload)
+        if android_web_login.is_android():
+            self._native_web_http = True
 
     def get_json(self, path: str) -> dict[str, Any]:
-        """带鉴权 GET 并解析 JSON，401 按登录失效处理。"""
+        """带鉴权 GET 并解析 JSON，401 按登录失效处理。
+
+        Android 登录后默认走 WebView/Chromium；若 WebView 不可用则退回 requests，
+        并在 requests 被 WAF 403 时再尝试一次 WebView。
+        """
         if not self.token:
             raise ApiError("尚未登录管理后台")
+
+        if self._native_web_http:
+            try:
+                payload = self._android_web_get(path)
+                if payload is not None:
+                    return payload
+            except ApiError:
+                # WebView 出错时不要直接失败；先退回 requests 再决定，避免单点故障。
+                pass
+
         headers = {"Authorization": f"Bearer {self.token}", "uniacid": self.uniacid}
         try:
             resp = self.session.get(self.origin + path, headers=headers, timeout=self.timeout)
         except requests.RequestException as exc:
             raise ApiError(f"接口 {path} 请求失败：{exc}") from exc
+
+        if resp.status_code == 403:
+            try:
+                payload = self._android_web_get(path)
+            except ApiError:
+                payload = None
+            if payload is not None:
+                self._native_web_http = True
+                return payload
 
         try:
             payload = resp.json()

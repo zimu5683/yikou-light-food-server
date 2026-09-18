@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from app.integrations.api_client import (AUTH_ERROR_CODES, AUTH_MESSAGE_KEYWORDS,
@@ -16,6 +18,7 @@ from app.integrations.api_client import (AUTH_ERROR_CODES, AUTH_MESSAGE_KEYWORDS
                             auth_error_message, is_auth_expired_payload,
                             origin_from_url)
 from app.integrations import api_client as api_client_module
+from app.integrations import android_web_login
 
 
 # ----------------------------------------------------------------------
@@ -266,3 +269,69 @@ def test_admin_login_uses_webview_fallback_on_403(monkeypatch):
     assert client.uniacid == "wv-uniacid"
     # 成功走 WebView 后不应再创建新 Session 做第二次 requests 重试。
     assert len(_FakeSession.instances) == 1
+
+
+# ----------------------------------------------------------------------
+# Android WebView 管理接口全链路
+# ----------------------------------------------------------------------
+def test_admin_login_prefers_android_webview(monkeypatch):
+    _FakeSession.instances = []
+    _FakeSession.post_statuses = []
+    monkeypatch.setattr(api_client_module.requests, "Session", _FakeSession)
+    monkeypatch.setattr(android_web_login, "is_android", lambda: True)
+    monkeypatch.setattr(android_web_login, "webview_login", lambda *a, **k: {
+        "code": 200, "data": {"token": "wv", "uniacid": "wx"}})
+
+    client = AdminApiClient("https://m.icall.me/admin/#/login", "u", "p", timeout=5)
+    client.login()
+
+    assert client.token == "wv" and client.uniacid == "wx"
+    assert client._native_web_http is True
+    assert _FakeSession.instances[0].calls == []
+
+
+def test_admin_get_json_uses_webview_after_login(monkeypatch):
+    _FakeSession.instances = []
+    _FakeSession.post_statuses = []
+    monkeypatch.setattr(api_client_module.requests, "Session", _FakeSession)
+    client = AdminApiClient("https://m.icall.me/admin/#/login", "u", "p", timeout=5)
+    client.token = "t"
+    client.uniacid = "x"
+    client._native_web_http = True
+
+    calls: list[tuple] = []
+    def fake_fetch(origin, path, **kwargs):
+        calls.append((origin, path, kwargs))
+        return 200, '{"code":200,"data":{"list":[1,2]}}'
+
+    monkeypatch.setattr(android_web_login, "is_android", lambda: True)
+    monkeypatch.setattr(android_web_login, "webview_fetch", fake_fetch)
+
+    payload = client.get_json("/channel/order?scene=1&pageNo=1")
+
+    assert payload["data"]["list"] == [1, 2]
+    assert calls[0][1] == "/channel/order?scene=1&pageNo=1"
+    assert calls[0][2]["token"] == "t" and calls[0][2]["uniacid"] == "x"
+    # 不应再调用 requests。
+    assert _FakeSession.instances[0].calls == []
+
+
+def test_webview_fetch_parses_native_envelope(monkeypatch):
+    class _FakeJava:
+        def fetchJson(self, origin, path, method, token, uniacid, body_json, timeout_ms):
+            assert origin == "https://m.icall.me"
+            assert path == "/channel/order"
+            assert method == "GET"
+            assert token == "t" and uniacid == "x"
+            return json.dumps({
+                "status": 200,
+                "body": json.dumps({"code": 200, "data": {"ok": True}}),
+            })
+
+    monkeypatch.setattr(android_web_login, "is_android", lambda: True)
+    monkeypatch.setattr(android_web_login, "_java_class", lambda: _FakeJava())
+
+    status, body = android_web_login.webview_fetch(
+        "https://m.icall.me", "/channel/order", token="t", uniacid="x")
+    assert status == 200
+    assert json.loads(body)["data"]["ok"] is True

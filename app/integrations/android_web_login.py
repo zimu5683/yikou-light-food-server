@@ -39,6 +39,41 @@ def _java_class() -> Any:
         raise AndroidWebLoginError(f"Android WebView 登录类缺失：{WEB_LOGIN_CLASS}") from exc
 
 
+def webview_fetch(origin: str, path: str, *, method: str = "GET",
+                  token: str = "", uniacid: str = "",
+                  body: Any = None, timeout_ms: int = 30_000) -> tuple[int, str]:
+    """在 Android WebView 的 Chromium 环境里请求管理接口。
+
+    返回 ``(status, body_text)``；后端原始响应体由调用方解析。
+    """
+    if not is_android():
+        raise AndroidWebLoginError("非 Android 环境不启用 WebView 请求")
+    body_json = None
+    if body is not None:
+        body_json = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+    try:
+        raw = getattr(_java_class(), "fetchJson")(
+            str(origin or ""), str(path or ""), str(method or "GET"),
+            str(token or ""), str(uniacid or ""), body_json, int(timeout_ms))
+    except AndroidWebLoginError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise AndroidWebLoginError(
+            f"WebView 接口请求调用失败：{type(exc).__name__}: {exc}") from exc
+
+    try:
+        envelope = json.loads(str(raw))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AndroidWebLoginError("WebView 接口返回了非法 JSON") from exc
+    if not isinstance(envelope, dict):
+        raise AndroidWebLoginError("WebView 接口返回结构异常")
+    status = int(envelope.get("status") or 0)
+    body_text = str(envelope.get("body") or "")
+    if status <= 0:
+        raise AndroidWebLoginError(body_text[:200] or "WebView 接口请求失败")
+    return status, body_text
+
+
 def webview_login(origin: str, username: str, password: str, *,
                   timeout_ms: int = 30_000) -> dict[str, Any]:
     """通过 Android WebView 执行浏览器登录，返回后端 JSON payload。"""
