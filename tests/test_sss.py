@@ -477,6 +477,48 @@ def test_sss_client_retries_get_but_not_post():
         client.close()
 
 
+def test_sss_client_only_advertises_decodable_accept_encoding():
+    """br/zstd 未安装时不能声明支持，否则验证码图片会以压缩流形式返回。"""
+    from app.integrations.api_client import SssApiClient
+
+    client = SssApiClient("https://example.invalid/takeout", "a", "p")
+    try:
+        assert client.session.headers["Accept-Encoding"] == "gzip, deflate"
+    finally:
+        client.close()
+
+
+def test_sss_fetch_captcha_returns_png_bytes():
+    from app.integrations.api_client import SssApiClient
+
+    class Response:
+        status_code = 200
+        content = b"\x89PNG\r\n\x1a\n" + b"fake-image-body"
+
+    client = SssApiClient("https://example.invalid/takeout", "a", "p")
+    client.session.get = lambda *args, **kwargs: Response()  # type: ignore[method-assign]
+    try:
+        assert client.fetch_captcha() == Response.content
+    finally:
+        client.close()
+
+
+def test_sss_fetch_captcha_reports_http_error_before_png_check():
+    from app.integrations.api_client import ApiError, SssApiClient
+
+    class Response:
+        status_code = 502
+        content = b"bad gateway"
+
+    client = SssApiClient("https://example.invalid/takeout", "a", "p")
+    client.session.get = lambda *args, **kwargs: Response()  # type: ignore[method-assign]
+    try:
+        with pytest.raises(ApiError, match="HTTP 502"):
+            client.fetch_captcha()
+    finally:
+        client.close()
+
+
 def test_sss_client_treats_non_json_401_as_auth_expired():
     from app.integrations.api_client import ApiError, SssApiClient
 

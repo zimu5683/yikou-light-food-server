@@ -42,7 +42,9 @@ export function TaskPanel({ logToggle }: { logToggle?: LogToggleProps }) {
   const formKey = config ? 'ready' : 'loading'
   return (
     // 分栏边框由 App 外壳负责（桌面才画），这里再画一次会变成 2px
-    <section className="flex min-h-0 flex-1 flex-col border-border">
+    // min-w-0：TaskPanel 是横向 flex 子项；云同步预览里的 <pre> 长行曾把
+    // 面板的 min-content 撑到视口外，手机上右侧页签和按钮会被裁掉。
+    <section className="flex min-w-0 min-h-0 flex-1 flex-col border-border">
       {/* 标题与模式 tab 固定不滚：手机上它们是导航，滚走就找不回来了。
           副标题是装饰性文案，窄屏收起，把高度让给表单。 */}
       <div className="shrink-0 px-3 pt-4 sm:px-5">
@@ -69,13 +71,13 @@ export function TaskPanel({ logToggle }: { logToggle?: LogToggleProps }) {
           导致切页签后已输入内容丢失并被旧 config 重新填充。
           每个表单自己管「字段区滚动 + 底部操作条」，所以这里必须是能撑满的
           flex 列容器（不能是 block）。 */}
-      <div className={cn('min-h-0 flex-1 flex-col', mode === 'order' ? 'flex' : 'hidden')}>
+      <div className={cn('min-w-0 min-h-0 flex-1 flex-col', mode === 'order' ? 'flex' : 'hidden')}>
         <OrderForm key={formKey} logToggle={logToggle} />
       </div>
-      <div className={cn('min-h-0 flex-1 flex-col', mode === 'cloud' ? 'flex' : 'hidden')}>
+      <div className={cn('min-w-0 min-h-0 flex-1 flex-col', mode === 'cloud' ? 'flex' : 'hidden')}>
         <CloudForm key={formKey} />
       </div>
-      <div className={cn('min-h-0 flex-1 flex-col', mode === 'sss' ? 'flex' : 'hidden')}>
+      <div className={cn('min-w-0 min-h-0 flex-1 flex-col', mode === 'sss' ? 'flex' : 'hidden')}>
         <SssForm key={formKey} logToggle={logToggle} />
       </div>
       {workerAlive && (
@@ -203,7 +205,7 @@ function OrderForm({ logToggle }: { logToggle?: LogToggleProps }) {
   }
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div className="flex min-w-0 min-h-0 flex-1 flex-col">
       {/* 字段区自己滚动，操作条是它的兄弟节点（真页脚）。
           原来操作条用 sticky bottom-0 待在滚动区内部：内容不足一屏时它不会被
           撑到底部，下方就露出滚动容器的空白（「更多」下面那块空缺）；滚动时
@@ -459,7 +461,7 @@ function SssForm({ logToggle }: { logToggle?: LogToggleProps }) {
   }
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div className="flex min-w-0 min-h-0 flex-1 flex-col">
       {/* 与订单处理页签同构：字段区滚动 + 操作条做真页脚（不再 sticky） */}
       <div className="scroll-contain min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-1 sm:px-5">
         {isAdmin && (

@@ -223,7 +223,7 @@ export function CloudForm() {
   return (
     // 云文档页签没有固定操作条（按钮与预览结果在同一流程里），因此整个表单
     // 自己就是滚动区，填满 TaskPanel 留给它的高度。
-    <div className="scroll-contain min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-1 sm:px-5">
+    <div className="scroll-contain min-w-0 min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-1 sm:px-5">
       <div className="mb-3.5 rounded-md border bg-muted/40 px-3 py-2.5 text-xs leading-relaxed">
         <p className="font-medium text-foreground">把本地排单表同步到 WPS 云端</p>
         <p className="mt-1 text-muted-foreground">
@@ -517,7 +517,7 @@ export function CloudForm() {
       ) : null}
 
       {preview?.text ? (
-        <pre className="mt-2 max-h-64 overflow-auto rounded-md border bg-muted/40 p-2.5 text-[11px] leading-relaxed">
+        <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-all rounded-md border bg-muted/40 p-2.5 text-[11px] leading-relaxed">
           {preview.text}
         </pre>
       ) : null}

@@ -91,7 +91,10 @@ def _browser_headers(origin: str, *, admin: bool = True) -> dict[str, str]:
         ),
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br, zstd",
+        # requests/urllib3 只有在安装了 brotli/zstandard 时才能解码 br/zstd；
+        # 这里声明实际支持的编码，避免服务端返回 br 后拿到的是压缩流，
+        # 被 fetch_captcha 误判成“未返回 PNG 图片”。
+        "Accept-Encoding": "gzip, deflate",
         "Origin": origin,
         "X-Requested-With": "XMLHttpRequest",
         "Connection": "keep-alive",
@@ -414,6 +417,8 @@ class SssApiClient:
             )
         except requests.RequestException as exc:
             raise ApiError(f"获取闪时送验证码失败：{exc}") from exc
+        if resp.status_code != 200:
+            raise ApiError(f"获取闪时送验证码失败：HTTP {resp.status_code}")
         if not resp.content.startswith(b"\x89PNG"):
             raise ApiError("闪时送验证码接口未返回 PNG 图片")
         return resp.content
