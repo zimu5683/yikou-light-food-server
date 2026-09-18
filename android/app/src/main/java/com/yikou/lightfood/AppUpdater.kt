@@ -2,112 +2,161 @@ package com.yikou.lightfood
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
+import android.provider.Settings
 import androidx.core.content.FileProvider
 import org.json.JSONObject
 import java.io.File
-import java.io.FileOutputStream
-import java.net.HttpURLConnection
-import java.net.URL
-
-data class UpdateInfo(
-    val tagName: String,
-    val version: String,
-    val body: String,
-    val htmlUrl: String,
-    val apkUrl: String = "",
-)
+import java.security.MessageDigest
 
 /**
- * GitHub Releases 更新：只负责检查和下载，安装交给系统 PackageInstaller。
+ * APK 应用内更新原生桥。
  *
- * 正式分发必须使用同一把 release keystore，否则新 APK 无法覆盖安装；CI 从
- * YIKOU_KEYSTORE_* secrets 读取，缺失时 M0/M1 构建退回 debug 签名。
+ * 设计约束：
+ * * Python（Bridge）负责从 GitHub Releases 取版本、下载和 SHA-256 校验；
+ * * Kotlin 只负责「最后 1 米」：校验安装包签名、检查未知来源安装权限、调用
+ *   系统 PackageInstaller；
+ * * 任何失败都返回 JSON 给 Python，由前端展示，不再打开浏览器兜底。
+ *
+ * 覆盖安装要求新旧 APK 使用同一把签名证书；CI 从 YIKOU_KEYSTORE_* secrets
+ * 读取，本地缺失时会回退 debug 签名，此时正式包无法覆盖自更新。
  */
 object AppUpdater {
-    private const val DEFAULT_REPOSITORY = "zimu5683/yikou-light-food-server"
-    private const val USER_AGENT = "yikou-light-food-android"
+    @Volatile
+    private var appContext: Context? = null
 
-    fun checkForUpdate(currentVersion: String,
-                       repository: String = DEFAULT_REPOSITORY): UpdateInfo? {
-        val payload = httpGetJson("https://api.github.com/repos/$repository/releases/latest")
-            ?: return null
-        val tag = payload.optString("tag_name").trim()
-        if (tag.isEmpty()) return null
-        val version = tag.removePrefix("v")
-        if (compareVersions(version, currentVersion) <= 0) return null
-        val assets = payload.optJSONArray("assets") ?: return null
-        var apkUrl = ""
-        for (index in 0 until assets.length()) {
-            val asset = assets.optJSONObject(index) ?: continue
-            val name = asset.optString("name").lowercase()
-            if (!name.endsWith(".apk")) continue
-            val url = asset.optString("browser_download_url")
-            // 优先明确的 arm64 包；没有则退回第一个 APK，便于手工下载通用包。
-            if (name.contains("arm64") || name.contains("universal")) {
-                apkUrl = url
-                break
+    @JvmStatic
+    fun initialize(context: Context) {
+        appContext = context.applicationContext
+    }
+
+    /** 返回 Python 可解码的能力 JSON：版本号 + 是否已允许安装未知来源应用。 */
+    @JvmStatic
+    fun updateCapabilitiesJson(): String {
+        val context = appContext
+            ?: return errorJson("RUNTIME_UNAVAILABLE", "更新模块尚未初始化")
+        return try {
+            val info = context.packageManager.getPackageInfo(context.packageName, 0)
+            JSONObject().apply {
+                put("ok", true)
+                put("canInstall", context.packageManager.canRequestPackageInstalls())
+                put("versionName", info.versionName ?: "")
+                put("versionCode", versionCodeOf(info))
+            }.toString()
+        } catch (exc: Throwable) {
+            errorJson("VERSION_UNAVAILABLE", "读取当前版本失败：${exc.message}")
+        }
+    }
+
+    /**
+     * 校验待安装 APK：包名必须一致，签名必须与当前 App 一致。
+     *
+     * 注意：签名校验只能确认“能覆盖安装”，不能确认版本号一定更新；versionCode
+     * 由 Python 侧结合 capabilities 再比较一次。
+     */
+    @JvmStatic
+    fun verifyUpdateApkJson(path: String): String {
+        val context = appContext
+            ?: return errorJson("RUNTIME_UNAVAILABLE", "更新模块尚未初始化")
+        return try {
+            val apk = File(path)
+            if (!apk.isFile) {
+                return errorJson("APK_NOT_FOUND", "安装包不存在或已失效")
             }
-            if (apkUrl.isEmpty()) apkUrl = url
-        }
-        // 没有 APK 资产的 Release 不是 Android 发布包（可能是旧的网页端/桌面端），
-        // 不弹「发现新版本」，避免用户点了却下载不到可安装文件。
-        if (apkUrl.isBlank()) return null
-        return UpdateInfo(
-            tagName = tag,
-            version = version,
-            body = payload.optString("body"),
-            htmlUrl = payload.optString("html_url"),
-            apkUrl = apkUrl,
-        )
-    }
-
-    fun downloadAndInstall(context: Context, info: UpdateInfo) {
-        if (info.apkUrl.isBlank()) {
-            openExternal(context, info.htmlUrl)
-            return
-        }
-        Thread {
-            try {
-                val directory = File(context.cacheDir, "updates").apply { mkdirs() }
-                val apk = File(directory, "yikou-${info.version}.apk")
-                val url = URL(info.apkUrl)
-                val connection = (url.openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 15_000
-                    readTimeout = 60_000
-                    setRequestProperty("User-Agent", USER_AGENT)
-                }
-                connection.inputStream.use { input ->
-                    FileOutputStream(apk).use { output -> input.copyTo(output) }
-                }
-                install(context, apk)
-            } catch (_: Throwable) {
-                openExternal(context, info.htmlUrl)
+            val archive = archivePackageInfo(context, apk.absolutePath)
+                ?: return errorJson("APK_INVALID", "无法解析安装包，文件可能已损坏")
+            if (archive.packageName != context.packageName) {
+                return errorJson("PACKAGE_MISMATCH", "安装包包名与当前应用不一致")
             }
-        }.start()
-    }
-
-    private fun install(context: Context, apk: File) {
-        val uri: Uri = FileProvider.getUriForFile(
-            context, "${context.packageName}.fileprovider", apk)
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, "application/vnd.android.package-archive")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            val installed = context.packageManager.getPackageInfo(
+                context.packageName, packageInfoFlags())
+            val archiveDigests = signatureDigests(archive)
+            val installedDigests = signatureDigests(installed)
+            val sameSignature = archiveDigests.isNotEmpty() && archiveDigests == installedDigests
+            JSONObject().apply {
+                put("ok", true)
+                put("packageName", archive.packageName)
+                put("versionName", archive.versionName ?: "")
+                put("versionCode", versionCodeOf(archive))
+                put("sameSignature", sameSignature)
+                if (!sameSignature) {
+                    put("message", "安装包签名与当前应用不一致")
+                }
+            }.toString()
+        } catch (exc: Throwable) {
+            errorJson("APK_VERIFY_FAILED", "校验安装包失败：${exc.message}")
         }
-        context.startActivity(intent)
     }
 
-    private fun openExternal(context: Context, url: String) {
-        if (url.isBlank()) return
-        try {
-            context.startActivity(
-                Intent(Intent.ACTION_VIEW, Uri.parse(url))
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    /** 用 FileProvider 把安装包交给系统 PackageInstaller。 */
+    @JvmStatic
+    fun installApkJson(path: String): String {
+        val context = appContext
+            ?: return errorJson("RUNTIME_UNAVAILABLE", "更新模块尚未初始化")
+        return try {
+            val updatesDir = File(context.cacheDir, "updates").canonicalFile
+            val apk = File(path).canonicalFile
+            if (!apk.isFile) {
+                return errorJson("APK_NOT_FOUND", "安装包不存在或已失效")
+            }
+            val allowed = apk.path.startsWith(updatesDir.path + File.separator)
+            if (!allowed) {
+                return errorJson("INVALID_PATH", "安装包路径不在允许范围内")
+            }
+            if (!context.packageManager.canRequestPackageInstalls()) {
+                return JSONObject().apply {
+                    put("ok", false)
+                    put("code", "permission_required")
+                    put("message", "请先允许本应用安装「未知来源应用」")
+                }.toString()
+            }
+            val uri: Uri = FileProvider.getUriForFile(
+                context, "${context.packageName}.fileprovider", apk)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+            JSONObject().apply {
+                put("ok", true)
+                put("message", "已打开系统安装器")
+            }.toString()
+        } catch (exc: Throwable) {
+            errorJson("INSTALL_ACTIVITY_FAILED", "拉起系统安装器失败：${exc.message}")
+        }
+    }
+
+    /** 打开「安装未知应用」授权页；失败时回退到设置首页。 */
+    @JvmStatic
+    fun openInstallPermissionSettingsJson(): String {
+        val context = appContext
+            ?: return errorJson("RUNTIME_UNAVAILABLE", "更新模块尚未初始化")
+        return try {
+            val packageIntent = Intent(
+                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                Uri.parse("package:${context.packageName}"),
+            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(packageIntent)
+            JSONObject().apply { put("ok", true) }.toString()
         } catch (_: Throwable) {
-            // 没有浏览器时静默失败；更新只是提示，不应打断主流程。
+            try {
+                context.startActivity(
+                    Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                JSONObject().apply { put("ok", true) }.toString()
+            } catch (exc: Throwable) {
+                errorJson("SETTINGS_UNAVAILABLE", "无法打开安装权限设置：${exc.message}")
+            }
         }
     }
+
+    // ------------------------------------------------------------------
+    // 纯函数 / 兼容旧测试
+    // ------------------------------------------------------------------
 
     /** 语义化版本比较，兼容 ``v3.5.0`` 与 ``3.5.0``；不可比时返回 -1。 */
     fun compareVersions(left: String, right: String): Int {
@@ -127,20 +176,55 @@ object AppUpdater {
         return if (numbers.size == 3) numbers else null
     }
 
-    private fun httpGetJson(url: String): JSONObject? {
-        return try {
-            val connection = (URL(url).openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = 10_000
-                readTimeout = 10_000
-                setRequestProperty("Accept", "application/vnd.github+json")
-                setRequestProperty("User-Agent", USER_AGENT)
-            }
-            if (connection.responseCode != HttpURLConnection.HTTP_OK) return null
-            val body = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-            JSONObject(body)
-        } catch (_: Throwable) {
-            null
+    @Suppress("DEPRECATION")
+    private fun versionCodeOf(info: PackageInfo): Long =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            info.longVersionCode
+        } else {
+            info.versionCode.toLong()
         }
+
+    @Suppress("DEPRECATION")
+    private fun packageInfoFlags(): Int =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            PackageManager.GET_SIGNING_CERTIFICATES
+        } else {
+            PackageManager.GET_SIGNATURES
+        }
+
+    @Suppress("DEPRECATION")
+    private fun archivePackageInfo(context: Context, path: String): PackageInfo? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            context.packageManager.getPackageArchiveInfo(
+                path, PackageManager.GET_SIGNING_CERTIFICATES)
+        } else {
+            context.packageManager.getPackageArchiveInfo(path, PackageManager.GET_SIGNATURES)
+        }
+
+    private fun signatureDigests(info: PackageInfo): Set<String> {
+        val signatures: Array<android.content.pm.Signature> =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val signingInfo = info.signingInfo ?: return emptySet()
+                if (signingInfo.hasMultipleSigners()) {
+                    signingInfo.apkContentsSigners
+                } else {
+                    val certificate = signingInfo.signingCertificate ?: return emptySet()
+                    arrayOf(certificate)
+                }
+            } else {
+                info.signatures ?: return emptySet()
+            }
+        return signatures.mapNotNull { signature ->
+            MessageDigest.getInstance("SHA-256")
+                .digest(signature.toByteArray())
+                .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+        }.toSet()
     }
+
+    private fun errorJson(code: String, message: String): String =
+        JSONObject().apply {
+            put("ok", false)
+            put("code", code)
+            put("message", message)
+        }.toString()
 }

@@ -1,9 +1,10 @@
 /**
- * 更新检查节流：浏览器每次刷新都打 GitHub API 会撞匿名限流（60 次/小时）。
- * 自动检查每 6 小时最多一次；手动“检查更新”不受这里限制。
+ * 更新检查节流：App 每次打开都会检查；短节流只用于挡住页面反复刷新造成的重复请求，
+ * 避免撞 GitHub 匿名限流（60 次/小时）。手动“检查更新”不受这里限制。
  */
 
-export const AUTO_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
+//: App 打开后最多每 5 分钟自动查一次；正常使用频率下每次打开都会检查。
+export const AUTO_CHECK_INTERVAL_MS = 5 * 60 * 1000
 export const AUTO_CHECK_STORAGE_KEY = 'yikou.update.autoCheckAt.v1'
 
 /** storage 只需实现 getItem/setItem，便于 Node 测试注入假对象。 */

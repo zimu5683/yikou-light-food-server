@@ -23,7 +23,7 @@ test('first auto check writes timestamp and allows check', () => {
   assert.equal(storage.getItem(AUTO_CHECK_STORAGE_KEY), '1000000')
 })
 
-test('auto check is throttled inside 6h window', () => {
+test('auto check is throttled inside the interval window', () => {
   const storage = fakeStorage('1000000')
   assert.equal(
     shouldAutoCheckUpdates(storage, 1_000_000 + AUTO_CHECK_INTERVAL_MS - 1),
@@ -31,7 +31,7 @@ test('auto check is throttled inside 6h window', () => {
   )
 })
 
-test('auto check allowed after 6h', () => {
+test('auto check allowed after the interval', () => {
   const storage = fakeStorage('1000000')
   assert.equal(
     shouldAutoCheckUpdates(storage, 1_000_000 + AUTO_CHECK_INTERVAL_MS),

@@ -32,6 +32,7 @@ import {
   type BridgeEvent,
   type Transport,
   type UpdateAvailable,
+  type UpdateProgress,
 } from '@/lib/bridge'
 
 import {
@@ -58,6 +59,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [captcha, setCaptcha] = useState<CaptchaRequest | null>(null)
   const [addressInput, setAddressInput] = useState<AddressInputRequest | null>(null)
   const [updateAvailable, setAvailableState] = useState<UpdateAvailable | null>(null)
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null)
+  const [updatePermissionRequired, setUpdatePermissionRequired] = useState(false)
+  const [updateError, setUpdateError] = useState('')
+  const [platform, setPlatform] = useState<'android' | 'web'>('web')
+  const [canSelfUpdate, setCanSelfUpdate] = useState(false)
   const [mode, setMode] = useState<TaskMode>('order')
   const logId = useRef(0)
 
@@ -77,6 +83,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setVersion(state.version)
       setStatus(state.status)
       setIsAdmin(state.is_admin === true)
+      setPlatform(state.platform === 'android' ? 'android' : 'web')
+      setCanSelfUpdate(state.can_self_update === true)
       setConfig(state.config)
       setPasswords(state.passwords)
       // 验收回传：自动化验收依赖本通道（evaluate_js 在新 WebKitGTK 上不可信）
@@ -85,8 +93,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
           .frontend_report({ kind: 'ready', version: state.version, status: state.status })
           .catch(() => {})
       }
-      // 启动 700ms 后静默检查更新；自动检查每 6 小时最多一次，避免撞
-      // GitHub 匿名 API 限流（手动“检查更新”仍不受此限制）。
+      // 启动 700ms 后静默检查更新；自动检查有短节流，避免重复刷新时频繁请求
+      // GitHub 匿名 API（手动“检查更新”不受此限制）。
       if (!mocked) {
         let shouldCheck = true
         try {
@@ -144,13 +152,37 @@ export function AppProvider({ children }: { children: ReactNode }) {
           toast.error(event.payload.message, { duration: 8000 })
           break
         case 'update:available':
+          // 新版本弹窗只负责展示 + 安装；重置上一次的进度/错误状态。
           setAvailableState(event.payload)
+          setUpdateProgress(null)
+          setUpdatePermissionRequired(false)
+          setUpdateError('')
           break
         case 'update:latest':
-          toast.info(`当前已是最新版本（${event.payload.current}）。`)
+          setUpdateProgress(null)
+          setUpdatePermissionRequired(false)
+          if (event.payload.manual) {
+            toast.info(`当前已是最新版本（${event.payload.current}）。`)
+          }
+          break
+        case 'update:progress':
+          setUpdateProgress(event.payload)
+          setUpdateError('')
+          setUpdatePermissionRequired(false)
+          break
+        case 'update:permission_required':
+          setUpdatePermissionRequired(true)
+          setUpdateProgress(null)
+          break
+        case 'update:cancelled':
+          setUpdateProgress(null)
+          setUpdatePermissionRequired(false)
+          toast.info(event.payload.message || '已取消更新下载')
           break
         case 'update:error':
-          toast.error(`检查更新失败：${event.payload.message}`)
+          setUpdateProgress(null)
+          setUpdateError(event.payload.message)
+          toast.error(`更新失败：${event.payload.message}`, { duration: 8000 })
           break
         case 'desktop_update:available': {
           // 桌面版更新只是提示，不参与网页版更新，也不会改动任何网页端文件。
@@ -254,6 +286,46 @@ export function AppProvider({ children }: { children: ReactNode }) {
     api().check_updates(manual).catch(() => {})
   }, [])
 
+  const installUpdate = useCallback(() => {
+    setUpdateError('')
+    setUpdatePermissionRequired(false)
+    setUpdateProgress({ phase: 'downloading', percent: 0, message: '正在准备下载…' })
+    api().install_update()
+      .then((result) => {
+        if (result.ok) return
+        if (result.reason === 'permission_required') {
+          setUpdateProgress(null)
+          setUpdatePermissionRequired(true)
+          return
+        }
+        setUpdateProgress(null)
+        setUpdateError(result.message || '无法开始更新')
+      })
+      .catch((error: unknown) => {
+        setUpdateProgress(null)
+        setUpdateError(error instanceof Error ? error.message : String(error))
+      })
+  }, [])
+
+  const cancelUpdate = useCallback(() => {
+    setUpdateProgress(null)
+    api().cancel_update().catch(() => {})
+  }, [])
+
+  const openInstallSettings = useCallback(() => {
+    setUpdatePermissionRequired(false)
+    setUpdateError('')
+    api().open_install_settings()
+      .then((result) => {
+        if (!result.ok) {
+          setUpdateError(result.message || '无法打开安装权限设置')
+        }
+      })
+      .catch((error: unknown) => {
+        setUpdateError(error instanceof Error ? error.message : String(error))
+      })
+  }, [])
+
   const openExternal = useCallback((url: string) => {
     api().open_external(url).catch(() => {})
   }, [])
@@ -292,6 +364,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       version,
       status,
       isAdmin,
+      platform,
+      canSelfUpdate,
       config,
       passwords,
       logs,
@@ -308,6 +382,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
       newTemplate,
       clearPassword,
       checkUpdates,
+      updateProgress,
+      updatePermissionRequired,
+      updateError,
+      installUpdate,
+      cancelUpdate,
+      openInstallSettings,
       openExternal,
       requestClose,
       setSplitRatio,
@@ -316,11 +396,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
       resolveCaptcha,
       resolveAddressInput,
     }),
-    [ready, mocked, transport, authError, version, status, isAdmin, config, passwords, logs,
-      decision, mode, captcha, addressInput, startOrder, startSss, stopTask,
-      chooseExcel, newTemplate, clearPassword, checkUpdates,
-      openExternal, requestClose, setSplitRatio, clearLogs, resolveDecision, resolveCaptcha,
-      resolveAddressInput],
+    [ready, mocked, transport, authError, version, status, isAdmin, platform, canSelfUpdate,
+      config, passwords, logs, decision, mode, captcha, addressInput,
+      startOrder, startSss, stopTask, chooseExcel, newTemplate, clearPassword, checkUpdates,
+      updateProgress, updatePermissionRequired, updateError, installUpdate, cancelUpdate,
+      openInstallSettings, openExternal, requestClose, setSplitRatio, clearLogs,
+      resolveDecision, resolveCaptcha, resolveAddressInput],
   )
 
   const updateAvailableValue = useMemo(

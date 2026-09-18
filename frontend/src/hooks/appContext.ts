@@ -16,6 +16,7 @@ import {
   type StatusState,
   type Transport,
   type UpdateAvailable,
+  type UpdateProgress,
 } from '@/lib/bridge'
 
 export type TaskMode = 'order' | 'cloud' | 'sss'
@@ -37,6 +38,10 @@ export interface AppStateBundle {
   status: StatusState
   /** 当前账号是否管理员；非管理员只看到基础功能（后端另有强制拦截）。 */
   isAdmin: boolean
+  /** 运行平台：android = APK 自带 WebView；web = 纯浏览器访问。 */
+  platform: 'android' | 'web'
+  /** 是否支持应用内下载安装更新。 */
+  canSelfUpdate: boolean
   config: AppState['config'] | null
   passwords: { order: string; sss: string }
   logs: LogRow[]
@@ -53,6 +58,15 @@ export interface AppStateBundle {
   newTemplate: (mode: 'order' | 'sss') => Promise<{ path: string; error: string }>
   clearPassword: (mode: 'order' | 'sss') => Promise<void>
   checkUpdates: (manual: boolean) => void
+  /** APK 更新：下载/校验/安装进程中的状态。 */
+  updateProgress: UpdateProgress | null
+  /** 缺少「安装未知应用」权限时由弹窗引导到系统设置。 */
+  updatePermissionRequired: boolean
+  /** 最近一次更新相关错误的可展示文本。 */
+  updateError: string
+  installUpdate: () => void
+  cancelUpdate: () => void
+  openInstallSettings: () => void
   openExternal: (url: string) => void
   requestClose: () => void
   setSplitRatio: (ratio: number) => void

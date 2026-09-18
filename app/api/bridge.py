@@ -12,10 +12,14 @@ sequence 中间缺口和关键事件超限都会返回 ``events:dropped`` 告警
 - status             {state}                   ready/running/stopping/success/partial/stopped/error/updating
 - task:done          {message, stopped, partial}
 - task:error         {message}
-- update:available         {tag, current, body, html_url}   网页版自己的 Release
+- update:available         {tag, current, body, html_url, can_install, asset_name, size}
+                            App 自己的 Release；APK 模式下带安装包信息
 - desktop_update:available {tag, current, body, html_url}   桌面版提示，不改变网页版
-- update:latest            {manual}
-- update:error             {message}
+- update:latest            {manual, current}
+- update:progress          {phase, percent, downloaded, total, message}
+- update:permission_required {message}                      需要允许“安装未知应用”
+- update:cancelled         {message}
+- update:error             {code, message}
 - decision           {id, kind, title, message, choices}
 - captcha            {id, image}
 - address_input      {id, title, message, items[{raw_address, order_numbers,
@@ -50,7 +54,13 @@ from app.ordering.cloud_import import ImportRefused, prepare_day_orders
 from app.core.update import (
     DESKTOP_REPOSITORY,
     ReleaseCheckError,
+    UpdateCancelled,
     check_for_update,
+    download_asset,
+    parse_sha256,
+    read_asset_text,
+    select_android_apk,
+    select_sha256_asset,
 )
 from app.wps.sync import (KdocsCli, SyncLedger, WpsCloudError, apply_plan,
                         build_plan, effective_tables, format_plan,
@@ -138,6 +148,11 @@ class Bridge:
         self._push_lock = threading.Lock()
         self._worker_lock = threading.Lock()
         self._update_checking = False
+        #: APK 更新：同一时间只允许一个下载/安装任务。
+        self._update_installing = False
+        self._update_cancel = threading.Event()
+        self._update_prev_status = "ready"
+        self._update_phase = ""
         self._decision_seq = 0
         self._decisions: dict[str, _PendingInteraction] = {}
         self._interaction_timeout_s = DEFAULT_INTERACTION_TIMEOUT_S
@@ -399,11 +414,16 @@ class Bridge:
     def bridge_ready(self) -> dict[str, Any]:
         """前端装载完成后的握手。返回初始状态并冲积未发送事件。"""
         config = self._config
+        android_mode = android_runtime.is_android()
         state: dict[str, Any] = {
             "version": __version__,
             "status": self._status,
             # 前端据此识别 Python 进程重启，避免旧 cursor 与新的 sequence 冲突。
             "event_producer_id": self._event_producer_id,
+            #: App 运行平台：android = APK 自带 WebView；web = 纯浏览器访问。
+            "platform": "android" if android_mode else "web",
+            #: 是否支持应用内下载安装（当前只有 APK 模式支持）。
+            "can_self_update": android_mode,
             #: 前端据此决定显示哪些表单字段。真正的拦截在后端（见 _ADMIN_ONLY_CONFIG
             #: 与 web_server 的方法白名单），前端只是不显示。
             "is_admin": bool(self.is_admin),
@@ -1450,58 +1470,286 @@ class Bridge:
         return {"ok": True}
 
     def check_updates(self, manual: bool = False) -> dict[str, Any]:
-        """启动更新检查（后台线程）。正在检查时返回 ``{"ok": False, "reason": "already_checking"}``。"""
+        """启动更新检查（后台线程）。正在安装时拒绝，避免状态互相覆盖。"""
+        if self._update_installing:
+            return {"ok": False, "reason": "installing",
+                    "message": "正在下载/安装更新，请稍候"}
         if self._update_checking:
             return {"ok": False, "reason": "already_checking"}
         self._update_checking = True
-        self._set_status("updating")
+        self._update_prev_status = self._status
+        if self._status not in ("running", "stopping"):
+            self._set_status("updating")
         self.log("正在检查更新...")
         threading.Thread(target=self._check_updates_worker, args=(bool(manual),), daemon=True).start()
         return {"ok": True}
 
+    def _installed_app_version(self) -> str:
+        """返回当前安装包的真实版本；非 Android 时退回 Python 版本号。"""
+        if android_runtime.is_android():
+            capabilities = android_runtime.update_capabilities()
+            version = str(capabilities.get("versionName") or "").strip()
+            if version:
+                return version
+        return __version__
+
+    def _restore_after_update_task(self) -> None:
+        """检查/安装结束后恢复进入前的状态（检查更新不算真的“正在更新”）。"""
+        if self._status != "updating":
+            return
+        previous = self._update_prev_status
+        self._set_status(previous if previous and previous != "updating" else "ready")
+
     def _check_updates_worker(self, manual: bool) -> None:
         web_ok = True
+        current_version = self._installed_app_version()
+        android_mode = android_runtime.is_android()
         try:
-            # 1) 网页版自己的 Release：只有这个仓库的新版本才代表“网页版需要更新”。
-            release = check_for_update()
-            if release:
-                self._emit_event("update:available", {
-                    "tag": release.tag_name,
-                    "current": __version__,
-                    "body": release.body or "（暂无更新说明）",
-                    "html_url": release.release_url,
+            try:
+                release = check_for_update(current_version=current_version)
+                if release:
+                    apk = select_android_apk(release) if android_mode else None
+                    if android_mode and apk is None:
+                        self.log(f"发现新版本 {release.tag_name}，"
+                                 "但 Release 缺少 Android APK 资产，暂不可安装", "WARN")
+                        if manual:
+                            self._emit_event("update:error", {
+                                "code": "no_apk",
+                                "message": "发现新版本，但该 Release 没有 Android 安装包",
+                            })
+                    else:
+                        payload: dict[str, Any] = {
+                            "tag": release.tag_name,
+                            "current": current_version,
+                            "body": release.body or "（暂无更新说明）",
+                            "html_url": release.release_url,
+                            "can_install": bool(android_mode and apk is not None),
+                        }
+                        if apk is not None:
+                            payload.update({
+                                "asset_name": apk.name,
+                                "size": int(apk.size or 0),
+                            })
+                        self._emit_event("update:available", payload)
+                elif manual:
+                    self._emit_event("update:latest", {"manual": True, "current": current_version})
+                else:
+                    self.log("当前已是最新版本")
+            except ReleaseCheckError as exc:
+                web_ok = False
+                self._set_status("error")
+                self._emit_event("update:error", {"code": "check_failed", "message": str(exc)})
+
+            # 桌面版仓库只做提示：不下载、不安装、不改动任何网页端文件。
+            try:
+                desktop = check_for_update(current_version=current_version,
+                                           repository=DESKTOP_REPOSITORY)
+                if desktop:
+                    self._emit_event("desktop_update:available", {
+                        "tag": desktop.tag_name,
+                        "current": current_version,
+                        "body": desktop.body or "（暂无更新说明）",
+                        "html_url": desktop.release_url,
+                    })
+                    self.log(f"桌面版发布新版本 {desktop.tag_name}；"
+                             "网页版内容不会被自动改动，如需同步功能请手动移植代码")
+            except ReleaseCheckError as exc:
+                self.log(f"桌面版更新检查失败：{exc}", "WARN")
+        finally:
+            self._update_checking = False
+            if web_ok:
+                self._restore_after_update_task()
+
+    def _emit_update_progress(self, phase: str, percent: int, *,
+                              downloaded: int | None = None,
+                              total: int | None = None,
+                              message: str = "") -> None:
+        self._update_phase = phase
+        payload: dict[str, Any] = {
+            "phase": phase,
+            "percent": max(0, min(100, int(percent))),
+        }
+        if downloaded is not None:
+            payload["downloaded"] = max(0, int(downloaded))
+        if total is not None:
+            payload["total"] = max(0, int(total))
+        if message:
+            payload["message"] = message
+        self._emit_event("update:progress", payload)
+
+    def install_update(self) -> dict[str, Any]:
+        """准备应用内更新：Android APK 模式下下载并拉起系统安装器。
+
+        会先检查平台、任务状态、未知来源安装权限；真正下载在后台线程执行，
+        进度通过 ``update:progress`` 事件回传。
+        """
+        if self._update_installing:
+            return {"ok": False, "reason": "already_installing",
+                    "message": "正在下载或安装更新，请稍候"}
+        if self._update_checking:
+            return {"ok": False, "reason": "checking",
+                    "message": "正在检查更新，请稍候"}
+        if not android_runtime.is_android():
+            return {"ok": False, "reason": "unsupported_platform",
+                    "message": "当前不是 APK 模式，无法应用内安装更新"}
+        if self.worker_alive():
+            return {"ok": False, "reason": "busy",
+                    "message": "任务正在运行，请先停止任务再更新"}
+        capabilities = android_runtime.update_capabilities()
+        if not capabilities.get("ok"):
+            return {"ok": False, "reason": "native_unavailable",
+                    "message": str(capabilities.get("message") or "Android 更新组件不可用")}
+        if not capabilities.get("canInstall"):
+            return {"ok": False, "reason": "permission_required",
+                    "message": "请先允许本应用安装「未知来源应用」"}
+
+        self._update_installing = True
+        self._update_cancel.clear()
+        self._update_phase = "checking"
+        self._update_prev_status = self._status
+        if self._status not in ("running", "stopping"):
+            self._set_status("updating")
+        self.log("开始准备更新...")
+        threading.Thread(target=self._install_update_worker, args=(capabilities,),
+                         daemon=True).start()
+        return {"ok": True}
+
+    def cancel_update(self) -> dict[str, Any]:
+        """取消正在进行的下载；已经交给系统安装器后无法取消。"""
+        if not self._update_installing:
+            return {"ok": True}
+        if self._update_phase in ("checking", "downloading"):
+            self._update_cancel.set()
+            self.log("正在取消更新下载...")
+        return {"ok": True}
+
+    def open_install_settings(self) -> dict[str, Any]:
+        """打开系统「安装未知应用」设置页。"""
+        if not android_runtime.is_android():
+            return {"ok": False, "reason": "unsupported_platform"}
+        return {"ok": bool(android_runtime.open_install_permission_settings())}
+
+    def _install_update_worker(self, capabilities: dict[str, Any]) -> None:
+        try:
+            current_version = str(capabilities.get("versionName") or __version__)
+            current_code = int(capabilities.get("versionCode") or 0)
+            release = check_for_update(current_version=current_version)
+            if release is None:
+                self._emit_event("update:latest", {"manual": True, "current": current_version})
+                return
+
+            apk = select_android_apk(release)
+            if apk is None:
+                self._emit_event("update:error", {
+                    "code": "no_apk",
+                    "message": "该版本没有 Android 安装包，无法自动更新",
                 })
-            elif manual:
-                self._set_status("ready")
-                self._emit_event("update:latest", {"manual": True, "current": __version__})
+                return
+
+            expected_sha = ""
+            sha_asset = select_sha256_asset(release, apk)
+            if sha_asset is not None:
+                try:
+                    expected_sha = parse_sha256(read_asset_text(sha_asset))
+                except ReleaseCheckError as exc:
+                    self.log(f"[更新] 校验文件读取失败：{exc}", "WARN")
             else:
-                self.log("网页版已是最新版本")
-                self._set_status("ready")
-        except ReleaseCheckError as exc:
-            web_ok = False
-            self._set_status("error")
-            self._emit_event("update:error", {"message": str(exc)})
+                self.log("[更新] Release 缺少 sha256 校验文件，将依赖 APK 签名校验", "WARN")
 
-        # 2) 桌面版仓库只做“有更新”的提示：不参与网页版版本比较、不下载、
-        #    更不会改动任何网页端文件。用户可据此决定是否手动移植代码。
-        try:
-            desktop = check_for_update(repository=DESKTOP_REPOSITORY)
-            if desktop:
-                self._emit_event("desktop_update:available", {
-                    "tag": desktop.tag_name,
-                    "current": __version__,
-                    "body": desktop.body or "（暂无更新说明）",
-                    "html_url": desktop.release_url,
+            cache_root = android_runtime.cache_dir()
+            if cache_root is None:
+                self._emit_event("update:error", {
+                    "code": "cache_unavailable",
+                    "message": "无法获取应用缓存目录，更新已取消",
                 })
-                self.log(f"桌面版发布新版本 {desktop.tag_name}；"
-                         "网页版内容不会被自动改动，如需同步功能请手动移植代码")
-        except ReleaseCheckError as exc:
-            # 桌面版检查失败只是提示信息缺失，不影响网页版自身的更新状态。
-            self.log(f"桌面版更新检查失败：{exc}", "WARN")
+                return
+            destination = cache_root / "updates" / f"yikou-{release.version}-arm64.apk"
 
-        if not web_ok and not manual:
-            pass  # 保留上面的 error 状态，前台会提示检查失败
-        self._update_checking = False
+            total_hint = int(apk.size or 0)
+            last_emit = [0.0]
+
+            def on_progress(downloaded: int, total: int) -> None:
+                resolved = total or total_hint
+                now = time.monotonic()
+                # 避免 19MB 下载产生几百条关键事件：约每 250ms 或整 5% 上报一次。
+                if downloaded < resolved and now - last_emit[0] < 0.25:
+                    return
+                last_emit[0] = now
+                percent = int(downloaded * 100 / resolved) if resolved > 0 else 0
+                self._emit_update_progress("downloading", percent,
+                                           downloaded=downloaded, total=resolved)
+
+            self._emit_update_progress("downloading", 0, downloaded=0, total=total_hint,
+                                       message="正在下载安装包…")
+            self.log(f"正在下载 {apk.name}...")
+            try:
+                download_asset(
+                    apk,
+                    destination,
+                    expected_sha256=expected_sha,
+                    expected_size=apk.size or None,
+                    on_progress=on_progress,
+                    cancel_check=self._update_cancel.is_set,
+                )
+            except UpdateCancelled:
+                self.log("已取消下载更新")
+                self._emit_event("update:cancelled", {"message": "已取消更新下载"})
+                return
+
+            self._emit_update_progress("verifying", 100, downloaded=apk.size,
+                                       total=apk.size, message="正在校验安装包…")
+            self.log("正在校验安装包...")
+            verify = android_runtime.verify_update_apk(str(destination))
+            if not verify.get("ok"):
+                try:
+                    destination.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                self._emit_event("update:error", {
+                    "code": str(verify.get("code") or "verify_failed"),
+                    "message": str(verify.get("message") or "安装包校验失败"),
+                })
+                return
+            if not verify.get("sameSignature"):
+                self._emit_event("update:error", {
+                    "code": "signature_mismatch",
+                    "message": "安装包签名与当前应用不一致，已拒绝安装"
+                               "（请确认新版使用同一把签名证书）",
+                })
+                return
+            remote_code = int(verify.get("versionCode") or 0)
+            if remote_code and current_code and remote_code <= current_code:
+                self._emit_event("update:latest", {"manual": True, "current": current_version})
+                return
+
+            self._emit_update_progress("installing", 100, downloaded=apk.size,
+                                       total=apk.size,
+                                       message="已打开系统安装器，请按手机提示完成安装")
+            self.log("安装包校验通过，正在拉起系统安装器...", "OK")
+            result = android_runtime.install_apk(str(destination))
+            if not result.get("ok"):
+                code = str(result.get("code") or "install_failed")
+                message = str(result.get("message") or "拉起系统安装器失败")
+                if code in ("permission_required", "unknown_sources"):
+                    self._emit_event("update:permission_required", {"message": message})
+                else:
+                    self._emit_event("update:error", {"code": code, "message": message})
+                return
+            self.log("已拉起系统安装器，请在手机弹窗中完成安装", "OK")
+        except ReleaseCheckError as exc:
+            self._emit_event("update:error", {"code": "check_failed", "message": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("update install failed")
+            self.log(f"[更新] 失败：{type(exc).__name__}: {exc}", "ERROR")
+            self._emit_event("update:error", {
+                "code": "update_failed",
+                "message": f"{type(exc).__name__}: {exc}",
+            })
+        finally:
+            self._update_installing = False
+            self._update_cancel.clear()
+            self._update_phase = ""
+            self._restore_after_update_task()
 
     def open_external(self, url: str) -> dict[str, Any]:
         """用系统默认程序打开外链。

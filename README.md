@@ -70,6 +70,23 @@ x86_64 runner 下载 **linux-arm64** kdocs-cli、Termux proot 依赖与 Mozilla 
 patchelf 把 RUNPATH 改成 `$ORIGIN` 后由 Chaquopy/AGP 打包。正式分发必须在 GitHub
 Secrets 配置 `YIKOU_KEYSTORE_FILE` / `YIKOU_KEYSTORE_PASSWORD` / `YIKOU_KEY_ALIAS` /
 `YIKOU_KEY_PASSWORD`；缺失时会退化为 debug 签名，只能做 M0/M1 可行性验证。
+### APK 应用内更新
+
+App 打开后会自动检查 GitHub Release（5 分钟短节流，正常使用每次打开都会检查）。
+发现新版本时点击弹窗里的「下载并安装」，会：
+
+1. 自动选择 Release 里的 arm64 APK 与 `.sha256`；
+2. 下载到 App 缓存目录并显示进度；
+3. 校验文件完整性、SHA-256、包名、签名和 `versionCode`；
+4. 校验通过后直接拉起系统安装器，用户按系统提示完成覆盖安装。
+
+注意：
+
+- 普通 Android App 无法静默安装，系统安装确认弹窗无法绕过；
+- 首次需要允许本应用「安装未知来源应用」；
+- 新旧 APK 必须使用同一把签名证书，否则只能卸载重装（配置会丢失）；
+- 这一功能只对**已经包含该功能的版本**生效，首次升级 v3.6.5 仍需从 Release 手动安装一次。
+
 第一次在真机跑 M0 时，建议先验证 `WpsRuntime` 诊断页输出的 `version` / `auth status`，
 再把真机结果填入 [`design/APK-STATUS.md`](design/APK-STATUS.md)。
 

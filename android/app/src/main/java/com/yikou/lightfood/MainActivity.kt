@@ -46,7 +46,6 @@ class MainActivity : Activity() {
         RuntimeState.addListener(stateListener)
         TaskService.start(this)
         requestStartupPermissions()
-        checkForUpdates()
     }
 
     override fun onDestroy() {
@@ -62,41 +61,6 @@ class MainActivity : Activity() {
             @Suppress("DEPRECATION")
             super.onBackPressed()
         }
-    }
-
-    private fun checkForUpdates() {
-        // GitHub 检查失败绝不打扰启动；有更新时才弹原生对话框，下载后交给
-        // PackageInstaller，不复用网页版的 update:available 事件。
-        Thread {
-            val update = try {
-                AppUpdater.checkForUpdate(BuildConfig.VERSION_NAME)
-            } catch (_: Throwable) {
-                null
-            }
-            if (update != null) {
-                runOnUiThread { showUpdateDialog(update) }
-            }
-        }.start()
-    }
-
-    private fun showUpdateDialog(info: UpdateInfo) {
-        val message = buildString {
-            append("当前版本：").append(BuildConfig.VERSION_NAME).append("\n")
-            append("最新版本：").append(info.tagName).append("\n\n")
-            append(info.body.take(1200))
-        }
-        AlertDialog.Builder(this)
-            .setTitle("发现新版本")
-            .setMessage(message)
-            .setPositiveButton("下载并安装") { _, _ ->
-                AppUpdater.downloadAndInstall(this, info)
-                Toast.makeText(this, "开始下载更新…", Toast.LENGTH_SHORT).show()
-            }
-            .setNeutralButton("查看发布页") { _, _ ->
-                if (info.htmlUrl.isNotBlank()) WpsRuntime.openExternal(info.htmlUrl)
-            }
-            .setNegativeButton("稍后") { _, _ -> }
-            .show()
     }
 
     @SuppressLint("SetJavaScriptEnabled")  // 本地 127.0.0.1 页面且只加载自有前端。

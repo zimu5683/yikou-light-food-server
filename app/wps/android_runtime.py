@@ -301,6 +301,68 @@ def open_external(url: str) -> bool:
     return str(raw).strip().lower() in {"true", "1"}
 
 
+def cache_dir() -> Path | None:
+    """返回 Kotlin 注入的应用缓存目录（APK 更新包放在这里）。"""
+    raw = os.environ.get("YIKOU_CACHE_DIR") or ""
+    return Path(raw) if raw else None
+
+
+def update_capabilities() -> dict[str, Any]:
+    """读取原生更新能力：当前 versionCode/versionName、能否安装未知来源应用。
+
+    返回 dict；原生桥不可用时返回 ``{"ok": False, ...}``，不抛异常。
+    """
+    try:
+        data = _as_mapping(_call("updateCapabilitiesJson"))
+    except AndroidRuntimeError as exc:
+        return {"ok": False, "errorCode": exc.error_code, "message": str(exc)}
+    if not data:
+        return {"ok": False, "errorCode": "RUNTIME_UNAVAILABLE",
+                "message": "Android 更新接口返回空数据"}
+    return data
+
+
+def verify_update_apk(path: str) -> dict[str, Any]:
+    """让原生层校验下载的 APK：包名、签名、versionCode。"""
+    value = str(path or "").strip()
+    if not value:
+        return {"ok": False, "code": "APK_NOT_FOUND", "message": "安装包路径为空"}
+    try:
+        data = _as_mapping(_call("verifyUpdateApkJson", value))
+    except AndroidRuntimeError as exc:
+        return {"ok": False, "code": exc.error_code, "message": str(exc)}
+    if not data:
+        return {"ok": False, "code": "APK_VERIFY_FAILED", "message": "APK 校验失败"}
+    return data
+
+
+def install_apk(path: str) -> dict[str, Any]:
+    """让原生层通过 FileProvider 拉起系统 PackageInstaller。"""
+    value = str(path or "").strip()
+    if not value:
+        return {"ok": False, "code": "APK_NOT_FOUND", "message": "安装包路径为空"}
+    try:
+        data = _as_mapping(_call("installApkJson", value))
+    except AndroidRuntimeError as exc:
+        return {"ok": False, "code": exc.error_code, "message": str(exc)}
+    if not data:
+        return {"ok": False, "code": "INSTALL_FAILED", "message": "拉起系统安装器失败"}
+    return data
+
+
+def open_install_permission_settings() -> bool:
+    """打开系统「安装未知应用」设置页；失败返回 False。"""
+    try:
+        raw = _call("openInstallPermissionSettingsJson")
+    except AndroidRuntimeError:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    data = _as_mapping(raw)
+    return bool(data.get("ok"))
+
+
+
 def diagnostics() -> dict[str, Any]:
     """返回原生运行时诊断快照（不含 token/密码）。"""
     try:

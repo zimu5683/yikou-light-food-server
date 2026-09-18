@@ -85,3 +85,33 @@ def test_python_adapter_and_xdgopen_shim_are_present():
     assert 'RUNTIME_MARKER = "@android-runtime"' in _read(adapter)
     assert shim.is_file() and "YIKOU_AUTH_URL_FILE" in _read(shim)
     assert fetcher.is_file()
+
+
+def test_android_updater_has_native_json_bridge_and_no_browser_fallback():
+    """Python 只能通过 @JvmStatic JSON 接口调用原生更新器；更新失败不得跳浏览器。"""
+    updater = _read(ANDROID / "app" / "src" / "main" / "java" / "com"
+                    / "yikou" / "lightfood" / "AppUpdater.kt")
+    assert '@JvmStatic' in updater
+    assert 'fun updateCapabilitiesJson' in updater
+    assert 'fun verifyUpdateApkJson' in updater
+    assert 'fun installApkJson' in updater
+    assert 'fun openInstallPermissionSettingsJson' in updater
+    assert 'openExternal' not in updater
+    manifest = _read(ANDROID / "app" / "src" / "main" / "AndroidManifest.xml")
+    assert 'android.permission.REQUEST_INSTALL_PACKAGES' in manifest
+
+
+def test_main_activity_does_not_duplicate_update_dialog():
+    activity = _read(ANDROID / "app" / "src" / "main" / "java" / "com"
+                     / "yikou" / "lightfood" / "MainActivity.kt")
+    assert 'showUpdateDialog' not in activity
+    assert 'checkForUpdates' not in activity
+
+
+def test_bridge_exposes_in_app_install_methods():
+    bridge = _read(ROOT / "app" / "api" / "bridge.py")
+    assert 'def install_update' in bridge
+    assert 'def cancel_update' in bridge
+    assert 'def open_install_settings' in bridge
+    assert 'update:progress' in bridge
+    assert 'open_external' not in bridge.split('def __init__')[0]  # 仅确保模块头没有旧兜底

@@ -170,6 +170,10 @@ export interface AppState {
   is_admin?: boolean
   /** Python 进程标识：用于识别重启后 sequence 归零，避免复用旧 cursor。 */
   event_producer_id?: string
+  /** 运行平台：android = APK 自带 WebView；web = 纯浏览器访问。 */
+  platform?: 'android' | 'web'
+  /** 当前环境是否支持应用内下载安装（仅 APK 模式为 true）。 */
+  can_self_update?: boolean
   config: AppConfigState
   passwords: { order: string; sss: string }
 }
@@ -216,8 +220,23 @@ export interface UpdateAvailable {
   tag: string
   current: string
   body: string
-  /** Release 页面地址；旧后端未返回时由前端回退到仓库地址。 */
+  /** Release 页面地址；仅作为信息保留，更新按钮不再打开它。 */
   html_url?: string
+  /** Android 模式：Release 里选中的 APK 资产名与大小。 */
+  asset_name?: string
+  size?: number
+  /** 当前环境是否支持应用内下载安装。 */
+  can_install?: boolean
+}
+
+export type UpdatePhase = 'downloading' | 'verifying' | 'installing'
+
+export interface UpdateProgress {
+  phase: UpdatePhase
+  percent: number
+  downloaded?: number
+  total?: number
+  message?: string
 }
 
 type BridgeEventBase =
@@ -239,7 +258,10 @@ type BridgeEventBase =
       payload: { tag: string; current: string; body: string; html_url?: string }
     }
   | { event: 'update:latest'; payload: { manual: boolean; current: string } }
-  | { event: 'update:error'; payload: { message: string } }
+  | { event: 'update:progress'; payload: UpdateProgress }
+  | { event: 'update:permission_required'; payload: { message: string } }
+  | { event: 'update:cancelled'; payload: { message?: string } }
+  | { event: 'update:error'; payload: { code?: string; message: string } }
   | { event: 'decision'; payload: DecisionRequest }
   | { event: 'captcha'; payload: CaptchaRequest }
   | { event: 'address_input'; payload: AddressInputRequest }
@@ -379,7 +401,10 @@ interface BackendApi {
   wps_check_copies(): Promise<WpsCopyCheck>
   save_wps_config(payload: WpsConfigPayload): Promise<{ ok: boolean; reason?: string }>
   clear_password(mode: 'order' | 'sss'): Promise<{ ok: boolean }>
-  check_updates(manual: boolean): Promise<{ ok: boolean; reason?: string }>
+  check_updates(manual: boolean): Promise<{ ok: boolean; reason?: string; message?: string }>
+  install_update(): Promise<{ ok: boolean; reason?: string; message?: string }>
+  cancel_update(): Promise<{ ok: boolean }>
+  open_install_settings(): Promise<{ ok: boolean; message?: string }>
   open_external(url: string): Promise<{ ok: boolean }>
   frontend_report(payload: Record<string, unknown> | string): Promise<{ ok: boolean }>
   drain_events(lastSequence?: number, ackSequence?: number, producerId?: string): Promise<DrainEventsResult>
