@@ -419,3 +419,85 @@ def test_bridge_wps_logout_android_error_shape(android, monkeypatch):
         lambda: android_runtime.ExecResult(exit_code=1, stderr="boom", error_code="RUNTIME_CRASHED"))
     assert Bridge(config_path=None, is_admin=True).wps_logout() == {
         "ok": False, "reason": "RUNTIME_CRASHED"}
+
+
+@pytest.fixture
+def fake_updater(monkeypatch, android):
+    """安装一个可记录调用的假 Kotlin AppUpdater（更新接口专用类）。"""
+
+    class Updater:
+        def __init__(self) -> None:
+            self.calls: list[tuple] = []
+            self.capabilities = {
+                "ok": True,
+                "canInstall": True,
+                "versionName": "3.6.5",
+                "versionCode": 30605,
+            }
+            self.verify = {
+                "ok": True,
+                "sameSignature": True,
+                "versionCode": 3060800,
+                "versionName": "3.6.8",
+            }
+            self.install = {"ok": True, "message": "已打开系统安装器"}
+            self.permission = {"ok": True}
+
+        def updateCapabilitiesJson(self):
+            self.calls.append(("updateCapabilitiesJson",))
+            return json.dumps(self.capabilities)
+
+        def verifyUpdateApkJson(self, path):
+            self.calls.append(("verifyUpdateApkJson", path))
+            return json.dumps(self.verify)
+
+        def installApkJson(self, path):
+            self.calls.append(("installApkJson", path))
+            return json.dumps(self.install)
+
+        def openInstallPermissionSettingsJson(self):
+            self.calls.append(("openInstallPermissionSettingsJson",))
+            return json.dumps(self.permission)
+
+    updater = Updater()
+    monkeypatch.setattr(android_runtime, "_updater_class", lambda: updater)
+    return updater
+
+
+def test_update_capabilities_uses_app_updater_class(fake_updater):
+    # 回归锁：更新方法只在 AppUpdater 上；绝不能再去 WpsRuntime 找。
+    capabilities = android_runtime.update_capabilities()
+    assert capabilities["ok"] is True
+    assert capabilities["versionName"] == "3.6.5"
+    assert capabilities["versionCode"] == 30605
+    assert fake_updater.calls == [("updateCapabilitiesJson",)]
+
+
+def test_verify_and_install_update_apk_use_app_updater_class(fake_updater):
+    verify = android_runtime.verify_update_apk("/data/cache/updates/a.apk")
+    assert verify["ok"] is True
+    assert verify["sameSignature"] is True
+    assert verify["versionCode"] == 3060800
+
+    installed = android_runtime.install_apk("/data/cache/updates/a.apk")
+    assert installed["ok"] is True
+    assert fake_updater.calls == [
+        ("verifyUpdateApkJson", "/data/cache/updates/a.apk"),
+        ("installApkJson", "/data/cache/updates/a.apk"),
+    ]
+
+
+def test_open_install_permission_settings_uses_app_updater_class(fake_updater):
+    assert android_runtime.open_install_permission_settings() is True
+    assert fake_updater.calls == [("openInstallPermissionSettingsJson",)]
+
+
+def test_update_capabilities_reports_missing_app_updater_method(monkeypatch, android):
+    class BrokenUpdater:
+        pass
+
+    monkeypatch.setattr(android_runtime, "_updater_class", lambda: BrokenUpdater())
+    capabilities = android_runtime.update_capabilities()
+    assert capabilities["ok"] is False
+    assert capabilities["errorCode"] == "RUNTIME_UNAVAILABLE"
+    assert "updateCapabilitiesJson" in capabilities["message"]

@@ -25,6 +25,8 @@ RUNTIME_MARKER = "@android-runtime"
 
 #: Kotlin 侧对象名（Java 反射视角；Kotlin ``object`` 的方法已加 ``@JvmStatic``）。
 RUNTIME_CLASS = "com.yikou.lightfood.WpsRuntime"
+#: 应用内更新接口在独立的 AppUpdater 对象上，不能也当 WpsRuntime 调。
+UPDATE_RUNTIME_CLASS = "com.yikou.lightfood.AppUpdater"
 
 #: APK 启动时由 Kotlin 写入的环境变量；只有显式设置了它才启用原生路径。
 APP_MODE_ENV = "YIKOU_APP_MODE"
@@ -74,8 +76,8 @@ def is_android() -> bool:
     return os.environ.get(APP_MODE_ENV, "").strip().lower() == APP_MODE_ANDROID
 
 
-def _runtime_class() -> Any:
-    """返回 Chaquopy ``jclass``；在桌面测试中由 monkeypatch 替换。"""
+def _load_class(runtime_class: str) -> Any:
+    """按类名返回 Chaquopy ``jclass``；测试可直接 monkeypatch 上层函数。"""
     try:
         from java import jclass  # type: ignore[import-not-found]  # noqa: PLC0415
     except Exception as exc:  # pragma: no cover - 仅 APK 之外会走到
@@ -84,17 +86,26 @@ def _runtime_class() -> Any:
             error_code="RUNTIME_UNAVAILABLE",
         ) from exc
     try:
-        return jclass(RUNTIME_CLASS)
+        return jclass(runtime_class)
     except Exception as exc:  # pragma: no cover - APK 类缺失时才发生
         raise AndroidRuntimeError(
-            f"Android 原生运行时类缺失：{RUNTIME_CLASS}",
+            f"Android 原生运行时类缺失：{runtime_class}",
             error_code="RUNTIME_UNAVAILABLE",
         ) from exc
 
 
-def _call(method: str, *args: Any) -> Any:
-    """调用 Kotlin 静态方法；只传字符串 / 整数，避免 Java 类型擦除歧义。"""
-    runtime = _runtime_class()
+def _runtime_class() -> Any:
+    """返回 ``WpsRuntime`` 的 jclass；在桌面测试中由 monkeypatch 替换。"""
+    return _load_class(RUNTIME_CLASS)
+
+
+def _updater_class() -> Any:
+    """返回 ``AppUpdater`` 的 jclass；更新接口不在 WpsRuntime 上。"""
+    return _load_class(UPDATE_RUNTIME_CLASS)
+
+
+def _call_runtime(runtime: Any, method: str, *args: Any) -> Any:
+    """调用已加载 Kotlin 对象的静态方法；只传字符串/整数，避免类型擦除歧义。"""
     try:
         function = getattr(runtime, method)
     except AttributeError as exc:
@@ -110,6 +121,16 @@ def _call(method: str, *args: Any) -> Any:
             f"Android 原生运行时调用失败（{method}）：{name}: {exc}",
             error_code="RUNTIME_CRASHED",
         ) from exc
+
+
+def _call(method: str, *args: Any) -> Any:
+    """调用 ``WpsRuntime`` 静态方法。"""
+    return _call_runtime(_runtime_class(), method, *args)
+
+
+def _call_updater(method: str, *args: Any) -> Any:
+    """调用 ``AppUpdater`` 静态方法（版本检查/校验/安装）。"""
+    return _call_runtime(_updater_class(), method, *args)
 
 
 def _decode_json(raw: Any, *, default: Any = None) -> Any:
@@ -313,7 +334,7 @@ def update_capabilities() -> dict[str, Any]:
     返回 dict；原生桥不可用时返回 ``{"ok": False, ...}``，不抛异常。
     """
     try:
-        data = _as_mapping(_call("updateCapabilitiesJson"))
+        data = _as_mapping(_call_updater("updateCapabilitiesJson"))
     except AndroidRuntimeError as exc:
         return {"ok": False, "errorCode": exc.error_code, "message": str(exc)}
     if not data:
@@ -328,7 +349,7 @@ def verify_update_apk(path: str) -> dict[str, Any]:
     if not value:
         return {"ok": False, "code": "APK_NOT_FOUND", "message": "安装包路径为空"}
     try:
-        data = _as_mapping(_call("verifyUpdateApkJson", value))
+        data = _as_mapping(_call_updater("verifyUpdateApkJson", value))
     except AndroidRuntimeError as exc:
         return {"ok": False, "code": exc.error_code, "message": str(exc)}
     if not data:
@@ -342,7 +363,7 @@ def install_apk(path: str) -> dict[str, Any]:
     if not value:
         return {"ok": False, "code": "APK_NOT_FOUND", "message": "安装包路径为空"}
     try:
-        data = _as_mapping(_call("installApkJson", value))
+        data = _as_mapping(_call_updater("installApkJson", value))
     except AndroidRuntimeError as exc:
         return {"ok": False, "code": exc.error_code, "message": str(exc)}
     if not data:
@@ -353,7 +374,7 @@ def install_apk(path: str) -> dict[str, Any]:
 def open_install_permission_settings() -> bool:
     """打开系统「安装未知应用」设置页；失败返回 False。"""
     try:
-        raw = _call("openInstallPermissionSettingsJson")
+        raw = _call_updater("openInstallPermissionSettingsJson")
     except AndroidRuntimeError:
         return False
     if isinstance(raw, bool):
