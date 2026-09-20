@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from app.wps.sync import (
-    Change, CloudOrder, SheetPlan, SyncLedger, WpsCloudError,
+    Change, CloudOrder, LedgerCorruptError, SheetPlan, SyncLedger, WpsCloudError,
     apply_plan, build_plan, find_cli, format_plan, parse_date_header,
     person_key, summarize_plan, target_date_for, weekday_number,
 )
@@ -719,7 +719,10 @@ def test_apply_plan_detects_silent_write_failure():
     plans = _plan(cli, orders)
     result = apply_plan(cli, plans, ledger=None, marker_enabled=False)
     assert result["failed"] == 1
-    assert result["sheets"][0]["status"] == "verify_failed"
+    assert result["uncertain"] is True
+    assert result["sheets"][0]["status"] == "uncertain"
+    assert result["sheets"][0]["uncertain"] is True
+    assert result["next_action"] == "manual_reconcile"
 
 
 def test_scan_bounds_respects_read_budget():
@@ -1358,11 +1361,12 @@ def test_ledger_roundtrip(tmp_path: Path):
     assert summary and summary["people"] == 1
 
 
-def test_ledger_ignores_corrupt_file(tmp_path: Path):
+def test_ledger_corrupt_file_is_rejected_not_reset(tmp_path: Path):
+    """损坏账本必须失败关闭，不能被当成“没有记录”而重复加餐。"""
     path = tmp_path / "state.json"
     path.write_text("{ not json", encoding="utf-8")
-    led = SyncLedger(path)
-    assert led.synced_meals("2026-09-11", "F1", "张", "111") is None
+    with pytest.raises(LedgerCorruptError):
+        SyncLedger(path)
 
 
 # ----------------------------------------------------------------------

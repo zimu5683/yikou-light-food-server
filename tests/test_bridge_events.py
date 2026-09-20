@@ -84,7 +84,8 @@ def test_address_input_event_and_resolve(tmp_path):
     assert event, "应发出 address_input 事件"
     request_id = event["payload"]["id"]
     assert event["payload"]["items"][0]["order_numbers"] == ["W16", "W15"]
-    assert bridge.resolve_address_input(request_id, {"教学楼-南门": "教5"}) == {"ok": True}
+    got = bridge.resolve_address_input(request_id, {"教学楼-南门": "教5"})
+    assert got["ok"] is True and got["status"] == "accepted"
     worker.join(1.0)
 
     assert not worker.is_alive()

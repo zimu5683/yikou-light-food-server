@@ -232,10 +232,12 @@ def test_empty_payload_is_a_noop_but_still_saves(tmp_path):
 @pytest.fixture
 def deleted(monkeypatch):
     calls: list[tuple[str, str]] = []
-    monkeypatch.setattr(bridge_module, "delete_password",
-                        lambda account: calls.append(("admin", account)))
-    monkeypatch.setattr(bridge_module, "delete_sss_password",
-                        lambda account: calls.append(("sss", account)))
+    monkeypatch.setattr(
+        bridge_module, "delete_password",
+        lambda account: calls.append(("admin", account)) or True)
+    monkeypatch.setattr(
+        bridge_module, "delete_sss_password",
+        lambda account: calls.append(("sss", account)) or True)
     return calls
 
 
@@ -243,7 +245,9 @@ def test_clear_order_password_targets_the_admin_credential(tmp_path, deleted):
     bridge = _bridge(tmp_path)
     bridge._config.phone_number = "13800000000"
 
-    assert bridge.clear_password("order") == {"ok": True}
+    got = bridge.clear_password("order")
+    assert got["ok"] is True and got["state"] == "deleted"
+    assert got["deleted"] is True and got["mode"] == "order"
 
     assert deleted == [("admin", "13800000000")]
 
@@ -252,7 +256,9 @@ def test_clear_sss_password_targets_the_sss_credential(tmp_path, deleted):
     bridge = _bridge(tmp_path)
     bridge._config.sss_account = "sss-user"
 
-    assert bridge.clear_password("sss") == {"ok": True}
+    got = bridge.clear_password("sss")
+    assert got["ok"] is True and got["state"] == "deleted"
+    assert got["deleted"] is True and got["mode"] == "sss"
 
     assert deleted == [("sss", "sss-user")], "必须删闪时送那一把，不能误删管理后台的"
 
@@ -273,17 +279,21 @@ def test_empty_account_never_touches_the_keychain(tmp_path, deleted):
     bridge._config.phone_number = "   "
     bridge._config.sss_account = ""
 
-    bridge.clear_password("order")
-    bridge.clear_password("sss")
+    order_got = bridge.clear_password("order")
+    sss_got = bridge.clear_password("sss")
 
     assert deleted == []
+    assert order_got["ok"] is True and order_got["state"] == "account_empty"
+    assert sss_got["ok"] is True and sss_got["state"] == "account_empty"
 
 
-def test_clear_password_always_reports_ok_and_logs_each_mode(tmp_path, deleted):
+def test_clear_password_success_logs_each_mode(tmp_path, deleted):
     bridge = _bridge(tmp_path)
+    bridge._config.phone_number = "13800000000"
+    bridge._config.sss_account = "sss-user"
 
-    assert bridge.clear_password("order") == {"ok": True}
-    assert bridge.clear_password("sss") == {"ok": True}
+    assert bridge.clear_password("order")["ok"] is True
+    assert bridge.clear_password("sss")["ok"] is True
 
     logs = [e["payload"]["msg"] for e in bridge.drain_events(0)["events"]
             if e["event"] == "log"]
@@ -298,7 +308,9 @@ def test_resolving_a_pending_decision_delivers_the_choice(tmp_path):
     bridge = _bridge(tmp_path)
     interaction_id, entry = bridge._register_interaction("decision")
 
-    assert bridge.resolve_decision(interaction_id, "retry") == {"ok": True}
+    got = bridge.resolve_decision(interaction_id, "retry")
+    assert got["ok"] is True and got["status"] == "accepted"
+    assert got["interaction_id"] == interaction_id
 
     assert entry.holder == ["retry"]
     assert entry.event.is_set(), "必须唤醒等待中的 worker"
@@ -309,7 +321,8 @@ def test_resolving_a_pending_captcha_delivers_the_code(tmp_path):
     captcha_id, entry = bridge._register_interaction("captcha")
 
     assert captcha_id.startswith("c"), "验证码的 id 前缀应为 c"
-    assert bridge.resolve_captcha(captcha_id, "1234") == {"ok": True}
+    got = bridge.resolve_captcha(captcha_id, "1234")
+    assert got["ok"] is True and got["status"] == "accepted"
 
     assert entry.holder == ["1234"]
     assert entry.event.is_set()
@@ -320,23 +333,30 @@ def test_the_same_id_can_only_be_resolved_once(tmp_path):
     bridge = _bridge(tmp_path)
     interaction_id, entry = bridge._register_interaction("decision")
 
-    assert bridge.resolve_decision(interaction_id, "retry") == {"ok": True}
-    assert bridge.resolve_decision(interaction_id, "skip") == {"ok": False}
+    first = bridge.resolve_decision(interaction_id, "retry")
+    second = bridge.resolve_decision(interaction_id, "skip")
+    assert first["ok"] is True and first["status"] == "accepted"
+    assert second["ok"] is False and second["status"] == "not_pending"
 
     assert entry.holder == ["retry"], "第二次的值不能进 holder"
 
 
 def test_unknown_id_is_reported_not_raised(tmp_path):
     bridge = _bridge(tmp_path)
-    assert bridge.resolve_decision("d999", "retry") == {"ok": False}
-    assert bridge.resolve_captcha("c999", "1234") == {"ok": False}
+    missing_decision = bridge.resolve_decision("d999", "retry")
+    missing_captcha = bridge.resolve_captcha("c999", "1234")
+    assert missing_decision["ok"] is False
+    assert missing_decision["status"] == "not_pending"
+    assert missing_captcha["ok"] is False
+    assert missing_captcha["status"] == "not_pending"
 
 
 def test_non_string_values_are_coerced(tmp_path):
     bridge = _bridge(tmp_path)
     interaction_id, entry = bridge._register_interaction("decision")
 
-    assert bridge.resolve_decision(interaction_id, 42) == {"ok": True}  # type: ignore[arg-type]
+    got = bridge.resolve_decision(interaction_id, 42)  # type: ignore[arg-type]
+    assert got["ok"] is True and got["status"] == "accepted"
 
     assert entry.holder == ["42"]
 
@@ -350,4 +370,4 @@ def test_resolving_one_id_does_not_affect_another(tmp_path):
 
     assert first.event.is_set()
     assert not second.event.is_set(), "不该顺带唤醒另一个等待者"
-    assert bridge.resolve_decision(second_id, "skip") == {"ok": True}
+    assert bridge.resolve_decision(second_id, "skip")["ok"] is True

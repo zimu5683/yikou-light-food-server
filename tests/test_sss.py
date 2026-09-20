@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 
 import pytest
 
@@ -9,6 +10,16 @@ from app.ordering import sss
 from app.ordering import reconcile as sss_reconcile
 from app.ordering import runner as sss_runner
 from app.ordering import submission as sss_submission
+
+
+@pytest.fixture(autouse=True)
+def _isolated_authoritative_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("YIKOU_DATA_DIR", str(tmp_path / "userdata"))
+    monkeypatch.setenv("YIKOU_SSS_LOCK_ROOT", str(tmp_path / "locks"))
+    monkeypatch.setenv(
+        "YIKOU_SSS_AUTHORITATIVE_PATH",
+        str(tmp_path / "authority" / "sss_uncertain_authoritative.json"),
+    )
 
 
 def test_compute_delivery_time_lunch_before_16():
@@ -601,6 +612,91 @@ def test_list_pending_orders_paginates():
                and "statusList" not in path for path in calls)
 
 
+def _page_no_from_path(path: str) -> int:
+    return int(re.search(r"[?&]pageNo=(\d+)", path).group(1))
+
+
+def test_list_pending_orders_continues_after_short_first_page():
+    """SN-C6：第一页短页但 total 显示还有后续，必须继续翻页，不能直接结束。"""
+    first = _task("first")
+    second = _task("second", name="李四", phone="13900000002", door="B2")
+    pages: list[int] = []
+
+    def fetch(path):
+        page = _page_no_from_path(path)
+        pages.append(page)
+        if page == 1:
+            # 只有 1 条，但 total=2：旧实现会在此结束并漏掉第二单。
+            return {"success": True, "result": {
+                "records": [_station_record(first)], "total": 2}}
+        return {"success": True, "result": {
+            "records": [_station_record(second)], "total": 2}}
+
+    records = sss._list_pending_orders(fetch, [first, second])
+    assert [record["receiveName"] for record in records] == ["张三", "李四"]
+    assert pages == [1, 2]
+
+
+def test_list_pending_orders_follows_explicit_next_page_hint():
+    """SN-C6：服务端用 nextPage/hasNext 明确指路时，即使短页也要跟随。"""
+    first = _task("first")
+    second = _task("second", name="李四", phone="13900000002", door="B2")
+    pages: list[int] = []
+
+    def fetch(path):
+        page = _page_no_from_path(path)
+        pages.append(page)
+        if page == 1:
+            return {"success": True, "result": {
+                "records": [_station_record(first)], "total": None, "nextPage": 3}}
+        return {"success": True, "result": {
+            "records": [_station_record(second)], "total": None, "hasNext": False}}
+
+    records = sss._list_pending_orders(fetch, [first, second])
+    assert [record["receiveName"] for record in records] == ["张三", "李四"]
+    assert pages == [1, 3]
+
+
+def test_list_pending_orders_fails_closed_when_total_not_reached():
+    """SN-C6：服务端提前结束且 total 未满足时，必须拒绝以不完整列表对账。"""
+    task = _task()
+
+    def fetch(path):
+        page = _page_no_from_path(path)
+        if page == 1:
+            return {"success": True, "result": {
+                "records": [_station_record(task)], "total": 5}}
+        return {"success": True, "result": {"records": [], "total": 5}}
+
+    with pytest.raises(LookupError, match="提前结束"):
+        sss._list_pending_orders(fetch, [])
+
+
+def test_list_pending_orders_fails_closed_when_has_next_false_conflicts_total():
+    """SN-C6：hasNext=false 与 total 矛盾时拒绝对账，不静默丢后续订单。"""
+    task = _task()
+
+    def fetch(path):
+        return {"success": True, "result": {
+            "records": [_station_record(task)], "total": 5, "hasNext": False}}
+
+    with pytest.raises(LookupError, match="hasNext=false"):
+        sss._list_pending_orders(fetch, [])
+
+
+def test_list_pending_orders_rejects_repeated_page():
+    """SN-C6：同一页重复返回会重复累加记录，必须 fail-closed 而不是继续对账。"""
+    task = _task()
+    record = _station_record(task)
+
+    def fetch(path):
+        return {"success": True, "result": {
+            "records": [dict(record)], "total": 5}}
+
+    with pytest.raises(LookupError, match="重复页"):
+        sss._list_pending_orders(fetch, [])
+
+
 def test_build_list_prefilter_uses_epoch_ms_window_with_margin():
     task = _task(delivery="2026-09-11 11:00:00")
     prefilter = sss._build_list_prefilter([task])
@@ -896,7 +992,9 @@ def _full_station_record(task, **overrides):
     payload = task["payload"]
     address = payload["receiveAddress"]
     record = {
-        "id": 1,
+        # 每条任务生成唯一 id，模拟真实站内一单一号；
+        # 分页重复必须由相同的 id 体现，不能靠测试默认值伪造。
+        "id": str(task.get("identifier") or "1"),
         "orderSn": "SN-1",
         "receiveName": payload["receiveName"],
         "receivePhone": payload["receivePhone"],
@@ -949,6 +1047,66 @@ def test_reconcile_matches_summary_schema_record():
     assert result.confirmed == {"full"}
     assert result.missing == []
     assert result.duplicate_count == 0
+
+
+def test_collect_tasks_keeps_duplicate_person_rows_as_multiple_orders():
+    """一人多行=多单：同人同门牌同时间两行也必须生成两个任务，
+    指纹相同但 identifier/client_request_id 必须可区分，供 multiplicity 对账。"""
+    orders = {"午餐": [
+        {"row": 3, "name": "张三", "door": "b2", "phone": "13800000001"},
+        {"row": 4, "name": "张三", "door": "b2", "phone": "13800000001"},
+    ]}
+    address = {"lnt": 1.0, "lat": 2.0, "areaCode": "330110", "addressDetail": "X"}
+    tasks = sss._collect_tasks(orders, 99, address, "轻食", account="acct")
+    assert len(tasks) == 2
+    assert tasks[0]["fingerprint"] == tasks[1]["fingerprint"]
+    assert tasks[0]["identifier"] != tasks[1]["identifier"]
+    assert tasks[0]["client_request_id"] != tasks[1]["client_request_id"]
+
+
+def _station_records(records):
+    def fetch(path):
+        return {"success": True, "result": {"records": records, "total": len(records)}}
+    return fetch
+
+
+def test_reconcile_counts_multiple_identical_orders_not_dedupe():
+    """两条合法同指纹订单必须按 Counter multiplicity 与站点记录一一匹配：
+    0 条 → 2 缺失；1 条 → 1 确认 1 缺失（不是重复）；2 条不同 id → 2 确认；
+    3 条不同 id → 2 确认 + 1 条真正重复。
+
+    站内记录分页重叠导致的同 id 重复由 ``_station_record_identity`` 去重，
+    不会被误当成一人的第二单。"""
+    first = _full_task("first")
+    second = _full_task("second")
+    assert first["fingerprint"] == second["fingerprint"]
+    record = _full_station_record(first)
+    record_one = {**record, "id": 1}
+    record_two = {**record, "id": 2}
+
+    none = sss._reconcile_tasks([first, second], _station_records([]))
+    assert none.confirmed == set() and len(none.missing) == 2
+    assert none.duplicate_count == 0
+
+    one = sss._reconcile_tasks([first, second], _station_records([dict(record_one)]))
+    assert len(one.confirmed) == 1 and len(one.missing) == 1
+    assert one.duplicate_count == 0
+
+    two = sss._reconcile_tasks([first, second], _station_records([dict(record_one), dict(record_two)]))
+    assert two.confirmed == {"first", "second"}
+    assert two.missing == [] and two.duplicate_count == 0
+
+    three = sss._reconcile_tasks(
+        [first, second], _station_records([{**record, "id": index} for index in (1, 2, 3)]))
+    assert three.confirmed == {"first", "second"}
+    assert three.duplicate_count == 1
+
+    # 分页重叠：同一条站内记录出现两次，只能算一单，绝不能补齐第二单。
+    pagination_dup = sss._reconcile_tasks(
+        [first, second], _station_records([dict(record_one), dict(record_one)]))
+    assert len(pagination_dup.confirmed) == 1
+    assert len(pagination_dup.missing) == 1
+    assert pagination_dup.duplicate_count == 0
 
 
 def test_reconcile_matches_summary_address_with_prefix_variation():

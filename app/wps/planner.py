@@ -48,7 +48,8 @@ from app.wps.common import (
 )
 from app.wps.errors import WpsCloudError
 from app.wps.ledger import SyncLedger
-from app.wps.models import Change, CloudOrder, InsertBlock, SheetPlan
+from app.wps.models import (LEDGER_SNAPSHOT_ABSENT, Change, CloudOrder,
+                           InsertBlock, SheetPlan)
 
 def formula_cells_for_new_rows(plan: SheetPlan, rows: Sequence[int]) -> list[dict[str, Any]]:
     """为新增行生成已出餐/剩余餐公式，日期列按表头动态识别。"""
@@ -183,6 +184,10 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
                      drive_id=conf.get("drive_id", ""),
                      target_date=target,
                      weekday_number=weekday_number(run_date or target))
+    plan.ledger_digest = None
+    if ledger is not None and getattr(ledger, "path", None):
+        plan.ledger_digest = (getattr(ledger, "_loaded_digest", None)
+                              or LEDGER_SNAPSHOT_ABSENT)
     # 批次日期核对放在**任何云端调用之前**：被拒绝的子表一个请求都不发（省额度）。
     block_reason, batch_warning = _batch_date_check(orders, target)
     if batch_warning:
@@ -295,6 +300,14 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
     if addr_col:
         for row in data_rows:
             address_of[row] = str(grid.get((row - 1, addr_col - 1), "") or "").strip()
+    # 恢复核对基线：只记“这一批云端有哪些人、在第几行”，用于证明“完全没执行”。
+    phone_col = plan.columns.get("phone") or 0
+    plan.baseline_name_rows = tuple(
+        (row,
+         str(grid.get((row - 1, plan.columns["name"] - 1), "") or "").strip(),
+         person_key("", grid.get((row - 1, phone_col - 1), "") if phone_col else "")[1])
+        for row in data_rows
+    )
 
     # 通讯记号列：优先认协作者正在用的 1~7 数字格，找不到用备注+3 兜底。
     if plan.columns.get("remark"):
@@ -395,7 +408,8 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
                                 meal_type=order.meal_type, meal_kind=order.meal_kind,
                                 local_meals=order.meals, ledger_prev=prev,
                                 target_occupied=occupied, local_rows=local_rows,
-                                slot=slot)
+                                slot=slot, pre_row=row,
+                                cloud_before_rows=tuple(cloud_rows))
                 # 半成品行自愈：上次中断可能留下缺「类型/餐种/公式」的行，本次补齐。
                 change.fill_type = bool(
                     type_col and order.meal_type
@@ -514,7 +528,9 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
     # 预测行号按 (人, 槽位) 记：一个人多行时第 i 行 = 他的第 i 个槽位。
     final_rows_by_key: dict[tuple[str, str], dict[int, int]] = {}
     for change in existing_changes:
-        change.row = final_row_of.get(pre_insert_row(change.row), change.row)
+        old_pre_row = change.pre_row or change.row
+        change.pre_row = pre_insert_row(old_pre_row)
+        change.row = final_row_of.get(change.pre_row, change.row)
         final_rows_by_key.setdefault(
             person_key(change.name, change.phone), {})[change.slot] = change.row
 
@@ -539,7 +555,7 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
                         local_meals=order.meals,
                         ledger_prev=None,
                         local_rows=tuple(order.rows) or ((order.row,) if order.row else ()),
-                        slot=slot)
+                        slot=slot, pre_row=pre_row)
         plan.changes.append(change)
         final_rows_by_key.setdefault(key, {})[slot] = row
     plan.final_rows = {key: tuple(rows[i] for i in sorted(rows))

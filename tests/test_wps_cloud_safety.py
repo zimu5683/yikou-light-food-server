@@ -17,7 +17,7 @@ import json
 
 import pytest
 
-from app.wps.sync import (CloudOrder, SheetPlan, SyncLedger, WpsCloudError,
+from app.wps.sync import (CloudOrder, SheetPlan, WpsCloudError,
                            _rollback_inserts, apply_plan, build_plan)
 
 BASE_HEADER = {0: "名字", 1: "地址", 2: "电话", 3: "9.10 周四",
@@ -284,10 +284,13 @@ def test_failure_after_successful_sort_does_not_roll_back():
     assert cli.sorts, "排序本身应当成功"
     assert cli.deleted_rows == [], "排序成功之后绝不能再删行"
     assert result["failed"] == 1
-    assert result["sheets"][0]["status"] == "failed"
+    assert result["uncertain"] is True
+    assert result["sheets"][0]["status"] == "uncertain"
+    assert result["sheets"][0]["next_action"] == "manual_reconcile"
     assert "回读失败" in result["sheets"][0]["reason"]
-    # 面向用户的提示必须告诉他「重传一次即可」，而不是让他以为云端坏了
-    assert any("重新上传" in m and "重复执行安全" in m for m in messages), messages
+    # 新协议：结果不确定时先人工核对，不能直接建议重传
+    assert any("不要直接重复提交" in m or "人工核对" in m for m in messages), messages
+    assert not any("重复执行安全" in m for m in messages), messages
     # 新行的信息仍留在云端（等用户重传），没有被抹掉
     names = [v for (r, c), v in cli.grid.items() if c == 0 and r >= 2]
     assert "新人" in names
@@ -348,7 +351,9 @@ def test_ledger_is_not_updated_when_verification_fails(tmp_path):
     result = apply_plan(cli, plans, ledger=ledger, marker_enabled=False)
 
     assert result["failed"] == 1
-    assert result["sheets"][0]["status"] == "verify_failed"
+    assert result["uncertain"] is True
+    assert result["sheets"][0]["status"] == "uncertain"
+    assert result["sheets"][0]["next_action"] == "manual_reconcile"
     assert _batch_people(ledger, dt.date(2026, 9, 11)) is None, "校验没过不能记进账本"
 
 
@@ -413,44 +418,20 @@ def test_unexpected_exception_propagates_out_of_apply_plan(tmp_path):
         apply_plan(cli, plans, ledger=None, marker_enabled=False)
 
 
-def test_wps_upload_swallows_every_exception(tmp_path, monkeypatch):
-    """README「任何失败都只写日志，不会影响本地排单任务」的**落点在这一层**。
+def test_wps_upload_without_preview_rejects_before_any_cloud_write(tmp_path):
+    """旧无参 ``wps_upload`` 已安全拒绝，且不应触碰云端/账本/日志异常路径。
 
-    ``wps_upload`` 末尾有 ``except Exception``，把任何异常转成
-    ``{"ok": False, "reason": "类型: 消息"}``，界面只会看到一条红色日志，
-    排单任务不会被云同步的意外错误带崩。
+    异常兜底现在由 A 会话的预览令牌上传链路与新测试覆盖；本文件保留最小
+    回归，确保旧调用方得到确定拒绝而不是半执行。
     """
-    from app.api import bridge as bridge_module
     from app.api.bridge import Bridge
 
     bridge = Bridge(config_path=str(tmp_path / "config.json"))
     bridge._config.excel_path = tmp_path / "排单.xlsx"
     bridge._config.excel_path.write_bytes(b"x")
-    monkeypatch.setattr(bridge_module, "effective_tables",
-                        lambda _cfg: {"东湖中餐": {"file_id": "F1"}})
-    monkeypatch.setattr(
-        bridge_module, "read_local_orders",
-        lambda path, log=None: {"东湖中餐": [
-            CloudOrder("东湖中餐", "某人", "小", "13800000000", "中餐", "经济", 6)]})
-    monkeypatch.setattr(bridge_module, "SyncLedger",
-                        lambda *a, **k: SyncLedger(tmp_path / "l.json"))
-
-    class _Cli:
-        path = "/fake/kdocs-cli"
-
-        def authenticated(self) -> bool:
-            return True
-
-    monkeypatch.setattr(bridge, "_wps_cli", lambda: _Cli())
-
-    def boom(*_a, **_k):
-        raise KeyError("坏数据")
-
-    monkeypatch.setattr(bridge_module, "build_plan", boom)
 
     got = bridge.wps_upload()          # 不应抛
 
     assert got["ok"] is False
-    assert got["reason"] == "KeyError: '坏数据'"
-    logs = [e["payload"] for e in bridge.drain_events(0)["events"] if e["event"] == "log"]
-    assert any(line["level"] == "ERROR" and "异常" in line["msg"] for line in logs)
+    assert got["code"] == "missing_preview"
+    assert "preview" in got["reason"]

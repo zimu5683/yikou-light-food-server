@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import datetime as _dt
+import os
 import re
+import stat
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -184,16 +187,96 @@ def _load_order_workbook(excel_path: Path, loader: Callable[..., Any] | None = N
         loader = load_workbook
     return loader(excel_path, keep_vba=excel_path.suffix.lower() == ".xlsm")
 
+class OrderSaveError(RuntimeError):
+    """订单 Excel 安全保存失败：原文件未被修改，禁止继续当成功处理。"""
+
+
+def _atomic_save_workbook(workbook: Any, excel_path: Path) -> None:
+    """原子保存：先写同目录临时文件，校验非空且可读，再 ``os.replace``。
+
+    任何写盘/校验/替换失败都不会替换原文件。临时文件创建、空输出、损坏输出、
+    目录不可写、replace 失败都会包装成 ``OrderSaveError``（目标被占用除外，
+    保留 ``PermissionError`` 供用户选择重试/取消）。
+    """
+    target = Path(excel_path)
+    temp_path: Path | None = None
+    try:
+        try:
+            handle, temp_name = tempfile.mkstemp(
+                prefix=f".{target.stem}.",
+                suffix=target.suffix or ".xlsx",
+                dir=str(target.parent),
+            )
+        except PermissionError as exc:
+            raise OrderSaveError(
+                f"目录不可写，无法创建临时保存文件：{target.parent}（{exc}）。"
+                "原文件未被修改；请关闭 Excel/WPS 占用或检查目录权限后重试") from exc
+        except OSError as exc:
+            raise OrderSaveError(
+                f"创建临时保存文件失败：{target.parent}（{exc}）。"
+                "原文件未被修改；请检查目录权限/磁盘空间后重试") from exc
+        os.close(handle)
+        temp_path = Path(temp_name)
+
+        try:
+            workbook.save(str(temp_path))
+        except PermissionError:
+            # 目标/临时文件可能被占用：保留 PermissionError 给上层重试/取消。
+            raise
+        except Exception as exc:
+            raise OrderSaveError(
+                f"写临时 Excel 失败：{exc}；原文件未被修改，请检查磁盘空间/权限后重试") from exc
+
+        try:
+            size = temp_path.stat().st_size
+        except OSError as exc:
+            raise OrderSaveError(
+                f"无法确认临时 Excel 输出：{exc}；原文件未被修改") from exc
+        if size <= 0:
+            raise OrderSaveError(
+                f"Excel 保存输出为空文件，已拒绝替换原文件：{target}；"
+                "原文件未被修改，请检查 Excel/WPS 是否返回了空写入")
+
+        try:
+            probe = _load_order_workbook(temp_path)
+            probe.close()
+        except Exception as exc:
+            raise OrderSaveError(
+                f"临时 Excel 无法读取/已损坏，已拒绝替换原文件：{target}（{exc}）；"
+                "原文件未被修改") from exc
+
+        try:
+            # os.replace 会保留临时文件权限；尽量沿用原文件权限，避免保存后
+            # 文件从 0644 变成 mkstemp 的 0600。
+            os.chmod(temp_path, stat.S_IMODE(target.stat().st_mode))
+        except OSError:
+            pass
+
+        try:
+            os.replace(temp_path, target)
+        except PermissionError:
+            raise
+        except OSError as exc:
+            raise OrderSaveError(
+                f"替换原 Excel 失败：{exc}；原文件未被修改（临时文件已清理），"
+                "请检查目录权限后重试") from exc
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
 def _save_workbook_with_retry(workbook: Any, excel_path: Path,
                               decision_callback: Callable[[str], str] | None = None) -> None:
-    """Save an Excel workbook, allowing the user to close a locked file and retry."""
+    """原子保存工作簿；目标被占用时可重试/取消，取消不修改原文件。"""
     while True:
         try:
-            workbook.save(str(excel_path))
+            _atomic_save_workbook(workbook, Path(excel_path))
             return
         except PermissionError as exc:
             if decision_callback is None:
                 raise
             decision = decision_callback(str(exc)).strip().lower()
             if decision not in {"retry", "重试", "再次保存"}:
-                raise PermissionError(f"已取消保存 Excel 文件：{excel_path}") from exc
+                raise PermissionError(
+                    f"已取消保存 Excel 文件：{excel_path}；原文件未被修改，"
+                    "请关闭占用后重新运行") from exc

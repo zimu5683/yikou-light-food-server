@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from app.core.models import MealInfo, OrderInfo
 from app.core.config import AppConfig
 
@@ -24,21 +26,34 @@ def test_order_info_to_dict_serialises_nested_meals():
     assert payload["lunch"][0]["meal_type"] == "午餐"
 
 
-def test_save_workbook_retries_after_locked_file():
+def test_save_workbook_retries_after_locked_file(tmp_path):
+    """R6-6：使用 tmp_path，禁止把 locked.xlsx 写进测试进程 CWD。"""
+    from openpyxl import Workbook, load_workbook
     from app.order.runner import _save_workbook_with_retry
 
-    class LockedWorkbook:
-        def __init__(self):
-            self.calls = 0
+    target = tmp_path / "排单.xlsx"
+    workbook = Workbook()
+    workbook.active["A1"] = "原内容"
+    workbook.save(target)
+    loaded = load_workbook(target)
+    real_save = loaded.save
+    calls: list[str] = []
 
-        def save(self, path):
-            self.calls += 1
-            if self.calls == 1:
-                raise PermissionError("file is locked")
+    def flaky_save(path):
+        calls.append(str(path))
+        if len(calls) == 1:
+            raise PermissionError("file is locked")
+        real_save(path)
 
-    workbook = LockedWorkbook()
-    _save_workbook_with_retry(workbook, "locked.xlsx", lambda error: "retry")
-    assert workbook.calls == 2
+    loaded.save = flaky_save  # type: ignore[method-assign]
+    _save_workbook_with_retry(loaded, target, lambda error: "retry")
+    loaded.close()
+
+    assert len(calls) == 2
+    assert Path(calls[0]) != target
+    reloaded = load_workbook(target)
+    assert reloaded.active["A1"].value == "原内容"
+    reloaded.close()
 
 
 def test_order_log_contains_order_details():

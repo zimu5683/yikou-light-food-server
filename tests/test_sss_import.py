@@ -14,6 +14,16 @@ from app.wps.sync import WpsCloudError
 from app.ordering import cloud_import as si, sss
 from app.ordering import runner as sss_runner
 
+
+@pytest.fixture(autouse=True)
+def _isolated_authoritative_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("YIKOU_DATA_DIR", str(tmp_path / "userdata"))
+    monkeypatch.setenv("YIKOU_SSS_LOCK_ROOT", str(tmp_path / "locks"))
+    monkeypatch.setenv(
+        "YIKOU_SSS_AUTHORITATIVE_PATH",
+        str(tmp_path / "authority" / "sss_uncertain_authoritative.json"),
+    )
+
 LUNCH_FILE = "F_LUNCH"
 DINNER_FILE = "F_DINNER"
 # 目标日期用固定值，避免测试依赖真实时钟。
@@ -217,15 +227,23 @@ def test_read_cloud_meal_refuses_on_broken_header():
                            table="东湖中餐", meal="午餐", target=TARGET)
 
 
-def test_read_cloud_meal_dedupes_same_person():
+def test_read_cloud_meal_keeps_same_person_multiple_rows():
+    """WPS-C11：一人多行各标 1 = 多单；两行的行号/槽位必须都保留。
+
+    云端 read_grid 是按 (row, col) 返回的二维网格，没有分页重复；每行都是
+    独立槽位。用户 2026-09-18 已明确一人多行对应多单，禁止按 name+phone 去重。
+    """
     grid = build_sheet([
         ("张三", "b2", "13800000001", "1"),
         ("张三", "b2", "13800000001", "1"),
     ])
     meal = si.read_cloud_meal(FakeCli({LUNCH_FILE: grid}), file_id=LUNCH_FILE,
                               table="东湖中餐", meal="午餐", target=TARGET)
-    assert meal.order_count == 1
-    assert meal.warnings and "重复" in meal.warnings[0]
+    assert meal.marked_total == 2
+    assert meal.order_count == 2
+    assert meal.warnings == []
+    assert [order["row"] for order in meal.orders] == [3, 4]
+    assert [order["door"] for order in meal.orders] == ["b2", "b2"]
 
 
 def test_collect_day_orders_skips_unconfigured_table():
@@ -323,6 +341,29 @@ def test_prepare_refuses_mismatch_before_writing(tmp_path):
     assert cli.calls == []          # 闸门在读取云端之前
 
 
+@pytest.mark.parametrize("moment,target,delivery,consistent", [
+    # 16:00~19:59：送达时间已顺延次日，但识别日期仍是运行日；日期闸门应拒绝。
+    (dt.datetime(2026, 9, 15, 16, 0, 0), dt.date(2026, 9, 15), dt.date(2026, 9, 16), False),
+    (dt.datetime(2026, 9, 15, 19, 59, 59), dt.date(2026, 9, 15), dt.date(2026, 9, 16), False),
+    # 20:00 起直到午夜：识别日期和送达日期一起顺延。
+    (dt.datetime(2026, 9, 15, 20, 0, 0), dt.date(2026, 9, 16), dt.date(2026, 9, 16), True),
+    (dt.datetime(2026, 9, 15, 23, 59, 59), dt.date(2026, 9, 16), dt.date(2026, 9, 16), True),
+    # 午夜与清晨：识别日期和送达日期都回到运行日。
+    (dt.datetime(2026, 9, 16, 0, 0, 0), dt.date(2026, 9, 16), dt.date(2026, 9, 16), True),
+    (dt.datetime(2026, 9, 16, 9, 59, 59), dt.date(2026, 9, 16), dt.date(2026, 9, 16), True),
+])
+def test_ordering_target_and_delivery_dates_at_20_and_midnight(moment, target, delivery, consistent):
+    """20 点与午夜边界的日期口径必须稳定；16~20 点不一致时闸门拒绝是既定规则。"""
+    from app.ordering.cloud_import import ordering_target_date
+    assert ordering_target_date(moment) == target
+    assert dt.date.fromisoformat(sss.compute_delivery_time(False, moment)[:10]) == delivery
+    if consistent:
+        si.check_target_day(target, delivery)
+    else:
+        with pytest.raises(si.ImportRefused, match="日期不匹配"):
+            si.check_target_day(target, delivery)
+
+
 def test_prepare_target_date_windows():
     cli = FakeCli({LUNCH_FILE: build_sheet([("张三", "b2", "13800000001", "1")]),
                    DINNER_FILE: build_sheet([("王五", "C3", "13800000003", "1")])})
@@ -383,6 +424,26 @@ def test_prepare_archives_orders_and_date(tmp_path):
     assert content["晚餐"]["e1"] == HEADER_DATE
 
 
+def test_prepare_archives_same_person_multiple_rows(tmp_path):
+    """一人两行=两单：留档也必须写两行，不能只留一行。"""
+    path = tmp_path / "闪时送.xlsx"
+    write_sss_excel(path)
+    grid = build_sheet([
+        ("张三", "b2", "13800000001", "1"),
+        ("张三", "C3", "13800000001", "1"),
+    ])
+    cli = FakeCli({LUNCH_FILE: grid,
+                   DINNER_FILE: build_sheet([("王五", "C3", "13800000005", "1")])})
+    day = si.prepare_day_orders(make_config(tmp_path), now=dt.datetime(2026, 9, 16, 9, 0),
+                                cli=cli)
+    assert len(day.orders_by_sheet["午餐"]) == 2
+    assert [order["door"] for order in day.orders_by_sheet["午餐"]] == ["b2", "C3"]
+    content = read_excel(path)
+    assert content["午餐"]["rows"][:2] == [["张三", "b2", "13800000001"],
+                                           ["张三", "C3", "13800000001"]]
+    assert content["午餐"]["rows"][2] == [None, None, None]
+
+
 def test_prepare_clears_skipped_meal_and_e1(tmp_path):
     path = tmp_path / "闪时送.xlsx"
     write_sss_excel(path, dinner_rows=(("旧晚餐", "b1", "13900000003"),))
@@ -405,6 +466,28 @@ def test_archive_failure_is_warning_only(tmp_path):
                                 now=dt.datetime(2026, 9, 16, 9, 0), cli=cli)
     assert day.archive_error
     assert day.orders_by_sheet["午餐"][0]["name"] == "张三"      # 名单仍然可用
+
+
+def test_archive_replace_failure_keeps_original_and_cleans_temp(tmp_path, monkeypatch):
+    """留档 os.replace 失败（Excel 占用等）时原文件保持字节不变，临时文件清理。"""
+    import app.ordering.archive as archive_mod
+    from app.ordering.import_models import MealImport
+
+    path = tmp_path / "闪时送.xlsx"
+    write_sss_excel(path)
+    before = path.read_bytes()
+
+    def locked_replace(src, dst):
+        raise PermissionError("file is locked")
+
+    monkeypatch.setattr(archive_mod.os, "replace", locked_replace)
+    meal = MealImport(meal="午餐", table="东湖中餐", target=TARGET, date_text=HEADER_DATE,
+                      orders=[{"row": 3, "name": "张三", "door": "b2",
+                               "phone": "13800000001"}])
+    with pytest.raises(PermissionError, match="无法写入"):
+        archive_mod.archive_to_excel(path, [meal])
+    assert path.read_bytes() == before
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".闪时送.")] == []
 
 
 def test_prepare_without_excel_only_logs(tmp_path):

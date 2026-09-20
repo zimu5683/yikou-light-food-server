@@ -6,6 +6,10 @@ import datetime as _dt
 from dataclasses import dataclass, field
 
 
+#: 计划构建时账本文件尚不存在；执行锁内若文件出现/摘要变化即为 stale。
+LEDGER_SNAPSHOT_ABSENT = "__wps_ledger_absent__"
+
+
 @dataclass
 class CloudOrder:
     """本地排单表里的**一行**订单。
@@ -71,6 +75,12 @@ class Change:
     # 同一个人一天下了两单（或一单两份）时会有 slot=2 的变更，两行都标当天 1，
     # 这样「闪时送下单」按"日期格 == 1"出两单、这天真的送两餐。
     slot: int = 1
+    # 排序前这一槽位所在的物理行号；排序后用它写排序身份标记，
+    # 避免"同人两行地址不同"时按行号升序把 slot 映射错（WPS-C8）。
+    pre_row: int = 0
+    # build_plan 看到的这个人排序前已有的云端行号（1-based，升序）；
+    # 新增槽位为空元组。恢复核对用它判断"原值槽位"和"本次新建槽位"。
+    cloud_before_rows: tuple[int, ...] = ()
 
     @property
     def target_blocked(self) -> bool:
@@ -151,6 +161,12 @@ class SheetPlan:
     # 本批（目标日期 + 文件）已同步过的摘要，形如「29 人（2026-09-17T21:27:06）」；
     # 空 = 本批还没同步过（首次上传）
     previous_batch: str = ""
+    # build_plan 读到的人员行基线（排序/插入前）：[(1-based 行, 姓名, 规范化电话), ...]，
+    # 只用于恢复时证明"整张表完全没动过"，不参与业务写入。
+    baseline_name_rows: tuple[tuple[int, str, str], ...] = ()
+    # build_plan 构建该计划时所用 ledger 的磁盘快照摘要（_loaded_digest）。
+    # apply_plan 在锁内必须拿它与最新磁盘账本比较，不能用执行时新加载的 ledger 冒充。
+    ledger_digest: str | None = None
 
     @property
     def applied(self) -> bool:

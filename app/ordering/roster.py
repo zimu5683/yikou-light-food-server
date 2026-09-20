@@ -180,7 +180,11 @@ def read_cloud_meal(cli: Any, *, file_id: str, table: str, meal: str,
     target_col, date_text = found[0] + 1, str(found[1]).strip()
     result.date_text = date_text
 
-    seen: set[tuple[str, str]] = set()
+    # 云端 read_grid 是按 (row, col) 返回的二维网格，不存在“同一行被分页返回两次”
+    # 的重复；每一行都是独立槽位。用户 2026-09-18 已明确：同一人可以在多行
+    # 各标 1，对应多个订单（例如两个不同取餐点/两份餐）。因此这里绝不能按
+    # name+phone 去重，否则会丢掉合法订单；分页重复只可能在 HTTP 订单列表侧，
+    # 由 fetching/fingerprint 用订单 id 与 Counter multiplicity 分别处理。
     for row0 in range(FIRST_DATA_ROW - 1, row_to + 1):
         if _clean_text(grid.get((row0, target_col - 1), "")) != CELL_MARK:
             continue
@@ -191,12 +195,6 @@ def read_cloud_meal(cli: Any, *, file_id: str, table: str, meal: str,
         if should_skip_address(door):
             result.skipped_address += 1
             continue
-        key = (name, phone)
-        if key in seen:
-            result.warnings.append(
-                f"{table} 第 {row0 + 1} 行：{name or '（无姓名）'} 重复标 1，已去重")
-            continue
-        seen.add(key)
         result.orders.append({
             "row": row0 + 1,          # 云端行号，便于日志与报错定位
             "name": name,

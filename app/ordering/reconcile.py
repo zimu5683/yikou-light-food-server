@@ -29,7 +29,7 @@ from app.ordering.fingerprint import (
     _task_fingerprint,
 )
 from app.ordering.models import OrderFingerprint, _Reconciliation
-from app.ordering.records import _pick
+from app.ordering.records import _pick, _pick_scalar
 def _list_records(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int | None]:
     """兼容闪时送列表响应的 ``result``/``data`` 两层分页结构。"""
     for container in (payload.get("result"), payload.get("data"), payload):
@@ -55,6 +55,48 @@ def _list_records(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int | 
                 "订单列表响应缺少 records/list（服务端可能不支持本次查询参数"
                 "或结构已变化），为避免重复下单已停止")
     raise LookupError("订单列表响应缺少 records/list")
+
+
+def _list_page_control(payload: dict[str, Any]) -> tuple[int | None, str | None, bool | None]:
+    """从列表响应提取翻页控制字段：nextPage / nextToken / hasNext。
+
+    不同服务端形态可能返回数字下一页、不透明 token 或显式 hasNext。
+    能识别时优先遵循服务端信号；识别不到则返回全 None，由调用方按“
+    短页也必须继续到空页/total 满足”处理，绝不把短页当结束。
+    """
+    for container in (payload.get("result"), payload.get("data"), payload):
+        if not isinstance(container, dict):
+            continue
+        next_page: int | None = None
+        for key in ("nextPage", "nextPageNo", "nextPageNum"):
+            value = container.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                candidate = int(value)
+            except (TypeError, ValueError):
+                continue
+            if candidate > 0:
+                next_page = candidate
+                break
+        next_token: str | None = None
+        for key in ("nextPageToken", "nextToken", "pageToken", "next_page_token"):
+            value = container.get(key)
+            if value not in (None, ""):
+                next_token = str(value)
+                break
+        has_next: bool | None = None
+        for key in ("hasNext", "has_next", "hasMore", "has_more"):
+            value = container.get(key)
+            if isinstance(value, bool):
+                has_next = value
+                break
+            if isinstance(value, (int, float)) and value in (0, 1):
+                has_next = bool(value)
+                break
+        if next_page is not None or next_token is not None or has_next is not None:
+            return next_page, next_token, has_next
+    return None, None, None
 
 
 def _build_list_prefilter(tasks: list[dict[str, Any]],
@@ -111,18 +153,27 @@ def _list_pending_orders(fetch_json: Callable[[str], dict[str, Any]],
     wanted_days = {_task_fingerprint(task).expected_delivery_time[:10] for task in tasks}
     records: list[dict[str, Any]] = []
     page_no = 1
+    page_token = ""
     page_size = _LIST_PAGE_SIZE
+    max_pages = 100
     sweep_started = time.perf_counter()
     page_count = 0
+    raw_seen = 0
+    seen_page_signatures: set[str] = set()
+    seen_tokens: set[str] = set()
     prefilter_active = bool(prefilter)
-    while page_no <= 100:
-        query = urlencode({
-            "pageNo": page_no,
+    while page_count < max_pages:
+        params = {
             "pageSize": page_size,
             "sortType": 1,
             "sort": 1,
             **(prefilter or {}),
-        })
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        else:
+            params["pageNo"] = page_no
+        query = urlencode(params)
         page_started = time.perf_counter()
         payload = fetch_json(f"{_ORDER_LIST_PATH}?{query}")
         page_seconds = time.perf_counter() - page_started
@@ -137,16 +188,56 @@ def _list_pending_orders(fetch_json: Callable[[str], dict[str, Any]],
             _trace(f"list page {page_no} 结构异常，查询串={query} "
                    f"原始报文={json.dumps(payload, ensure_ascii=False)[:400]}")
             raise
-        _trace(f"list page {page_no}: {page_seconds:.2f}s 返回 {len(page_records)} 条 total={total}")
+        next_page, next_token, has_next = _list_page_control(payload)
+        raw_seen += len(page_records)
+        page_signature = json.dumps(page_records, ensure_ascii=False, sort_keys=True)
+        _trace(f"list page {page_no}{' token' if page_token else ''}: "
+               f"{page_seconds:.2f}s 返回 {len(page_records)} 条 total={total} "
+               f"nextPage={next_page} hasNext={has_next} rawSeen={raw_seen}")
+        # 分页重叠/服务端不前进时，重复页不能继续累加，否则对账会把同一条
+        # 记录当多单；也不能静默跳过，必须 fail-closed。
+        if page_signature in seen_page_signatures:
+            raise LookupError(
+                f"订单列表分页返回重复页（pageNo={page_no}），"
+                "已停止对账以避免漏单或重复计算")
+        seen_page_signatures.add(page_signature)
         if not page_records:
+            if total is not None and raw_seen < total:
+                raise LookupError(
+                    f"订单列表分页提前结束：只读到 {raw_seen}/{total} 条，"
+                    "拒绝以不完整列表做对账")
             break
         for record in page_records:
             if _record_active_for_days(record, wanted_days):
                 records.append(record)
-        if len(page_records) < page_size:
+        # 显式结束信号与 total 矛盾时 fail-closed，不能以“服务端说没了”为由
+        # 丢掉可能仍存在的订单。
+        if has_next is False:
+            if total is not None and raw_seen < total:
+                raise LookupError(
+                    f"订单列表 hasNext=false 但只读到 {raw_seen}/{total} 条，"
+                    "拒绝以不完整列表做对账")
             break
-        if total is not None and page_no * page_size >= total:
+        if next_token is not None:
+            if next_token in seen_tokens:
+                raise LookupError("订单列表分页 token 未前进，拒绝继续对账")
+            seen_tokens.add(next_token)
+            page_token = next_token
+            page_no += 1
+            continue
+        if next_page is not None:
+            if next_page <= page_no:
+                raise LookupError("订单列表 nextPage 未前进，拒绝继续对账")
+            page_no = next_page
+            page_token = ""
+            continue
+        if has_next is True:
+            page_no += 1
+            continue
+        if total is not None and raw_seen >= total:
             break
+        # 没有 total/next/hasNext 时，短页也继续到下一页；真正的结束信号是
+        # 空页、total 已满足、hasNext=false、nextPage/nextToken 指示或达到上限。
         page_no += 1
     else:
         raise LookupError("订单列表分页超过 100 页，拒绝继续下单")
@@ -195,6 +286,33 @@ def _record_created_timestamp(record: dict[str, Any]) -> float | None:
     return parsed.timestamp()
 
 
+# 仅使用数据模型上唯一、稳定的订单号/主键做分页去重；像 pickUpNumber
+# 这类可能被合法多单复用的字段不参与，避免把“一人多单”误合并。
+_STATION_ID_KEYS = (
+    "id", "orderId", "order_id",
+    "orderSn", "orderNO", "orderNo", "order_no", "orderNumber",
+)
+
+
+def _station_record_identity(record: dict[str, Any]) -> tuple[str, str] | None:
+    """站内记录的稳定身份，用于去掉分页重叠造成的同一条记录。
+
+    同一人的两条合法订单通常有不同的 ``id``/``orderSn``；如果记录连一个稳定
+    标识都没有，则返回 ``None`` 不做去重，宁可像以前一样按多条计数并触发
+    重复保护，也不能把合法多单误合并。
+    """
+    for key in _STATION_ID_KEYS:
+        value = _pick_scalar(record, (key,))
+        if value in (None, ""):
+            continue
+        # 0/“0” 常被接口当作缺失哨兵值；这种值不参与去重，避免把不同订单
+        # 合并成同一个身份导致漏确认。
+        if str(value).strip() == "0":
+            continue
+        return key, str(value)
+    return None
+
+
 def _reconcile_tasks(tasks: list[dict[str, Any]],
                      fetch_json: Callable[[str], dict[str, Any]],
                      *, created_after: float | None = None,
@@ -225,7 +343,13 @@ def _reconcile_tasks(tasks: list[dict[str, Any]],
     fallback_account = next(iter(expected_accounts)) if len(expected_accounts) == 1 else ""
 
     actual = Counter()
+    seen_station_records: set[tuple[str, str]] = set()
     for record in _list_pending_orders(fetch_json, tasks, prefilter=prefilter):
+        identity = _station_record_identity(record)
+        if identity is not None:
+            if identity in seen_station_records:
+                continue
+            seen_station_records.add(identity)
         created_at = _record_created_timestamp(record)
         if created_at is not None:
             if created_after is not None and created_at < created_after:

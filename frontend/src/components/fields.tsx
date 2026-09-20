@@ -1,8 +1,17 @@
 /**
- * 表单基础件：Field（三态输入容器）、Stepper、DateField（仅今天/过去）。
- * 三态语义对齐旧版 FormField：neutral（聚焦高亮）/ valid / invalid。
+ * 表单基础件：Field（错误/辅助文案与控件 ARIA 关联）、Stepper、DateField。
+ * 三态语义沿用旧版 FormField：neutral / valid / invalid。
  */
-import { useMemo, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode } from 'react'
+import {
+  createContext,
+  useContext,
+  useId,
+  useMemo,
+  useState,
+  type ButtonHTMLAttributes,
+  type InputHTMLAttributes,
+  type ReactNode,
+} from 'react'
 import { CalendarIcon, Minus, Plus } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -14,6 +23,14 @@ export interface FieldState {
   state?: 'neutral' | 'valid' | 'invalid'
   message?: string
 }
+
+interface FieldA11y {
+  id?: string
+  error: boolean
+  describedBy?: string
+}
+
+const FieldA11yContext = createContext<FieldA11y>({ error: false })
 
 export function Field({
   label,
@@ -28,28 +45,40 @@ export function Field({
   htmlFor?: string
   error?: string
   okMessage?: string
-  /** 常驻 helper（聚焦时显示） */
+  /** 常驻辅助文案，保持一句话。 */
   helper?: string
   children: ReactNode
   className?: string
 }) {
-  const [focused, setFocused] = useState(false)
-  const showHelper = Boolean(error || okMessage || (focused && helper))
+  const autoId = useId()
+  const errorId = `${autoId}-error`
+  const helperId = `${autoId}-help`
+  const showHelper = Boolean(error || okMessage || helper)
+  const describedBy = error ? errorId : (okMessage || helper) ? helperId : undefined
   return (
     <div className={cn('mb-3', className)}>
       <label htmlFor={htmlFor} className="mb-1 block text-xs font-medium">
         {label}
+        {helper && !error ? <span className="sr-only">，{helper}</span> : null}
       </label>
-      <div onFocus={() => setFocused(true)} onBlur={() => setFocused(false)}>
+      <FieldA11yContext.Provider value={{ id: htmlFor, error: Boolean(error), describedBy }}>
         {children}
-      </div>
-      {showHelper && (
-        <p className={cn('mt-1 text-[11px]', error ? 'text-destructive' : 'text-muted-foreground')}>
-          {error ?? okMessage ?? helper}
+      </FieldA11yContext.Provider>
+      {error ? (
+        <p id={errorId} role="alert" className="mt-1 text-[11px] text-destructive">
+          {error}
+        </p>
+      ) : showHelper && (
+        <p id={helperId} className="mt-1 text-[11px] text-muted-foreground">
+          {okMessage ?? helper}
         </p>
       )}
     </div>
   )
+}
+
+function useFieldA11y() {
+  return useContext(FieldA11yContext)
 }
 
 export function TextInput({
@@ -57,15 +86,17 @@ export function TextInput({
   className,
   ...props
 }: InputHTMLAttributes<HTMLInputElement> & { state?: FieldState['state'] }) {
+  const a11y = useFieldA11y()
+  const invalid = Boolean(a11y.error) || state === 'invalid'
   return (
     <Input
+      aria-invalid={invalid || undefined}
+      aria-describedby={a11y.describedBy}
       className={cn(
-        // 手机上 34px 高够不到（触控目标需 ≥44px），字号也放大一档；
-        // sm 及以上回到规范冻结的 34px / 13px。
-        'h-[38px] rounded-[4px] border-transparent bg-secondary text-[13px] transition-colors focus-visible:bg-card sm:h-[34px]',
+        'h-[42px] rounded-[6px] border-transparent bg-secondary text-[13px] transition-colors focus-visible:bg-card sm:h-[36px]',
         state === 'valid' &&
           'border-success/50 bg-success/5 focus-visible:border-success focus-visible:ring-success/20',
-        state === 'invalid' && 'border-destructive bg-destructive/5',
+        invalid && 'border-destructive bg-destructive/5',
         className,
       )}
       {...props}
@@ -81,7 +112,7 @@ export function GhostButton({
     <Button
       variant="outline"
       className={cn(
-        'h-[38px] shrink-0 rounded-[4px] border-border bg-card px-3 text-xs text-foreground hover:border-primary hover:bg-card hover:text-primary-strong sm:h-[34px]',
+        'h-[42px] shrink-0 rounded-[6px] border-border bg-card px-3 text-xs text-foreground hover:border-primary hover:bg-card hover:text-primary-strong sm:h-[36px]',
         className,
       )}
       {...props}
@@ -89,7 +120,7 @@ export function GhostButton({
   )
 }
 
-/** 数字步进器：可留空（留空表示“全部”），左右 − ＋，中间等宽数字 */
+/** 数字步进器：可留空（留空表示“全部”），左右 − ＋，中间等宽数字。 */
 export function Stepper({
   value,
   onChange,
@@ -97,6 +128,8 @@ export function Stepper({
   max = 9999,
   invalid,
   allowEmpty = true,
+  ariaLabel = '待处理订单数',
+  id,
 }: {
   value: number | null
   onChange: (v: number | null) => void
@@ -104,8 +137,10 @@ export function Stepper({
   max?: number
   invalid?: boolean
   allowEmpty?: boolean
+  ariaLabel?: string
+  id?: string
 }) {
-  // 草稿态：输入时允许任意内容（含清空），失焦或按按钮时才提交并钳位。
+  const a11y = useFieldA11y()
   const [draft, setDraft] = useState<string | null>(null)
   const clamp = (v: number) => Math.min(max, Math.max(min, Math.trunc(v) || min))
   const commit = (raw: string) => {
@@ -127,7 +162,6 @@ export function Stepper({
     const numeric = base && !Number.isNaN(base) ? base : min
     let next: number | null
     if (base === null || base === undefined || Number.isNaN(base)) {
-      // 留空时按 +：回到最小值（1），而不是跳到 2。
       next = delta > 0 ? min : null
     } else if (delta < 0 && allowEmpty && numeric <= min) {
       next = null
@@ -137,25 +171,29 @@ export function Stepper({
     onChange(next)
     setDraft(null)
   }
+  const invalidState = Boolean(a11y.error) || Boolean(invalid)
   return (
     <div
       className={cn(
-        'inline-flex items-center overflow-hidden rounded-[4px] border bg-card',
-        invalid && 'border-destructive',
+        'inline-flex items-center overflow-hidden rounded-[6px] border bg-card',
+        invalidState && 'border-destructive',
       )}
     >
       <button
         type="button"
         aria-label="减少"
-        className="h-[38px] w-[38px] sm:h-[34px] sm:w-[30px] text-[15px] text-muted-foreground hover:bg-secondary hover:text-foreground"
+        className="h-[42px] w-[42px] text-[15px] text-muted-foreground hover:bg-secondary hover:text-foreground sm:h-[36px] sm:w-[34px]"
         onClick={() => step(-1)}
       >
         <Minus className="mx-auto size-3.5" />
       </button>
       <input
-        aria-label="待处理订单数"
+        id={id}
+        aria-label={ariaLabel}
+        aria-invalid={invalidState || undefined}
+        aria-describedby={a11y.describedBy}
         inputMode="numeric"
-        className="tabular h-[38px] w-[38px] border-x sm:h-[34px] bg-transparent text-center font-mono text-[13px] outline-none"
+        className="tabular h-[42px] w-[42px] border-x bg-transparent text-center font-mono text-[13px] outline-none sm:h-[36px]"
         value={draft ?? (value === null ? '' : String(value))}
         onChange={(e) => {
           const raw = e.target.value.replace(/[^0-9]/g, '').slice(0, 4)
@@ -176,7 +214,7 @@ export function Stepper({
       <button
         type="button"
         aria-label="增加"
-        className="h-[38px] w-[38px] sm:h-[34px] sm:w-[30px] text-[15px] text-muted-foreground hover:bg-secondary hover:text-foreground"
+        className="h-[42px] w-[42px] text-[15px] text-muted-foreground hover:bg-secondary hover:text-foreground sm:h-[36px] sm:w-[34px]"
         onClick={() => step(1)}
       >
         <Plus className="mx-auto size-3.5" />
@@ -187,28 +225,31 @@ export function Stepper({
 
 const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六'] as const
 
-/** 日期选择：只允许今天或过去日期（与旧版 _DatePickerPopup 语义一致），可清空 */
+/** 日期选择：只允许今天或过去日期，可清空；小屏自动避免溢出屏幕。 */
 export function DateField({
   value,
   onChange,
   invalid,
+  label = '选择日期',
 }: {
   value: string
   onChange: (iso: string) => void
   invalid?: boolean
+  label?: string
 }) {
+  const a11y = useFieldA11y()
   const today = useMemo(() => {
     const now = new Date()
     return new Date(now.getFullYear(), now.getMonth(), now.getDate())
   }, [])
   const [viewMonth, setViewMonth] = useState<Date>(() => {
-    const parsed = value ? new Date(value) : today
+    const parsed = value ? new Date(`${value}T00:00:00`) : today
     return Number.isNaN(parsed.getTime()) ? today : startOfMonth(parsed)
   })
   const [open, setOpen] = useState(false)
 
   const selected = useMemo(() => {
-    const parsed = value ? new Date(value) : null
+    const parsed = value ? new Date(`${value}T00:00:00`) : null
     return parsed && !Number.isNaN(parsed.getTime()) ? parsed : null
   }, [value])
 
@@ -224,6 +265,7 @@ export function DateField({
   }, [viewMonth])
 
   const canGoNext = startOfMonth(viewMonth) < startOfMonth(today)
+  const invalidState = Boolean(a11y.error) || Boolean(invalid)
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -231,9 +273,14 @@ export function DateField({
         <PopoverTrigger asChild>
           <button
             type="button"
+            aria-label={label}
+            aria-haspopup="dialog"
+            aria-expanded={open}
+            aria-invalid={invalidState || undefined}
+            aria-describedby={a11y.describedBy}
             className={cn(
-              'flex h-[38px] flex-1 items-center sm:h-[34px] rounded-[4px] border border-transparent bg-secondary px-2.5 text-left text-[13px] transition-colors hover:bg-secondary/80',
-              invalid && 'border-destructive bg-destructive/5',
+              'flex h-[42px] flex-1 items-center rounded-[6px] border border-transparent bg-secondary px-2.5 text-left text-[13px] transition-colors hover:bg-secondary/80 sm:h-[36px]',
+              invalidState && 'border-destructive bg-destructive/5',
               open && 'border-primary bg-card',
             )}
           >
@@ -243,20 +290,20 @@ export function DateField({
             </span>
           </button>
         </PopoverTrigger>
-        {/* 固定向下弹出并关闭自动翻转：avoidCollisions 默认会让日历在空间
-            不足时自动翻到上方，翻月导致高度变化时会上下跳位、箭头漂移。 */}
+        {/* 避免旧版“强制向下”溢出屏幕：允许碰撞翻转；内容自身可滚动，键盘弹出时仍可操作。 */}
         <PopoverContent
-          className="w-[264px] rounded-lg border bg-card p-3"
+          className="max-h-[min(70dvh,420px)] w-[min(280px,calc(100vw-24px))] overflow-y-auto rounded-lg border bg-card p-3"
           align="start"
           side="bottom"
-          avoidCollisions={false}
+          sideOffset={4}
+          avoidCollisions
           collisionPadding={8}
         >
           <div className="mb-2 flex items-center justify-between">
             <button
               type="button"
               aria-label="上一月"
-              className="grid size-7 place-items-center rounded text-muted-foreground hover:bg-secondary hover:text-foreground"
+              className="grid size-8 place-items-center rounded text-muted-foreground hover:bg-secondary hover:text-foreground"
               onClick={() => setViewMonth(new Date(viewMonth.getFullYear(), viewMonth.getMonth() - 1, 1))}
             >
               ‹
@@ -268,7 +315,7 @@ export function DateField({
               type="button"
               aria-label="下一月"
               disabled={!canGoNext}
-              className="grid size-7 place-items-center rounded text-muted-foreground hover:bg-secondary hover:text-foreground disabled:opacity-30"
+              className="grid size-8 place-items-center rounded text-muted-foreground hover:bg-secondary hover:text-foreground disabled:opacity-30"
               onClick={() => setViewMonth(new Date(viewMonth.getFullYear(), viewMonth.getMonth() + 1, 1))}
             >
               ›
@@ -289,12 +336,14 @@ export function DateField({
                   key={date.toISOString()}
                   type="button"
                   disabled={future}
+                  aria-label={`${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`}
+                  aria-pressed={isSelected}
                   onClick={() => {
                     onChange(formatISO(date))
                     setOpen(false)
                   }}
                   className={cn(
-                    'tabular mx-auto grid size-7 place-items-center rounded-[4px] font-mono text-xs',
+                    'tabular mx-auto grid size-8 place-items-center rounded-[6px] font-mono text-xs',
                     future && 'text-ink-faint/40',
                     !future && !isSelected && 'hover:bg-secondary',
                     isSelected && 'bg-primary font-semibold text-primary-foreground',
@@ -305,11 +354,11 @@ export function DateField({
               )
             })}
           </div>
-          <div className="mt-2 flex justify-between border-t pt-2">
+          <div className="mt-2 flex flex-wrap justify-between gap-2 border-t pt-2">
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 text-xs text-muted-foreground"
+              className="h-8 text-xs text-muted-foreground"
               onClick={() => {
                 onChange('')
                 setOpen(false)

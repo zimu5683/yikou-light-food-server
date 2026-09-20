@@ -8,6 +8,8 @@
  * 未配置后端的纯静态预览会退化为 mock 数据（仅用于样式开发）。
  */
 
+import { RequestError, classifyRequestError, toRequestError, type RequestErrorView } from './requestError.ts'
+
 // ---------- 协议类型 ----------
 
 export type LogLevel = 'INFO' | 'OK' | 'WARN' | 'ERROR'
@@ -23,10 +25,89 @@ export type StatusState =
   | 'running'
   | 'stopping'
   | 'success'
+  | 'noop'
   | 'partial'
   | 'stopped'
+  | 'dry_run'
+  | 'preflight_ok'
+  | 'no_orders'
+  | 'insufficient_balance'
+  | 'balance_unknown'
+  | 'uncertain'
+  | 'blocked_uncertain'
+  | 'blocked_concurrent'
+  | 'recovered'
+  | 'not_started'
+  | 'rejected'
   | 'error'
   | 'updating'
+
+export type OperationMode =
+  | ''
+  | 'order'
+  | 'sss'
+  | 'wps_upload'
+  | 'wps_authorize'
+  | 'wps_logout'
+  | 'check_update'
+  | 'install_update'
+  | 'wps_preview'
+  | 'wps_check_copies'
+  | 'sss_day_orders'
+  | 'wps_recovery_resolve'
+
+export type OperationLifecycle =
+  | 'idle'
+  | 'running'
+  | 'success'
+  | 'noop'
+  | 'partial'
+  | 'stopped'
+  | 'dry_run'
+  | 'preflight_ok'
+  | 'no_orders'
+  | 'insufficient_balance'
+  | 'balance_unknown'
+  | 'uncertain'
+  | 'blocked'
+  | 'blocked_uncertain'
+  | 'error'
+  | 'failed'
+  | 'rejected'
+  | 'recovered'
+  | 'not_started'
+  | 'not_found'
+
+/** operation_status() 返回的单条操作（活动或最近历史）。 */
+export interface OperationInfo {
+  ok: boolean
+  active: boolean
+  operation_id: string
+  mode: OperationMode | string
+  status: OperationLifecycle | string
+  phase: string
+  summary: Record<string, unknown>
+  next_action: string
+  reason: string
+  started_at: number | null
+  finished_at: number | null
+}
+
+/** operation_status() 完整返回；未指定 ID 时选择活动 > 最新完成 > 空闲。 */
+export interface OperationStatusResult extends OperationInfo {
+  operations: OperationInfo[]
+}
+
+export interface ClearPasswordResult {
+  ok: boolean
+  status: string
+  state: string
+  mode: 'order' | 'sss' | string
+  deleted: boolean
+  reason: string
+  next_action: string
+  summary: Record<string, unknown>
+}
 
 export interface AppConfigState {
   target_url: string
@@ -110,6 +191,75 @@ export interface WpsPlanSummary {
   warned: number
   /** 日期格已被协作者写了别的值（例如 0 = 当天不送），本次没动这一格的人数。 */
   skipped?: number
+  /** 结构化表统计中的阻断表数；summary 兼容字段可能没有，界面优先用 tables 求和。 */
+  blocked?: number | null
+}
+
+/**
+ * W6：行数口径（**计划**）。
+ *
+ * `planned_summary.rows.to_update/to_append` 是「计划要改几行」，永远不能当作
+ * 成功行数展示。后端 `Bridge._wps_execution_summary` 是唯一实现。
+ */
+export interface WpsPlanRows {
+  to_update: number
+  to_append: number
+  unchanged: number
+  skipped: number
+  warned: number
+  blocked?: number | null
+}
+
+export interface WpsPlannedSummary {
+  kind: 'plan'
+  contract_version?: number
+  rows: WpsPlanRows
+  [key: string]: unknown
+}
+
+/**
+ * W6：行数口径（**执行**）。
+ *
+ * - `sheets.*` 是**表数**，`rows.*` 才是行数，两者绝不能混用；
+ * - `rows.verified === null` 或 `rows_unknown === true` 表示「无法证明实际写入行数」，
+ *   界面必须显示“未知/待核对”，不得显示 0 或计划数；
+ * - `proven_no_write === true` 才允许说“本次未写入任何内容”。
+ */
+export interface WpsExecutionSheets {
+  total: number
+  verified: number
+  noop: number
+  failed: number
+  uncertain: number
+  skipped: number
+  blocked: number
+  other: number
+}
+
+export interface WpsExecutionRows {
+  verified: number | null
+  failed: number | null
+  uncertain: number | null
+  skipped: number | null
+  planned: number | null
+}
+
+export interface WpsExecutionSummary {
+  kind: 'execution'
+  contract_version?: number
+  status: string
+  executed: boolean
+  /** `apply_plan` | `rejected_before_write` | `unknown_after_exception`；只是计数来源，不是状态。 */
+  counts_source: string
+  sheets: WpsExecutionSheets
+  rows: WpsExecutionRows
+  rows_unknown: boolean
+  proven_no_write: boolean
+  written_sheets: number | null
+  failed_sheets: number | null
+  note?: string
+  next_action?: string
+  [key: string]: unknown
 }
 
 export interface WpsCopyCheckItem {
@@ -132,14 +282,317 @@ export interface WpsCopyCheck {
   tables?: WpsCopyCheckItem[]
 }
 
-export interface WpsResult {
+export interface WpsTableCounts {
+  to_update: number
+  to_append: number
+  unchanged: number
+  skipped: number
+  warned: number
+  blocked?: number | null
+}
+
+export interface WpsStructuredChange {
+  kind: 'new' | 'existing' | string
+  name: string
+  phone: string
+  row: number
+  slot: number
+  delta: number
+  total_before: number
+  total_after: number
+  target_col: number
+  target_ok: boolean
+  target_blocked: boolean
+  target_occupied: string
+  needs_write: boolean
+  local_rows: Array<number | string>
+  address: string
+  meal_type: string
+  meal_kind: string
+  detail: string
+  [key: string]: unknown
+}
+
+export interface WpsSortInfo {
+  enabled: boolean
+  sort_range: string
+  sort_key_col: number
+  row_keys_count: number
+  unknown_addresses: string[]
+}
+
+export interface WpsStructuredTable {
+  sheet: string
+  file_id: string
+  drive_id?: string
+  target_date: string
+  target_col: number
+  target_header: string
+  weekday_number: number
+  blocked_reason: string
+  counts: WpsTableCounts
+  changes: WpsStructuredChange[]
+  insert_blocks: Array<Record<string, unknown>>
+  warnings: string[]
+  unknown_addresses: string[]
+  sort?: WpsSortInfo
+  [key: string]: unknown
+}
+
+export interface WpsBlockedItem {
+  sheet: string
+  reason: string
+}
+
+export interface WpsFingerprint {
+  local_sha256: string
+  context: string
+  plan: string
+}
+
+/** wps_preview() 成功返回的结构化预览 + 一次性 preview_id。 */
+export interface WpsPreviewResult {
   ok: boolean
-  reason?: string
-  target_date?: string
+  status: string
+  reason: string
+  code?: string
+  next_action: string
+  summary: WpsPlanSummary
+  stats?: WpsPlanSummary
+  operation_id: string
+  preview_id: string
+  created_at: string
+  expires_at: string
+  expires_in: number
+  ttl_seconds: number
+  local_sha256: string
+  context_fingerprint: string
+  plan_fingerprint: string
+  fingerprint: WpsFingerprint
+  target_tables: Record<string, { file_id: string; drive_id?: string }>
+  target_date: string
+  test_mode: boolean
   text?: string
-  summary?: WpsPlanSummary
+  tables: WpsStructuredTable[]
+  blocked: WpsBlockedItem[]
+  warnings: string[]
+  state?: string
+  /** W6：预览阶段只有计划；`summary/stats` 在预览里也是计划口径。 */
+  planned_summary?: WpsPlannedSummary
+  /** W6：预览阶段执行口径必然 `proven_no_write=true`（还没写任何东西）。 */
+  execution_summary?: WpsExecutionSummary
+}
+
+/** wps_upload(preview_id) 成功/部分/不确定/拒绝的统一返回。 */
+export interface WpsUploadResult {
+  ok: boolean
+  status: string
+  code?: string
+  reason: string
+  next_action: string
+  /**
+   * 旧字段名保留，但 R6 起含义已改为**执行口径**（= `execution_summary`）。
+   * 不要再按 `summary.to_update` 展示“更新 N 行”。
+   */
+  summary?: WpsPlanSummary & Record<string, unknown>
+  stats?: Record<string, unknown>
+  /** W6：计划口径（要改几行）。 */
+  planned_summary?: WpsPlannedSummary | null
+  /** W6：执行口径（实际写入几行）。未知时为 `null` 字段 / `rows_unknown=true`。 */
+  execution_summary?: WpsExecutionSummary | null
+  /** 旧兼容字段：`planned_summary` 的镜像。 */
+  summary_stats?: WpsPlannedSummary | null
+  /** `execution_summary.rows_unknown` 的镜像。 */
+  rows_unknown?: boolean
+  operation_id: string
+  preview_id?: string
+  target_date?: string
   test_mode?: boolean
-  result?: { written: number; failed: number; sheets: Array<{ sheet: string; status: string; reason?: string }> }
+  failed?: number
+  written?: number
+  failed_sheets?: string[]
+  text?: string
+  message?: string
+  uncertain?: boolean
+  executor_status?: string
+  executor_next_action?: string
+  executor_operation_id?: string
+  verification_missing?: boolean
+  contradictory?: boolean
+  possible_write?: boolean
+  written_verified?: number
+  journal_path?: string
+  recovery?: Record<string, unknown> | null
+  result?: {
+    written: number
+    failed: number
+    sheets: Array<{
+      sheet: string
+      status: string
+      reason?: string
+      next_action?: string
+      uncertain?: boolean
+    }>
+  }
+}
+
+export type WpsResult = WpsPreviewResult | WpsUploadResult
+
+export interface PendingInteractionItem {
+  interaction_id: string
+  operation_id: string
+  kind: string
+  created_at: number
+  expires_at: number
+  status: 'pending'
+  request: Record<string, unknown>
+  /** 管理员非 owner 时 request 被脱敏为空；不要尝试用空 request 恢复客户输入。 */
+  request_redacted?: boolean
+}
+
+export interface PendingInteractionsResult {
+  ok: boolean
+  interactions: PendingInteractionItem[]
+  count: number
+  next_action: string
+}
+
+export interface WpsRecoveryCounts {
+  planned: number
+  writing: number
+  ledger_pending: number
+  uncertain: number
+  verified: number
+  failed: number
+  not_started: number
+  [key: string]: number
+}
+
+export interface WpsRecoverySummary {
+  operation_count: number
+  pending_count: number
+  uncertain_count: number
+  failed_count: number
+  not_started_count: number
+  /** R6 新增：已带审计退场、但同目标防重复闸门仍保留的批次数。 */
+  retired_guarded_count?: number
+  has_pending: boolean
+  needs_review: boolean
+  guidance: string
+}
+
+export interface WpsRecoverySheet {
+  target_date: string
+  target_ref: string
+  status: string
+  raw_status: string
+  error_code: string
+  allowed_next_actions: string[]
+  manual_required: boolean
+  cloud_checked: boolean
+  evidence: string
+}
+
+export interface WpsRecoveryOperation {
+  operation_id: string
+  operation_ref: string
+  status: string
+  pending: boolean
+  cloud_checked: boolean
+  created_at: string
+  updated_at: string
+  target_date: string
+  target_refs: string[]
+  sheet_count: number
+  error_code: string
+  allowed_next_actions: string[]
+  manual_required: boolean
+  sheets: WpsRecoverySheet[]
+}
+
+/** 只读恢复状态：普通用户 scope=summary 不含 operations/journal_path；管理员 scope=admin 也不含客户明细。 */
+export interface WpsRecoveryStatus {
+  ok: boolean
+  contract_version: number
+  source: string
+  read_only: boolean
+  queried_cloud: boolean
+  contains_cloud_checked_records: boolean
+  scope: 'summary' | 'admin'
+  counts: WpsRecoveryCounts
+  next_action: string
+  error_code: string
+  summary: WpsRecoverySummary
+  operations?: WpsRecoveryOperation[]
+  pending_operations?: WpsRecoveryOperation[]
+  /** R6 新增：管理员带审计退场、但同目标防重复闸门仍保留的批次数。 */
+  retired_guarded_count?: number
+}
+
+export type WpsRecoveryDecision =
+  | 'retire_guarded'
+  | 'cloud_verified'
+  | 'cloud_untouched'
+  | 'keep'
+
+/** `wps_recovery_resolve` 请求体（数组里放**对象**，不要放 JSON 字符串）。 */
+export interface WpsRecoveryResolvePayload {
+  operation_id: string
+  decision: WpsRecoveryDecision
+  /** 逐字确认：必须与 `decision` 完全相同。 */
+  confirm: string
+  /** 人工核对说明，≥4 字符，写入 journal 审计。 */
+  note: string
+  /** 仅 `retire_guarded`：确认已人工核对云端表结构。 */
+  confirm_structure_checked?: boolean
+}
+
+export interface WpsRecoveryResolveScope {
+  operation_ref: string
+  target_dates: string[]
+  target_refs: string[]
+  sheet_count: number
+  guard_retained: boolean
+  blocking: string
+}
+
+export interface WpsRecoveryResolveAudit {
+  actor: string
+  at: string
+  decision: string
+  note_recorded: boolean
+  duplicate: boolean
+  effects: {
+    cloud_written: boolean
+    guard_retained: boolean
+    blocking: string
+    auto_retry_allowed: boolean
+  }
+}
+
+/**
+ * `wps_recovery_resolve` 返回。**永不写云端**（`cloud_write=false`）。
+ *
+ * `ok=false` 时 `changed=false`，一个文件都不改：界面必须保持阻断，不能显示成功、
+ * 不能提供“删除账本/直接重传”捷径。
+ */
+export interface WpsRecoveryResolveResult {
+  ok: boolean
+  status: string
+  code?: string
+  reason: string
+  next_action: string
+  contract_version?: number
+  read_only?: boolean
+  cloud_write?: boolean
+  operation_id?: string
+  operation_ref?: string
+  changed?: boolean
+  verified_on_disk?: boolean
+  allowed_decisions?: string[]
+  scope?: WpsRecoveryResolveScope
+  audit?: WpsRecoveryResolveAudit
+  recovery?: WpsRecoveryStatus | null
 }
 
 /** 云端当天名单（bridge.sss_day_orders 返回）。 */
@@ -176,6 +629,10 @@ export interface AppState {
   platform?: 'android' | 'web'
   /** 当前环境是否支持应用内下载安装（仅 APK 模式为 true）。 */
   can_self_update?: boolean
+  /** 当前权威操作状态：断线重连后不依赖事件也能恢复 active/最近结果。 */
+  operation: OperationStatusResult
+  /** operation_status().operations 的镜像，按新→旧排序。 */
+  operations: OperationInfo[]
   config: AppConfigState
   passwords: { order: string; sss: string }
 }
@@ -241,19 +698,30 @@ export interface UpdateProgress {
   message?: string
 }
 
+export interface TaskEventPayload {
+  message: string
+  status: StatusState | string
+  result_status: StatusState | string
+  ok: boolean
+  success: boolean
+  real_order: boolean
+  stopped: boolean
+  partial: boolean
+  uncertain: boolean
+  blocked: boolean
+  needs_review: boolean
+  next_action: string
+  reason: string
+  summary: Record<string, unknown>
+  operation_id: string
+  result: Record<string, unknown>
+}
+
 type BridgeEventBase =
   | { event: 'log'; payload: LogEntry }
   | { event: 'status'; payload: { state: StatusState } }
-  | {
-      event: 'task:done'
-      payload: {
-        message: string
-        stopped: boolean
-        partial: boolean
-        result: Record<string, number | boolean | null>
-      }
-    }
-  | { event: 'task:error'; payload: { message: string } }
+  | { event: 'task:done'; payload: TaskEventPayload }
+  | { event: 'task:error'; payload: TaskEventPayload }
   | { event: 'update:available'; payload: UpdateAvailable }
   | {
       event: 'desktop_update:available'
@@ -362,6 +830,12 @@ export interface FieldErrors {
   reason?: string
   message?: string
   fields?: Record<string, { message: string }>
+  /** operation_status 统一冲突协议字段（rejected/busy 等）。 */
+  code?: string
+  status?: string
+  next_action?: string
+  operation_id?: string
+  summary?: Record<string, unknown>
 }
 
 /** 云文档同步配置（只包含这个页签会改的字段）。 */
@@ -385,6 +859,7 @@ export interface WpsConfigPayload {
 
 interface BackendApi {
   bridge_ready(): Promise<AppState>
+  operation_status(operationId?: string): Promise<OperationStatusResult>
   start_order(payload: OrderFormPayload): Promise<FieldErrors>
   start_sss(payload: SssFormPayload): Promise<FieldErrors>
   sss_day_orders(): Promise<SssDayOrders>
@@ -396,13 +871,20 @@ interface BackendApi {
   choose_excel(mode: 'order' | 'sss', path?: string): Promise<{ path: string; error: string }>
   new_template(mode: 'order' | 'sss', path?: string): Promise<{ path: string; error: string }>
   wps_status(): Promise<WpsStatus>
-  wps_preview(): Promise<WpsResult>
-  wps_upload(): Promise<WpsResult>
+  wps_recovery_status(): Promise<WpsRecoveryStatus>
+  /**
+   * 管理员专用（普通用户 HTTP 403 `admin_only`）。
+   * 只改本地 journal 审计，**永不写云端**；不提供“删除账本/直接重传”。
+   */
+  wps_recovery_resolve(payload: WpsRecoveryResolvePayload): Promise<WpsRecoveryResolveResult>
+  wps_preview(): Promise<WpsPreviewResult>
+  wps_upload(previewId: string): Promise<WpsUploadResult>
+  pending_interactions(operationId?: string): Promise<PendingInteractionsResult>
   wps_authorize(): Promise<{ ok: boolean; reason?: string; hint?: string }>
   wps_logout(): Promise<{ ok: boolean; reason?: string }>
   wps_check_copies(): Promise<WpsCopyCheck>
   save_wps_config(payload: WpsConfigPayload): Promise<{ ok: boolean; reason?: string }>
-  clear_password(mode: 'order' | 'sss'): Promise<{ ok: boolean }>
+  clear_password(mode: 'order' | 'sss'): Promise<ClearPasswordResult>
   check_updates(manual: boolean): Promise<{ ok: boolean; reason?: string; message?: string }>
   install_update(): Promise<{ ok: boolean; reason?: string; message?: string }>
   cancel_update(): Promise<{ ok: boolean }>
@@ -483,22 +965,65 @@ function authHeaders(): Record<string, string> {
   return headers
 }
 
-async function postJson(url: string, body: unknown): Promise<{ ok: boolean; status: number; data: unknown }> {
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: authHeaders(),
-    body: JSON.stringify(body),
-  })
-  const text = await response.text()
-  let data: unknown = null
-  if (text) {
-    try {
-      data = JSON.parse(text)
-    } catch {
-      data = { error: text }
+const REQUEST_TIMEOUT_MS: Record<string, number> = {
+  // 长操作：后端同步执行，超时只代表前端等待窗口结束，不代表服务端未执行。
+  wps_upload: 240_000,
+  wps_preview: 120_000,
+  sss_day_orders: 120_000,
+  wps_check_copies: 120_000,
+  // `cloud_verified/cloud_untouched` 需要重新只读云端，给足窗口。
+  wps_recovery_resolve: 120_000,
+  install_update: 60_000,
+  check_updates: 60_000,
+  // 配置/启动/状态是短请求。
+  save_order_config: 15_000,
+  save_sss_config: 15_000,
+  save_wps_config: 15_000,
+  operation_status: 15_000,
+  worker_alive: 15_000,
+  bridge_ready: 15_000,
+}
+
+function timeoutFor(method: string): number {
+  return REQUEST_TIMEOUT_MS[method] ?? 30_000
+}
+
+async function postJson(
+  url: string,
+  body: unknown,
+  timeoutMs = 30_000,
+): Promise<{ ok: boolean; status: number; data: unknown }> {
+  const controller = typeof AbortController === 'undefined' ? null : new AbortController()
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : undefined
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify(body),
+      signal: controller?.signal,
+    })
+    const text = await response.text()
+    let data: unknown = null
+    if (text) {
+      try {
+        data = JSON.parse(text)
+      } catch {
+        data = { error: text }
+      }
     }
+    return { ok: response.ok, status: response.status, data }
+  } catch (error) {
+    if (controller?.signal.aborted) {
+      throw new RequestError(
+        'timeout',
+        `请求超时（${Math.round(timeoutMs / 1000)} 秒内未返回）`,
+        { cause: error },
+      )
+    }
+    throw toRequestError(error)
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
   }
-  return { ok: response.ok, status: response.status, data }
 }
 
 function errorMessage(data: unknown, status: number): string {
@@ -509,13 +1034,58 @@ function errorMessage(data: unknown, status: number): string {
   return `请求失败（HTTP ${status}）`
 }
 
+function requestErrorForStatus(status: number, data: unknown): RequestError {
+  const message = status === 401
+    ? '访问令牌无效或已失效，请用带有效 ?token= 的完整网址重新打开'
+    : errorMessage(data, status)
+  let kind: ConstructorParameters<typeof RequestError>[0] = 'client'
+  if (status === 401) kind = 'auth'
+  else if (status === 403) kind = 'permission'
+  else if (status === 408 || status === 504 || status === 524) kind = 'timeout'
+  else if (status >= 500) kind = 'server'
+  return new RequestError(kind, message, { status })
+}
+
+export interface GlobalRequestIssue extends RequestErrorView {
+  id: number
+  scope: string
+  at: number
+}
+
+const issueListeners = new Set<(issue: GlobalRequestIssue) => void>()
+let issueSeq = 0
+
+export function onRequestIssue(listener: (issue: GlobalRequestIssue) => void): () => void {
+  issueListeners.add(listener)
+  return () => issueListeners.delete(listener)
+}
+
+/** 把错误广播给全局错误条；纯逻辑错误分类在 requestError.ts。 */
+export function reportRequestError(error: unknown, scope = '请求'): RequestError {
+  const normalized = toRequestError(error)
+  const view = classifyRequestError(normalized)
+  const issue: GlobalRequestIssue = {
+    id: (issueSeq += 1),
+    scope,
+    at: Date.now(),
+    ...view,
+  }
+  for (const listener of issueListeners) listener(issue)
+  return normalized
+}
+
 /** 用 HTTP 实现整个 BackendApi：方法名即路径，参数按位置传。 */
 function createHttpApi(): BackendApi {
   const call = async (method: string, args: unknown[]): Promise<unknown> => {
-    const { ok, status, data } = await postJson(`/api/${method}`, args)
+    let response: { ok: boolean; status: number; data: unknown }
+    try {
+      response = await postJson(`/api/${method}`, args, timeoutFor(method))
+    } catch (error) {
+      throw reportRequestError(error, method)
+    }
+    const { ok, status, data } = response
     if (!ok) {
-      if (status === 401) throw new Error('访问令牌无效或已失效，请用带 ?token= 的完整网址重新打开')
-      throw new Error(errorMessage(data, status))
+      throw reportRequestError(requestErrorForStatus(status, data), method)
     }
     return data
   }
@@ -772,20 +1342,46 @@ export async function connectBridge(): Promise<ReadyResult> {
   return { state: mockState(), mocked: true, transport, authError: '' }
 }
 
+/**
+ * 浏览器直开（无后端）时的**纯展示**初始状态，只用于样式开发/无后端演示。
+ *
+ * 这里不得出现真实手机号/账号或开发机绝对路径：`dist/index.html` 会被内联进 APK
+ * 随测试版分发。所有"未配置"字段一律留空字符串——这与全新安装的真实状态一致，
+ * 且非管理员不校验这些隐藏字段（见 `lib/formValidation.ts`），演示流程不受影响。
+ * 若将来某个演示场景确实需要占位值，只能使用一眼可辨的合成值（例如
+ * `13800000000`、`/tmp/synthetic-*.xlsx`），并在此处说明来源。
+ */
 function mockState(): AppState {
+  const idleOperation: OperationStatusResult = {
+    ok: true,
+    active: false,
+    operation_id: '',
+    mode: '',
+    status: 'idle',
+    phase: '',
+    summary: {},
+    next_action: '',
+    reason: '',
+    started_at: null,
+    finished_at: null,
+    operations: [],
+  }
   return {
     version: '3.0.0-dev',
     status: 'ready',
+    operation: idleOperation,
+    operations: [],
     config: {
       target_url: 'https://m.icall.me/admin/#/login',
-      phone_number: '13968033834',
-      excel_path: '/home/zimu/文档/排单.xlsx',
+      // 凭据类字段留空：不携带任何来源未确认的真实手机号/账号。
+      phone_number: '',
+      excel_path: '',
       order_date: '2026-09-05',
       order_count: null,
       split_ratio: 0.38,
       sss_url: 'https://sssplusnew.zhuopaikeji.com/takeout',
-      sss_account: '18758187837',
-      sss_excel_path: '/home/zimu/文档/闪时送.xlsx',
+      sss_account: '',
+      sss_excel_path: '',
       sss_order_source: 'wps',
       sss_product_name: '轻食',
       sss_common_address: '嗯哼',

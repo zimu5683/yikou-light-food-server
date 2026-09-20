@@ -19,6 +19,14 @@ from app.api.bridge import MAX_ORDER_COUNT, Bridge
 from app.api import bridge as bridge_module
 
 
+def _assert_started(got):
+    """启动成功现在会 additive 返回 status/operation_id/summary；旧前端读 ok 不变。"""
+    assert got["ok"] is True
+    assert got["status"] in ("running", "success")
+    assert got["operation_id"].startswith("op-")
+    assert "summary" in got and "next_action" in got
+
+
 def _bridge(tmp_path) -> Bridge:
     # 这些用例验证的是**管理员**的完整能力（start_order 的校验/副作用）。
     # Bridge 的默认角色是「非管理员」（安全默认），故此处显式以管理员构造；
@@ -106,13 +114,13 @@ def test_excel_suffix_must_be_xlsx_or_xlsm(bridge, tmp_path):
 
 def test_xlsm_is_accepted(bridge, tmp_path):
     got = bridge.start_order(_payload(tmp_path, excel=str(_excel(tmp_path, "名单.xlsm"))))
-    assert got == {"ok": True}
+    _assert_started(got)
 
 
 @pytest.mark.parametrize("count", ["", " "])
 def test_empty_count_means_all_orders(bridge, tmp_path, count):
     got = bridge.start_order(_payload(tmp_path, count=count))
-    assert got == {"ok": True}
+    _assert_started(got)
     assert bridge._config.order_count is None
 
 
@@ -137,13 +145,13 @@ def test_bad_count_is_rejected(bridge, tmp_path, count):
 
 @pytest.mark.parametrize("count,expected", [("1", 1), ("7", 7), (str(MAX_ORDER_COUNT), MAX_ORDER_COUNT)])
 def test_valid_count_is_stored_as_int(bridge, tmp_path, count, expected):
-    assert bridge.start_order(_payload(tmp_path, count=count)) == {"ok": True}
+    _assert_started(bridge.start_order(_payload(tmp_path, count=count)))
     assert bridge._config.order_count == expected
 
 
 def test_empty_date_is_valid_and_means_today(bridge, tmp_path):
     """``parse_target_date("")`` 返回**今天**，所以空日期不算错误。"""
-    assert bridge.start_order(_payload(tmp_path, date="")) == {"ok": True}
+    _assert_started(bridge.start_order(_payload(tmp_path, date="")))
     assert bridge._config.order_date == ""
 
 
@@ -199,7 +207,7 @@ def test_success_updates_only_the_order_side_of_the_config(bridge, tmp_path):
     cfg.sss_common_address = "自定义地址"
     cfg.sss_dry_run = False
 
-    assert bridge.start_order(_payload(tmp_path, phone="13900000000")) == {"ok": True}
+    _assert_started(bridge.start_order(_payload(tmp_path, phone="13900000000")))
 
     assert cfg.phone_number == "13900000000"
     assert cfg.sss_account == "sss-user"
@@ -261,4 +269,6 @@ def test_launch_receives_the_expected_arguments(bridge, tmp_path, monkeypatch):
 
 
 def test_success_returns_ok_without_fields(bridge, tmp_path):
-    assert bridge.start_order(_payload(tmp_path)) == {"ok": True}
+    got = bridge.start_order(_payload(tmp_path))
+    _assert_started(got)
+    assert "fields" not in got, "成功路径不应出现表单错误字段"

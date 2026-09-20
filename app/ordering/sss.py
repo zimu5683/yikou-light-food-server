@@ -109,6 +109,7 @@ from app.ordering.reconcile import (
 from app.ordering.submission import (
     _balance_precheck,
     _check_success,
+    _ExplicitRejection,
     _format_balance,
     _is_auth_expired,
     _make_api_submitter,
@@ -124,6 +125,18 @@ from app.ordering.runner import (
     run_sss_job,
 )
 from app.ordering.cloud_import import ImportRefused, prepare_day_orders
+from app.ordering.uncertain import (
+    authoritative_uncertain_path,
+    authority_scope_key,
+    batch_submission_lock,
+    discard_uncertain_records,
+    legacy_uncertain_paths,
+    merge_journals,
+    mirror_journal,
+    mirror_uncertain_paths,
+    normalise_account,
+    platform_origin,
+)
 from app.integrations.api_client import (
     ApiError, SssApiClient, SssTransportError,
     auth_error_message, is_auth_expired_payload,
@@ -143,6 +156,7 @@ __all__ = [
     "_ACCOUNT_PATH",
     "_AuthExpired",
     "_BALANCE_KEYWORDS",
+    "_ExplicitRejection",
     "_BATCH_CLOCK_SKEW_S",
     "_BLANK_ROWS_TO_STOP",
     "_BalanceDepleted",
@@ -228,6 +242,16 @@ __all__ = [
     "_unwrap_scalar",
     "_validate_sss_orders",
     "_with_auth_relogin",
+    "authoritative_uncertain_path",
+    "authority_scope_key",
+    "batch_submission_lock",
+    "discard_uncertain_records",
+    "legacy_uncertain_paths",
+    "merge_journals",
+    "mirror_journal",
+    "mirror_uncertain_paths",
+    "normalise_account",
+    "platform_origin",
     "auth_error_message",
     "build_order_payload",
     "compute_delivery_time",

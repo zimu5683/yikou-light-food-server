@@ -72,6 +72,10 @@ _PROXY_HEADERS = ("cf-connecting-ip", "cf-ray", "x-forwarded-for", "x-forwarded-
 #: 以及 WPS 的**预览与上传**（按使用要求开放，注意上传会真的写云文档）。
 #: 被拦下的都是「能改服务器状态或泄漏数据」的：保存配置、文件浏览、清除密码、
 #: 检查更新/安装、窗口控制、授权 WPS 等。
+#:
+#: 特别说明：``wps_recovery_resolve``（管理员恢复/退场旧 pending 任务）**故意不在
+#: 本白名单内** —— 未登记即默认仅管理员。Bridge 内部还会再校验一次
+#: ``is_admin``，直接调用（脚本/旧客户端绕过 HTTP）同样返回 forbidden。
 _NON_ADMIN_METHODS = frozenset({
     # 任务控制
     "start_order", "start_sss", "stop_task", "worker_alive",
@@ -84,6 +88,10 @@ _NON_ADMIN_METHODS = frozenset({
     "wps_status", "wps_preview", "wps_upload", "wps_check_copies",
     # 闪时送每日订单查询（只读）
     "sss_day_orders",
+    # 操作断线查询（订单/闪时送/云上传/授权/更新的 active/最近结果）
+    "operation_status",
+    # 只读恢复：WPS 恢复对账 + pending 交互列表（普通用户只会看到自己的交互）
+    "wps_recovery_status", "pending_interactions",
 })
 
 
@@ -415,14 +423,21 @@ class _Handler(BaseHTTPRequestHandler):
         # 因为拒绝分支会调 _drain_body()，而它原本由 do_GET/do_POST 初始化。
         self._body_read = False
         path = urlparse(self.path).path
+        # 先清掉复用连接线程可能残留的上一个请求角色/身份；无论后续鉴权成功/失败，
+        # 都不会让“未鉴权请求”继承上一请求的管理员身份或非本人交互。
+        self._bridge.set_request_is_admin(None)
+        self._bridge.set_request_identity(None)
         if path not in _PUBLIC_PATHS:
             user = self._current_user()
             if user is None:
                 self._reject_unauthenticated(path)
                 return False
-            # 每个请求都按当次会话重设角色：Bridge 是长生命周期对象，
-            # 绝不能残留上一个请求者的权限。
-            self._bridge.is_admin = bool(getattr(user, "is_admin", False))
+            # Bridge 是长生命周期对象；角色写入请求线程的 ContextVar，
+            # 而不是改写共享实例属性，避免并发请求互相借用管理员权限。
+            self._bridge.set_request_is_admin(
+                bool(getattr(user, "is_admin", False)))
+            self._bridge.set_request_identity(
+                str(getattr(user, "username", "") or ""))
         return True
 
     def _reject_unauthenticated(self, path: str) -> None:

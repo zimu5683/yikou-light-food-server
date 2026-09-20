@@ -207,15 +207,59 @@ def _api_list_waimai_orders(api_get: Callable[[str], dict[str, Any]],
                         continue
             raise
 
-    return fetch_safe(page_size)
+    return _dedupe_order_rows(fetch_safe(page_size))
+
+def _row_identity(row: dict[str, Any]) -> tuple[Any, ...]:
+    """同一接口记录的身份；优先 order_id，缺失时用取单号+创建时间+日期兜底。"""
+    order_id = str(row.get("order_id") or "").strip()
+    if order_id:
+        return ("order_id", order_id)
+    return ("fallback", str(row.get("pick_no") or ""), str(row.get("created_at") or ""),
+            str(row.get("date") or ""))
+
+
+def _dedupe_order_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """去掉分页重叠/重试造成的重复记录，保留第一次出现的顺序。"""
+    seen: set[tuple[Any, ...]] = set()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        key = _row_identity(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(row)
+    return result
+
+
+def _state_code(value: Any) -> int | None:
+    """把 state 字段规范成整数；非数字/缺失返回 None，不抛异常。"""
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        match = re.search(r"\d+", str(value))
+        return int(match.group()) if match else None
+
 
 def _group_orders_by_pick(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """按取单号分组（保持接口的新单在前顺序）；无取单号的忽略。"""
+    """按取单号分组（保持接口的新单在前顺序）；无取单号的忽略。
+
+    同一取单号内按 order_id 去重，避免分页重叠让同一接口记录进入详情重试候选。
+    """
     grouped: dict[str, list[dict[str, Any]]] = {}
+    seen_in_pick: dict[str, set[tuple[Any, ...]]] = {}
     for row in rows:
         pick = str(row.get("pick_no") or "").strip()
-        if pick:
-            grouped.setdefault(pick, []).append(row)
+        if not pick:
+            continue
+        key = _row_identity(row)
+        bucket = grouped.setdefault(pick, [])
+        seen = seen_in_pick.setdefault(pick, set())
+        if key in seen:
+            continue
+        seen.add(key)
+        bucket.append(row)
     return grouped
 
 def _filter_rows_by_date(rows: list[dict[str, Any]], selected_date: _dt.date) -> list[dict[str, Any]]:
@@ -253,9 +297,10 @@ def split_refund_orders(rows_by_pick: dict[str, list[dict[str, Any]]],
     for number in numbers:
         code = f"W{number}"
         rows = rows_by_pick.get(code, [])
-        if any(int(r.get("state") or 0) == ORDER_STATE_REFUND_DONE for r in rows):
+        states = {_state_code(r.get("state")) for r in rows}
+        if ORDER_STATE_REFUND_DONE in states:
             refunded.append(number)
-        elif any(int(r.get("state") or 0) == ORDER_STATE_REFUND_APPLIED for r in rows):
+        elif ORDER_STATE_REFUND_APPLIED in states:
             applied.append(number)
         else:
             normal.append(number)

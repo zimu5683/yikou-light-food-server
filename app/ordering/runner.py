@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.integrations.api_client import SssApiClient
+from app.integrations.sss_url import canonical_sss_origin
 from app.order.common import _emit
 from app.ordering.cloud_import import prepare_day_orders
 from app.ordering.constants import (
@@ -33,6 +34,26 @@ from app.ordering.submission import (
     _run_reconciled_submission,
     _with_auth_relogin,
     query_balance,
+)
+from app.ordering.uncertain import (
+    UncertainJournalError,
+    append_uncertain_records,
+    authoritative_uncertain_path,
+    authority_location_gate,
+    batch_key,
+    batch_submission_lock,
+    cross_scope_unresolved_records,
+    describe_authority_location_conflicts,
+    describe_cross_scope_conflicts,
+    discard_uncertain_records,
+    legacy_uncertain_paths,
+    merge_journals,
+    mirror_journal,
+    mirror_uncertain_paths,
+    normalise_account,
+    platform_origin,
+    resolve_pending_records,
+    resolve_uncertain_records,
 )
 from app.ordering.workbook import (
     _validate_sss_orders,
@@ -111,6 +132,25 @@ def run_sss_job(config: Any, stop_event: Any,
             payload["import"] = import_summary
         return payload
 
+    def _finish(payload: dict[str, Any], *, status: str, confirmed: int = 0,
+                unconfirmed: int = 0, stopped: bool = False, failed: int = 0,
+                next_action: str = "", **summary_extra: Any) -> dict[str, Any]:
+        """统一给结果补 status/next_action/summary，保留旧键与旧入口签名。"""
+        summary = {
+            "status": status,
+            "confirmed": int(confirmed),
+            "unconfirmed": int(unconfirmed),
+            "stopped": bool(stopped),
+            "failed": int(failed),
+            "next_action": next_action,
+        }
+        summary.update(summary_extra)
+        payload = dict(payload)
+        payload["status"] = status
+        payload["next_action"] = next_action
+        payload["summary"] = summary
+        return _result(payload)
+
     _validate_sss_orders(orders_by_sheet)
     total = sum(len(orders) for orders in orders_by_sheet.values())
     if total == 0:
@@ -119,7 +159,8 @@ def run_sss_job(config: Any, stop_event: Any,
                   "当天云端名单为空（没有当天日期列，或标 1 的人都是「大西/小」），本次不下单")
         else:
             _emit(progress_callback, "闪时送 Excel 中没有任何订单")
-        return _result({"processed": 0, "created": 0, "status": "no_orders"})
+        return _finish({"processed": 0, "created": 0}, status="no_orders",
+                       next_action="没有需要下单的订单，无需操作")
     _emit(progress_callback,
           f"读取订单表耗时 {(time.perf_counter() - load_start):.1f} 秒，共 {total} 单")
     if password is None:
@@ -158,16 +199,27 @@ def run_sss_job(config: Any, stop_event: Any,
             orders_by_sheet, store_id, address, goods_name,
             account=str(getattr(config, "sss_account", "") or ""),
             batch_id=batch_id, idempotency_field=idempotency_field, now=now)
-        return _result(_run_dry_run(tasks, progress_callback))
+        preview = _run_dry_run(tasks, progress_callback)
+        return _finish(preview, status="dry_run", confirmed=0,
+                       unconfirmed=len(tasks), next_action="干跑未发送任何 POST；确认报文后再正式运行")
 
     account = str(getattr(config, "sss_account", "") or "")
     if not account:
         raise ValueError("尚未填写闪时送账号")
 
+    # R8-S1：非规范/不支持的网址在产生任何闪时送请求之前就以明确的配置错误
+    # 终止（与配置保存入口、SssApiClient 共用 app.integrations.sss_url 规则）。
+    canonical_sss_origin(url)
+    # 校验通过后按**冻结的配置字符串**（不是实时 config）算 origin：既保持
+    # “只有一套 origin 规范化”，又保证执行期配置被改写不会漂移作用域。
+    origin = platform_origin(config, url=url)
+
     job_start = time.perf_counter()
     _emit(progress_callback, "正在获取闪时送验证码…")
-    client = SssApiClient(url, account, password or "", timeout=(5.0, read_timeout_s),
+    client = SssApiClient(origin, account, password or "",
+                          timeout=(5.0, read_timeout_s),
                           pool_size=max_workers)
+    _batch_guard: Any = None
     try:
         captcha = client.fetch_captcha()
         if captcha_callback is None:
@@ -210,6 +262,195 @@ def run_sss_job(config: Any, stop_event: Any,
             _emit(progress_callback, f"已启用客户端幂等字段「{idempotency_field}」")
         else:
             _emit(progress_callback, "平台接口未探测到客户端幂等字段：采用“至少一次提交 + 对账确认”语义，不承诺 exactly-once")
+
+        # 权威共享不确定状态：所有实例必须读写同一个权威 path，不能随
+        # sss_uncertain_path 改变；旧路径只做迁移/镜像，避免切路径绕过未决订单。
+        # R8-S1：这里显式传入**启动时已验证并冻结**的 origin/account，之后
+        # journal 元数据与跨作用域核对全部复用同一份身份；即使执行期配置被
+        # 改写，也不会把未决记录写到另一个 scope。
+        authoritative_journal = authoritative_uncertain_path(
+            config, origin=origin, account=account)
+        # 旧哈希/旧默认/旧全局文件只作为只读迁移来源；只有显式配置的
+        # sss_uncertain_path / YIKOU_SSS_UNCERTAIN_PATH 才允许镜像写回。
+        migration_sources = legacy_uncertain_paths(config, authoritative_journal)
+        mirror_journals = mirror_uncertain_paths(config, authoritative_journal)
+
+        def _sync_journal_mirrors() -> None:
+            for mirror_path in mirror_journals:
+                mirror_journal(authoritative_journal, mirror_path)
+
+        journal_key = batch_key(expected_delivery_date(now), source, account)
+        # SN-C1：业务批次级跨进程锁必须覆盖“读 unresolved → 对账 → POST → 结果写盘”
+        # 全过程。锁内重新读取权威 journal，不使用锁外快照；获取失败直接拒绝提交。
+        _batch_guard = batch_submission_lock(authoritative_journal, journal_key)
+        try:
+            _batch_guard.acquire()
+        except UncertainJournalError as exc:
+            _emit(progress_callback,
+                  f"批次级跨进程锁不可用：{exc}；另一个进程可能正在处理该批次，"
+                  "本进程不会提交任何 POST")
+            stop_event.set()
+            return _finish({
+                "processed": len(tasks), "created": 0, "submitted": 0,
+                "previewed": 0, "stopped": True, "partial": False,
+                "reconciled": False, "uncertain": True,
+                "semantics": "batch-submission-lock",
+            }, status="blocked_concurrent", unconfirmed=len(tasks), stopped=True,
+               next_action="另一进程正在处理同一批次或跨进程锁不可用；未发送任何 POST，"
+                           "请等待锁释放后重试，严禁并行重跑本批")
+        # 持锁后先把旧/镜像 journal 的 unresolved 合并进权威共享状态，再做
+        # 只读对账；迁移或镜像失败一律 fail-closed。
+        #
+        # R8-S1：历史 URL 写法（尾点/IDN 等）会把未决记录拆到另一个 authority
+        # scope。持锁后、迁移/对账/POST 之前，先按规范化账号只读扫描本机权威根；
+        # 发现**无法安全归属**给当前账号的活跃 unresolved（旧写法不再受支持、
+        # 平台/账号字段缺失）一律保守阻断；不同规范 origin 的平台不误伤。
+        # 该扫描只读：不迁移、不改写、不删除旧记录，也不依据 DNS 等价合并身份。
+        try:
+            cross_scope = cross_scope_unresolved_records(
+                authoritative_journal, config=config, account=account,
+                origin=origin)
+        except UncertainJournalError as exc:
+            _emit(progress_callback, f"跨作用域未决记录只读核对失败：{exc}")
+            stop_event.set()
+            return _finish({
+                "processed": len(tasks), "created": 0, "submitted": 0,
+                "previewed": 0, "stopped": True, "partial": False,
+                "reconciled": False, "uncertain": True,
+                "semantics": "cross-scope-authority-guard",
+                "authoritative_journal": str(authoritative_journal),
+            }, status="failed", unconfirmed=len(tasks), stopped=True,
+               failed=len(tasks),
+               next_action=f"{exc}；请人工只读核对后再运行，不要删除权威文件，"
+                           "也不要并行重跑")
+        if cross_scope:
+            detail = describe_cross_scope_conflicts(cross_scope)
+            _emit(progress_callback,
+                  f"发现 {len(cross_scope)} 条属于当前账号但无法安全归属的活跃未决记录："
+                  f"{detail}；本批拒绝任何 POST")
+            stop_event.set()
+            return _finish({
+                "processed": len(tasks), "created": 0, "submitted": 0,
+                "previewed": 0, "stopped": True, "partial": False,
+                "reconciled": False, "uncertain": True,
+                "semantics": "cross-scope-authority-guard",
+                "authoritative_journal": str(authoritative_journal),
+                "cross_scope_records": len(cross_scope),
+                "cross_scope_journals": sorted(
+                    {str(item.get("journal") or "") for item in cross_scope}),
+            }, status="blocked_uncertain", unconfirmed=len(tasks), stopped=True,
+               uncertain_count=len(cross_scope),
+               cross_scope_records=len(cross_scope),
+               next_action="换 URL 写法会让未决记录落在另一个 authority scope，"
+                           "无法安全判定它们是否属于同一平台同一账号；请先只读核对站内"
+                           "订单，并按上述文件人工整理这些记录（不要删除或改写权威文件，"
+                           "也不要并行重跑）。影响范围：本机同一账号在已不受支持的旧网址"
+                           "写法（尾点、中文域名等）或归属信息缺失时，本批都会被阻断，"
+                           "直到人工核对完成；其他账号与不同规范 origin 的平台不受影响")
+        # R8-S3：显式权威位置（config.sss_authoritative_uncertain_path /
+        # YIKOU_SSS_AUTHORITATIVE_PATH）启用、切换或取消时，旧位置的活跃
+        # unresolved 会变得不可见。这里在锁内、迁移/对账/POST 之前做一次
+        # 「位置切换闸门」：核对其他已知位置（默认权威根 + 部署级登记位置）里
+        # 属于当前账号的活跃未决记录；有就阻断，全部干净后先把当前位置登记
+        # 落盘（POST 之前），再继续既有流程。该闸门只读 journal、只写登记文件：
+        # 不迁移、不改写、不删除任何旧记录。
+        try:
+            location_gate = authority_location_gate(
+                authoritative_journal, config=config, account=account,
+                origin=origin)
+        except UncertainJournalError as exc:
+            _emit(progress_callback, f"权威位置登记/切换闸门失败：{exc}")
+            stop_event.set()
+            return _finish({
+                "processed": len(tasks), "created": 0, "submitted": 0,
+                "previewed": 0, "stopped": True, "partial": False,
+                "reconciled": False, "uncertain": True,
+                "semantics": "authority-location-guard",
+                "authoritative_journal": str(authoritative_journal),
+            }, status="failed", unconfirmed=len(tasks), stopped=True,
+               failed=len(tasks),
+               next_action=f"{exc}；请人工核对权威位置登记文件与各权威位置后再运行，"
+                           "不要删除权威记录文件，也不要并行重跑")
+        if location_gate["pruned"]:
+            _emit(progress_callback,
+                  "权威位置登记：已移除不存在的旧位置 "
+                  + "、".join(location_gate["pruned"]))
+        if location_gate["conflicts"]:
+            detail = describe_authority_location_conflicts(
+                location_gate["conflicts"])
+            _emit(progress_callback,
+                  f"权威位置切换闸门：其他权威位置仍有当前账号的 "
+                  f"{len(location_gate['conflicts'])} 条活跃未决记录：{detail}；"
+                  "本批拒绝任何 POST")
+            stop_event.set()
+            return _finish({
+                "processed": len(tasks), "created": 0, "submitted": 0,
+                "previewed": 0, "stopped": True, "partial": False,
+                "reconciled": False, "uncertain": True,
+                "semantics": "authority-location-guard",
+                "authoritative_journal": str(authoritative_journal),
+                "authority_locations_registry": location_gate["registry"],
+                "location_conflicts": len(location_gate["conflicts"]),
+                "location_conflict_locations": sorted(
+                    {str(item.get("location") or "")
+                     for item in location_gate["conflicts"]}),
+            }, status="blocked_uncertain", unconfirmed=len(tasks), stopped=True,
+               uncertain_count=len(location_gate["conflicts"]),
+               location_conflicts=len(location_gate["conflicts"]),
+               next_action="检测到另一个权威状态位置仍有当前账号的活跃未确认记录"
+                           "（例如启用/切换/取消显式权威路径后，旧位置不再被读取）。"
+                           "为避免重复下单，本次不会提交任何 POST。请先只读核对这些"
+                           "位置的站内订单与本地记录，确认后人工整理对应记录；"
+                           "不要删除权威记录文件，也不要并行重跑。影响范围：同一账号在"
+                           "任一已登记或默认权威位置存在活跃未决记录时，本批都会被阻断"
+                           f"（本次检查的位置：{'、'.join(location_gate['checked']) or '无'}）；"
+                           "其他账号不受影响。")
+        try:
+            migration = merge_journals(
+                authoritative_journal, migration_sources,
+                scope={"platform": origin,
+                       "account": normalise_account(account)})
+            if migration["merged"]:
+                _emit(progress_callback,
+                      f"已把旧 journal 的 {migration['merged']} 条 unresolved "
+                      f"合并到权威共享状态：{authoritative_journal}")
+            _sync_journal_mirrors()
+            pending_journal, journal_recon, journal_resolved = resolve_pending_records(
+                authoritative_journal, journal_key, client.get_json, progress_callback)
+            _sync_journal_mirrors()
+        except UncertainJournalError as exc:
+            _emit(progress_callback,
+                  f"权威/旧 journal 迁移或读取失败：{exc}；已停止，不会提交任何 POST")
+            stop_event.set()
+            return _finish({
+                "processed": len(tasks), "created": 0, "submitted": 0,
+                "previewed": 0, "stopped": True, "partial": False,
+                "reconciled": False, "uncertain": True,
+                "semantics": "authoritative-shared-journal",
+                "authoritative_journal": str(authoritative_journal),
+            }, status="failed", unconfirmed=len(tasks), stopped=True,
+               failed=len(tasks),
+               next_action=f"{exc}；请人工核对旧 journal 与权威 journal "
+                           f"{authoritative_journal} 后再运行；严禁直接删除或并行重跑")
+        if journal_resolved:
+            _emit(progress_callback,
+                  f"跨运行不确定记录：只读对账已确认并清理 {journal_resolved} 条")
+        if pending_journal:
+            _emit(progress_callback,
+                  f"发现 {len(pending_journal)} 条未解决的“已发送未知”记录，"
+                  "只读对账仍未确认：本批拒绝任何 POST，下一步仅可人工核对站内订单")
+            stop_event.set()
+            return _finish({
+                "processed": len(tasks), "created": 0, "submitted": 0,
+                "previewed": 0, "stopped": True, "partial": False,
+                "reconciled": journal_recon is not None, "uncertain": True,
+                "semantics": "uncertain-journal-guard",
+                "authoritative_journal": str(authoritative_journal),
+                "uncertain_records": len(pending_journal),
+            }, status="blocked_uncertain", unconfirmed=len(tasks), stopped=True,
+               uncertain_count=len(pending_journal),
+               next_action="先只读核对站内订单与本地不确定记录；未确认前不要重跑或补发")
+
         try:
             unit_price = float(getattr(config, "sss_unit_price", 0) or 0)
         except (TypeError, ValueError):
@@ -224,33 +465,66 @@ def run_sss_job(config: Any, stop_event: Any,
         balance_status, estimate = _balance_precheck(
             tasks, balance_total, unit_price, progress_callback)
         if balance_status != "ok":
-            return _result({
-                "status": balance_status,
+            if balance_status == "insufficient_balance":
+                next_action = "余额不足，本批未发送任何 POST；充值后先只读核对再运行"
+            else:
+                next_action = "余额未知，本批未发送任何 POST；确认余额后先只读核对再运行"
+            return _finish({
                 "processed": len(tasks), "created": 0, "submitted": 0,
                 "previewed": 0, "stopped": True, "partial": False,
                 "reconciled": False, "uncertain": balance_status == "balance_unknown",
                 "estimate": estimate,
                 "semantics": "pre-submit-balance-guard",
-            })
+            }, status=balance_status, unconfirmed=len(tasks), stopped=True,
+               next_action=next_action)
 
         if bool(getattr(config, "sss_preflight", False)):
             preflight_status, preflight = _preflight_tasks(
                 tasks, client.get_json, progress_callback)
-            return _result({
-                "status": preflight_status,
+            preflight_confirmed = len(preflight.confirmed) if preflight else 0
+            return _finish({
                 "processed": len(tasks),
-                "created": len(preflight.confirmed) if preflight else 0,
-                "submitted": 0, "previewed": 0, "stopped": preflight_status != "preflight_ok",
+                "created": preflight_confirmed,
+                "submitted": 0, "previewed": 0,
+                "stopped": preflight_status != "preflight_ok",
                 "partial": False,
                 "reconciled": preflight is not None,
                 "uncertain": preflight is None,
                 "balance_total": balance_total,
                 "estimate": estimate,
                 "semantics": "preflight-only",
-            })
+            }, status=preflight_status, confirmed=preflight_confirmed,
+               unconfirmed=len(tasks) - preflight_confirmed,
+               stopped=preflight_status != "preflight_ok",
+               failed=0 if preflight is not None else len(tasks),
+               next_action=("预检只读模式，未提交新订单；确认后再正式运行"
+                            if preflight_status == "preflight_ok"
+                            else "预检未通过或对账不确定，未提交任何 POST；先处理日志风险"))
 
         _emit(progress_callback,
               f"开始下单：共 {len(tasks)} 单，并发 {max_workers} 路，读取超时 {read_timeout_s:g}s")
+        journal_meta = {
+            "delivery_date": expected_delivery_date(now).isoformat(),
+            "source": source,
+            "account": account,
+            "platform": origin,
+            "batch_started_at": time.time(),
+        }
+
+        def _journal_sink(entries: list[dict[str, Any]],
+                          meta: dict[str, Any]) -> None:
+            append_uncertain_records(authoritative_journal, journal_key, entries, meta=meta)
+            _sync_journal_mirrors()
+
+        def _journal_clear(identifiers: set[str]) -> None:
+            resolve_uncertain_records(authoritative_journal, journal_key, identifiers)
+            _sync_journal_mirrors()
+
+        def _journal_discard(identifiers: set[str]) -> None:
+            discard_uncertain_records(authoritative_journal, journal_key, identifiers)
+            _sync_journal_mirrors()
+
+        outcome: dict[str, Any] = {}
         submit_start = time.perf_counter()
         final, reconciled = _run_reconciled_submission(
             tasks,
@@ -261,6 +535,11 @@ def run_sss_job(config: Any, stop_event: Any,
             decision_callback,
             max_workers,
             relogin=relogin,
+            uncertain_sink=_journal_sink,
+            uncertain_clear=_journal_clear,
+            uncertain_discard=_journal_discard,
+            journal_meta=journal_meta,
+            outcome=outcome,
         )
         created = len(final.confirmed) if final is not None else 0
         processed = len(tasks)
@@ -278,20 +557,54 @@ def run_sss_job(config: Any, stop_event: Any,
                 _emit(progress_callback, f"重新登录后余额查询仍失败：{exc}", "WARN")
                 end_total, end_frozen = None, None
         _emit(progress_callback, "结束" + _format_balance(end_total, end_frozen))
+
+        uncertain_ids = [str(item) for item in (outcome.get("uncertain") or [])]
+        failure_ids = [str(item) for item in
+                       (outcome.get("failure_ids") or outcome.get("failures") or [])]
+        not_sent_ids = [str(item) for item in (outcome.get("not_sent") or [])]
+        success_response_ids = [str(item) for item in
+                                (outcome.get("success_responses") or [])]
+        journal_error = str(outcome.get("journal_error") or "")
         stopped = bool(stop_event.is_set())
         partial = bool(reconciled and final is not None and final.missing and not stopped)
-        if stopped:
+        reconcile_failed = bool(outcome.get("reconcile_failed")) or not reconciled
+        if journal_error:
+            status = "failed"
+            next_action = (f"{journal_error}；先人工只读核对站内订单和本地记录，"
+                           "严禁重跑本批")
+        elif reconcile_failed or final is None:
+            status = "failed"
+            next_action = ("站内对账失败，无法确认创建数量；请仅做只读核对，"
+                           "严禁重跑或补发本批")
+        elif stopped:
+            status = "stopped"
+            next_action = ("任务已停止；未确认单只做只读核对，禁止重试或重跑")
+        elif uncertain_ids or (final is not None and final.missing):
+            status = "unconfirmed"
+            next_action = ("存在未确认或“已发送未知”的订单；下一步仅做只读核对，"
+                           "禁止人工重试或重跑本批")
+        else:
+            status = "confirmed"
+            next_action = "已全部对账确认，无需重复提交"
+        failed_count = len(failure_ids) + (1 if journal_error else 0)
+
+        if status == "failed":
+            _emit(progress_callback,
+                  f"闪时送任务失败：确认 {created}/{processed}，"
+                  f"{next_action}")
+        elif status == "stopped":
             _emit(progress_callback,
                   f"闪时送任务已停止：{'已完成站内对账' if reconciled else '站内对账失败'}，"
                   f"确认 {created}/{processed}")
-        elif partial:
-            _emit(progress_callback,
-                  f"闪时送任务部分完成：确认 {created}/{processed}，"
-                  f"{processed - created} 单未完成")
-        else:
+        elif status == "confirmed":
             _emit(progress_callback,
                   f"闪时送下单完成：确认 {created}/{processed}，"
                   f"总耗时 {(time.perf_counter() - job_start):.1f} 秒")
+        else:
+            _emit(progress_callback,
+                  f"闪时送任务未确认：确认 {created}/{processed}，"
+                  f"{processed - created} 单未确认；{next_action}")
+
         result: dict[str, Any] = {
             "processed": processed,
             "created": created,
@@ -301,29 +614,20 @@ def run_sss_job(config: Any, stop_event: Any,
             "uncertain": not reconciled,
             "semantics": ("idempotency-key+reconciliation"
                           if idempotency_field else "at-least-once+reconciliation"),
+            "next_action": next_action,
         }
         if balance_total is not None:
             result["balance_total"] = balance_total
         if end_total is not None:
             result["balance_end"] = end_total
-        return _result(result)
+        return _finish(
+            result, status=status, confirmed=created, unconfirmed=processed - created,
+            stopped=stopped, failed=failed_count, next_action=next_action,
+            uncertain=len(uncertain_ids), explicit_failures=len(failure_ids),
+            not_sent=len(not_sent_ids), success_responses=len(success_response_ids),
+            reconciled=reconciled,
+        )
     finally:
+        if _batch_guard is not None:
+            _batch_guard.release()
         client.close()
-
-    if stopped:
-        _emit(progress_callback,
-              f"闪时送任务已停止：{'已完成站内对账' if reconciled else '站内对账失败'}，"
-              f"确认 {created}/{processed}")
-    elif partial:
-        _emit(progress_callback,
-              f"闪时送任务部分完成：确认 {created}/{processed}，"
-              f"{processed - created} 单未完成")
-    else:
-        _emit(progress_callback,
-              f"闪时送下单完成：确认 {created}/{processed}，"
-              f"总耗时 {(time.perf_counter() - job_start):.1f} 秒")
-    return _result({"processed": processed, "created": created,
-                    "stopped": stopped, "partial": partial, "reconciled": reconciled,
-                    "uncertain": not reconciled,
-                    "semantics": ("idempotency-key+reconciliation"
-                                  if idempotency_field else "at-least-once+reconciliation")})

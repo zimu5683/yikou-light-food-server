@@ -20,6 +20,9 @@ class _SubmitResult:
     succeeded: set[str] = field(default_factory=set)
     failures: list[tuple[str, str]] = field(default_factory=list)
     uncertain: list[tuple[str, str]] = field(default_factory=list)
+    auth: set[str] = field(default_factory=set)
+    balance: set[str] = field(default_factory=set)
+    not_sent: set[str] = field(default_factory=set)
     auth_error: str = ""
     balance_error: str = ""
     stopped: bool = False

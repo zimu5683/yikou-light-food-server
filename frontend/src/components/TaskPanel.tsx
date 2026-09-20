@@ -1,18 +1,17 @@
 /**
- * 任务面板：模式切换（下划线 tab）+ 订单处理 / 闪时送下单 表单 + 主操作条 + 更多菜单。
- * 校验结果由桥接层返回（start_order/start_sss 的 fields），前端渲染字段错误态。
+ * 任务工作台：三个语义页签 + 订单处理 / 云文档同步 / 闪时送表单。
+ *
+ * 本版重设计重点：
+ * - tab 有 aria-controls/aria-labelledby 与方向键；
+ * - 默认只展开“本次必要字段”，网址/凭据/路径等高级配置折叠；
+ * - 主流程准备→校验/预览→确认→执行→结果，不伪造后台不存在的步骤/百分比；
+ * - 固定底栏主动作 + 权威状态；真实下单与模拟执行都用明确文字二次确认；
+ * - 密码清除只在服务端成功后同步清空表单草稿。
  */
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { MoreHorizontal } from 'lucide-react'
-import { toast } from 'sonner'
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react'
+import { MoreHorizontal, ScrollText } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { CloudForm } from '@/components/CloudForm'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from '@/components/ui/dropdown-menu'
 import {
   Dialog,
   DialogContent,
@@ -21,98 +20,158 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { Switch } from '@/components/ui/switch'
 import { DateField, Field, GhostButton, Stepper, TextInput } from '@/components/fields'
 import { FileBrowserDialog } from '@/components/FileBrowserDialog'
-import { useApp, type FieldErrors, type TaskMode } from '@/hooks/appContext'
 import {
-  api,
-  isApiReady,
-  isWebTransport,
-  type OrderFormPayload,
-  type SssFormPayload,
-} from '@/lib/bridge'
+  AdvancedSection,
+  Callout,
+  ConfirmActionDialog,
+  FlowStrip,
+  SegmentedControl,
+  StatusPill,
+} from '@/components/WorkspaceUI'
+import { useApp, type FieldErrors, type TaskMode } from '@/hooks/appContext'
+import { useConfigSave } from '@/hooks/useConfigSave'
+import { api, isApiReady, isWebTransport, type OrderFormPayload, type SssDayOrders, type SssFormPayload } from '@/lib/bridge'
+import { formatISO, modeError } from '@/lib/format'
+import { toFieldErrors, validateOrderDraft, validateSssDraft } from '@/lib/formValidation'
+import { passwordResetVersion } from '@/lib/passwordDraft'
+import { classifyRequestError } from '@/lib/requestError'
+import { previewLocalKey } from '@/lib/preview'
 import { pointFromEvent } from '@/lib/reveal'
 import type { LogReveal } from '@/lib/useLogReveal'
+import { saveStateView } from '@/lib/saveState'
 import { cn } from '@/lib/utils'
-import { modeError } from '@/lib/format'
+
+const TAB_ORDER: TaskMode[] = ['order', 'cloud', 'sss']
 
 export function TaskPanel({ logReveal }: { logReveal?: LogReveal }) {
-  const { mode, setMode, workerAlive, config } = useApp()
+  const { mode, setMode, config, operationView } = useApp()
   const formKey = config ? 'ready' : 'loading'
-  return (
-    // 分栏边框由 App 外壳负责（桌面才画），这里再画一次会变成 2px
-    // min-w-0：TaskPanel 是横向 flex 子项；云同步预览里的 <pre> 长行曾把
-    // 面板的 min-content 撑到视口外，手机上右侧页签和按钮会被裁掉。
-    <section className="flex min-w-0 min-h-0 flex-1 flex-col border-border">
-      {/* 标题与模式 tab 固定不滚：手机上它们是导航，滚走就找不回来了。
-          副标题是装饰性文案，窄屏收起，把高度让给表单。 */}
-      <div className="shrink-0 px-3 pt-4 sm:px-5">
-        <h1 className="font-serif text-lg font-semibold tracking-[1px]">任务配置</h1>
-        <p className="mb-3.5 mt-0.5 hidden text-xs text-muted-foreground sm:block">
-          选择任务类型，准备好资料后启动。
-        </p>
 
-        {/* 手机上三个 tab 均分整行（触控目标更大），桌面回到左对齐的紧凑排布 */}
-        <div role="tablist" className="mb-3 flex gap-2 border-b sm:gap-[18px]">
-          <ModeTab active={mode === 'order'} onClick={() => setMode('order')}>
-            订单处理
-          </ModeTab>
-          <ModeTab active={mode === 'cloud'} onClick={() => setMode('cloud')}>
-            云文档同步
-          </ModeTab>
-          <ModeTab active={mode === 'sss'} onClick={() => setMode('sss')}>
-            闪时送下单
-          </ModeTab>
+  const focusTab = useCallback((next: TaskMode) => {
+    setMode(next)
+    window.requestAnimationFrame(() => {
+      document.getElementById(`task-tab-${next}`)?.focus()
+    })
+  }, [setMode])
+
+  const onTabKeyDown = useCallback((event: KeyboardEvent<HTMLButtonElement>, current: TaskMode) => {
+    const index = TAB_ORDER.indexOf(current)
+    let next = current
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
+      next = TAB_ORDER[(index + 1) % TAB_ORDER.length]
+    } else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
+      next = TAB_ORDER[(index - 1 + TAB_ORDER.length) % TAB_ORDER.length]
+    } else if (event.key === 'Home') {
+      next = TAB_ORDER[0]
+    } else if (event.key === 'End') {
+      next = TAB_ORDER[TAB_ORDER.length - 1]
+    } else {
+      return
+    }
+    event.preventDefault()
+    focusTab(next)
+  }, [focusTab])
+
+  return (
+    <section className="flex min-w-0 min-h-0 flex-1 flex-col border-border">
+      <div className="shrink-0 border-b bg-card/60 px-3 pt-3 sm:px-5">
+        <div className="mb-2 flex min-w-0 items-center gap-2">
+          <div className="min-w-0 flex-1">
+            <h1 className="font-serif text-base font-semibold tracking-[1px]">任务工作台</h1>
+            <p className="truncate text-[11px] text-muted-foreground">{operationView.detail}</p>
+          </div>
+          <StatusPill label={operationView.label} tone={operationView.tone} live={operationView.active} />
+        </div>
+        <div role="tablist" aria-label="任务类型" className="flex gap-1">
+          {TAB_ORDER.map((tab) => (
+            <ModeTab
+              key={tab}
+              mode={tab}
+              active={mode === tab}
+              onClick={() => setMode(tab)}
+              onKeyDown={(event) => onTabKeyDown(event, tab)}
+            />
+          ))}
         </div>
       </div>
 
-      {/* 三个表单常驻渲染（仅切换可见性）：卸载会清空各字段的 useState，
-          导致切页签后已输入内容丢失并被旧 config 重新填充。
-          每个表单自己管「字段区滚动 + 底部操作条」，所以这里必须是能撑满的
-          flex 列容器（不能是 block）。 */}
-      <div className={cn('min-w-0 min-h-0 flex-1 flex-col', mode === 'order' ? 'flex' : 'hidden')}>
+      {/* 常驻渲染三块面板：切换页签不丢草稿；hidden 保留状态且不被读屏聚焦。 */}
+      <div
+        id="task-panel-order"
+        role="tabpanel"
+        aria-labelledby="task-tab-order"
+        hidden={mode !== 'order'}
+        className="min-h-0 flex-1 flex-col data-[hidden=false]:flex"
+        data-hidden={mode !== 'order'}
+      >
         <OrderForm key={formKey} logReveal={logReveal} />
       </div>
-      <div className={cn('min-w-0 min-h-0 flex-1 flex-col', mode === 'cloud' ? 'flex' : 'hidden')}>
+      <div
+        id="task-panel-cloud"
+        role="tabpanel"
+        aria-labelledby="task-tab-cloud"
+        hidden={mode !== 'cloud'}
+        className="min-h-0 flex-1 flex-col data-[hidden=false]:flex"
+        data-hidden={mode !== 'cloud'}
+      >
         <CloudForm key={formKey} logReveal={logReveal} />
       </div>
-      <div className={cn('min-w-0 min-h-0 flex-1 flex-col', mode === 'sss' ? 'flex' : 'hidden')}>
+      <div
+        id="task-panel-sss"
+        role="tabpanel"
+        aria-labelledby="task-tab-sss"
+        hidden={mode !== 'sss'}
+        className="min-h-0 flex-1 flex-col data-[hidden=false]:flex"
+        data-hidden={mode !== 'sss'}
+      >
         <SssForm key={formKey} logReveal={logReveal} />
       </div>
-      {workerAlive && (
-        <p className="shrink-0 border-t px-3 py-1.5 text-[11px] text-muted-foreground sm:px-5">
-          任务运行中，开始与表单暂不可用。
-        </p>
-      )}
     </section>
   )
 }
 
 function ModeTab({
+  mode,
   active,
   onClick,
-  children,
+  onKeyDown,
 }: {
+  mode: TaskMode
   active: boolean
   onClick: () => void
-  children: ReactNode
+  onKeyDown: (event: KeyboardEvent<HTMLButtonElement>) => void
 }) {
+  const labels: Record<TaskMode, string> = {
+    order: '订单处理',
+    cloud: '云文档同步',
+    sss: '闪时送下单',
+  }
   return (
     <button
+      id={`task-tab-${mode}`}
+      type="button"
       role="tab"
       aria-selected={active}
+      aria-controls={`task-panel-${mode}`}
+      tabIndex={active ? 0 : -1}
       onClick={onClick}
+      onKeyDown={onKeyDown}
       className={cn(
-        // 手机：均分整行 + ≥44px 触控高度；桌面：保持规范里的紧凑下划线 tab
-        'relative flex min-h-10 flex-1 items-center justify-center pb-2 pt-1.5 text-[13.5px] font-medium transition-colors',
-        'sm:min-h-0 sm:flex-none sm:justify-start',
-        active ? 'font-semibold text-foreground' : 'text-muted-foreground hover:text-foreground',
-        active &&
-          "after:absolute after:inset-x-0 after:-bottom-px after:h-0.5 after:bg-primary after:content-['']",
+        'relative min-h-10 flex-1 rounded-t-md px-2 pb-2 pt-1.5 text-[13px] font-medium transition-colors sm:min-h-9',
+        active ? 'bg-background text-foreground' : 'text-muted-foreground hover:bg-secondary/60 hover:text-foreground',
+        active && "after:absolute after:inset-x-2 after:bottom-0 after:h-0.5 after:rounded-full after:bg-primary after:content-['']",
       )}
     >
-      {children}
+      {labels[mode]}
     </button>
   )
 }
@@ -122,61 +181,57 @@ function ModeTab({
 /* ------------------------------------------------------------------ */
 
 function OrderForm({ logReveal }: { logReveal?: LogReveal }) {
-  const { config, passwords, startOrder, workerAlive, isAdmin } = useApp()
+  const { config, passwords, startOrder, workerAlive, operationActive, operationView, isAdmin, passwordReset } = useApp()
+  const orderResetVersion = passwordResetVersion(passwordReset, 'order')
   const [url, setUrl] = useState(config?.target_url ?? '')
   const [phone, setPhone] = useState(config?.phone_number ?? '')
-  const [password, setPassword] = useState(passwords.order ?? '')
+  const [passwordDraft, setPasswordDraft] = useState({
+    value: passwords.order ?? '',
+    version: orderResetVersion,
+  })
+  const password = passwordDraft.version === orderResetVersion ? passwordDraft.value : ''
+  const setPassword = (value: string) => setPasswordDraft({ value, version: orderResetVersion })
   const [excel, setExcel] = useState(config?.excel_path ?? '')
   const [date, setDate] = useState(config?.order_date ?? '')
   const [count, setCount] = useState<number | null>(config?.order_count ?? null)
   const [remember, setRemember] = useState(true)
   const [fields, setFields] = useState<FieldErrors | null>(null)
   const [busy, setBusy] = useState(false)
-  // 网页版的服务端文件浏览器：null 表示未打开。
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [advancedOpen, setAdvancedOpen] = useState(() =>
+    Boolean(!config?.target_url || !config?.phone_number || !config?.excel_path),
+  )
   const [browser, setBrowser] = useState<'open' | 'save' | null>(null)
 
-  // 字段停止变化后自动落盘（切页签/退出重进都从后端还原，配置不丢失）。
-  const scheduleSave = useDebouncedSave(() => {
-    if (!isApiReady()) return
-    api()
-      .save_order_config({ url, phone, excel, date, count })
-      .catch(() => {})
-  })
+  const save = useCallback(async () => {
+    if (!isWebTransport() || !isApiReady()) {
+      return { ok: false, reason: '后端未连接，配置尚未保存' }
+    }
+    return api().save_order_config({ url, phone, excel, date, count })
+  }, [url, phone, excel, date, count])
+  const { state: saveState, schedule, retry } = useConfigSave(save)
   const firstSave = useRef(true)
   useEffect(() => {
     if (firstSave.current) {
       firstSave.current = false
       return
     }
-    scheduleSave()
-  }, [url, phone, excel, date, count, scheduleSave])
+    schedule()
+  }, [url, phone, excel, date, count, schedule])
 
+  const advancedMissing = Boolean(!config?.target_url || !config?.phone_number || !config?.excel_path)
   const excelError = modeError(fields, 'excel')
-  const excelOk = !excelError && excel && !fields ? '文件已准备' : undefined
-
-  async function onStart() {
-    if (busy) return
-    setBusy(true)
-    setFields(null)
-    try {
-      // 只提交当前表单字段；桌面/浏览器时代的兼容字段已经删除。
-      const payload: OrderFormPayload = { url, phone, password, excel, date, count: count === null ? '' : String(count), remember }
-      const errors = await startOrder(payload)
-      if (errors) setFields(errors)
-    } finally {
-      setBusy(false)
-    }
-  }
 
   function applyExcelResult(result: { path: string; error: string }) {
-    if (result.path) setExcel(result.path)
+    if (result.path) {
+      setExcel(result.path)
+      setFields((prev) => ({ ...prev, excel: undefined }))
+    }
     if (result.error) setFields((prev) => ({ ...prev, excel: { message: result.error } }))
   }
 
   async function chooseFile() {
     if (!isApiReady()) return
-    // 网页版走服务端文件浏览器：任务在手机上跑，Excel 也在手机上，
-    // 浏览器自己的文件选择器只能拿到客户端文件，用不上。
     if (isWebTransport()) {
       setBrowser('open')
       return
@@ -193,7 +248,6 @@ function OrderForm({ logReveal }: { logReveal?: LogReveal }) {
     applyExcelResult(await api().new_template('order'))
   }
 
-  /** 文件浏览器选中路径后回填，并让后端按同一套规则校验/落盘。 */
   async function onBrowserPick(path: string) {
     const picked = browser
     setBrowser(null)
@@ -204,90 +258,137 @@ function OrderForm({ logReveal }: { logReveal?: LogReveal }) {
     applyExcelResult(await api().choose_excel('order', path))
   }
 
+  function validateAndPreview() {
+    const errors = validateOrderDraft({ isAdmin, url, phone, password, excel, date, count, today: formatISO(new Date()) })
+    if (Object.keys(errors).length > 0) {
+      setFields(toFieldErrors(errors))
+      if (errors.url || errors.phone || errors.password || errors.excel) setAdvancedOpen(true)
+      return
+    }
+    setFields(null)
+    setConfirmOpen(true)
+  }
+
+  async function performStart() {
+    setBusy(true)
+    try {
+      const payload: OrderFormPayload = {
+        url, phone, password, excel, date,
+        count: count === null ? '' : String(count),
+        remember,
+      }
+      const errors = await startOrder(payload)
+      if (errors && Object.keys(errors).length > 0) {
+        setFields(errors)
+        setConfirmOpen(false)
+        if (errors.url || errors.phone || errors.password || errors.excel) setAdvancedOpen(true)
+        return
+      }
+      setConfirmOpen(false)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const resultTone = operationView.tone === 'danger' ? 'danger' : operationView.tone === 'warning' ? 'warning' : 'neutral'
+  const flow: Array<{ key: string; label: string; state: 'todo' | 'active' | 'done' | 'warning' | 'error'; detail?: string }> = [
+    { key: 'prepare', label: '准备', state: 'done' },
+    { key: 'validate', label: '校验', state: confirmOpen ? 'done' : 'active' },
+    { key: 'confirm', label: '确认', state: confirmOpen ? 'active' : 'todo' },
+    { key: 'run', label: '执行', state: workerAlive ? 'active' : operationView.key === 'success' ? 'done' : 'todo' },
+    {
+      key: 'result',
+      label: '结果',
+      state: operationView.key === 'error' ? 'error' : operationView.needsReview ? 'warning' : operationView.key === 'success' ? 'done' : 'todo',
+      detail: operationView.detail,
+    },
+  ]
+
   return (
     <div className="flex min-w-0 min-h-0 flex-1 flex-col">
-      {/* 字段区自己滚动，操作条是它的兄弟节点（真页脚）。
-          原来操作条用 sticky bottom-0 待在滚动区内部：内容不足一屏时它不会被
-          撑到底部，下方就露出滚动容器的空白（「更多」下面那块空缺）；滚动时
-          表单内容又会从它后面滑过。做成页脚后这两种情况都不存在。 */}
-      <div className="scroll-contain min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-1 sm:px-5">
+      <div className="scroll-contain min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-3 sm:px-5">
+        <FlowStrip steps={flow} label="订单处理流程" />
+
+        <Callout tone={resultTone} title={operationView.label}>
+          {operationView.detail}
+        </Callout>
+
         {isAdmin && (
-          <>
-        <Field label="管理网址" htmlFor="order-url" error={modeError(fields, 'url')} helper="用于登录管理后台">
-          <TextInput
-            id="order-url"
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://example.com/admin"
-          />
-        </Field>
-
-        <Field label="手机号 / 账号" htmlFor="order-phone" error={modeError(fields, 'phone')} helper="用于登录管理后台">
-          <TextInput
-            id="order-phone"
-            value={phone}
-            onChange={(e) => setPhone(e.target.value)}
-          />
-        </Field>
-
-        <Field label="登录密码" htmlFor="order-password" error={modeError(fields, 'password')} helper="密码仅保存在系统凭据管理器中">
-          <TextInput
-            id="order-password"
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-          />
-        </Field>
-
-        <Field label="Excel 文件" htmlFor="order-excel" error={excelError} okMessage={excelOk} helper="支持 .xlsx / .xlsm">
-          <div className="flex gap-1.5">
-            <TextInput
-              id="order-excel"
-              value={excel}
-              onChange={(e) => setExcel(e.target.value)}
-              state={excel && !excelError ? 'valid' : undefined}
-              className="min-w-0 flex-1"
-              placeholder="选择排单 .xlsx 文件"
-            />
-            <GhostButton onClick={chooseFile}>选择文件</GhostButton>
-            <GhostButton onClick={newTemplate}>新建模板</GhostButton>
-          </div>
-        </Field>
-
-          </>
+          <AdvancedSection
+            id="order-advanced"
+            title="管理网址与登录凭据"
+            summary={advancedMissing ? '首次使用需先补齐，否则无法启动' : '已配置，可展开修改'}
+            open={advancedOpen}
+            onOpenChange={setAdvancedOpen}
+            notice={advancedMissing ? '缺少网址、账号或排单表路径。首次使用请先完成这些必填配置；系统会按后端最终校验为准。' : undefined}
+          >
+            <Field label="管理网址" htmlFor="order-url" error={modeError(fields, 'url')} helper="用于登录管理后台">
+              <TextInput id="order-url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://example.com/admin" autoComplete="url" />
+            </Field>
+            <Field label="手机号 / 账号" htmlFor="order-phone" error={modeError(fields, 'phone')} helper="用于登录管理后台">
+              <TextInput id="order-phone" value={phone} onChange={(e) => setPhone(e.target.value)} autoComplete="username" />
+            </Field>
+            <Field label="登录密码" htmlFor="order-password" error={modeError(fields, 'password')} helper="只保存在系统凭据管理器">
+              <TextInput id="order-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
+            </Field>
+            <Field label="Excel 排单文件" htmlFor="order-excel" error={excelError} helper="支持 .xlsx / .xlsm">
+              <div className="flex flex-wrap gap-1.5">
+                <TextInput id="order-excel" value={excel} onChange={(e) => setExcel(e.target.value)} className="min-w-[12rem] flex-1" placeholder="选择排单 .xlsx 文件" />
+                <GhostButton onClick={() => void chooseFile()}>选择文件</GhostButton>
+                <GhostButton onClick={() => void newTemplate()}>新建模板</GhostButton>
+              </div>
+            </Field>
+          </AdvancedSection>
         )}
-        {/* 非管理员：凭据与文件路径一律不显示 —— 任务按管理员预设的账号运行。
-            真正的拦截在后端（配置脱敏 + 方法白名单），这里只是不显示。 */}
         {!isAdmin && (
-          <p className="mb-4 mt-1 rounded-[4px] border border-border bg-card px-3 py-2 text-[12px] text-muted-foreground">
-            本账号按管理员预设的账号与文件运行，无需填写管理网址/手机号/密码/Excel。
-          </p>
+          <Callout tone="neutral" title="按管理员预设运行">
+            本账号无需填写管理网址、账号、密码和文件路径；任务会使用管理员预设配置。真正的强制拦截在服务端。
+          </Callout>
         )}
-        <Field label="目标日期" error={modeError(fields, 'date')} helper="留空默认今天；只允许选择今天或过去日期">
-          <DateField value={date} onChange={setDate} invalid={Boolean(modeError(fields, 'date'))} />
+
+        <Field label="目标日期" htmlFor="order-date" error={modeError(fields, 'date')} helper="留空默认今天；只允许今天或过去日期">
+          <DateField value={date} onChange={setDate} invalid={Boolean(modeError(fields, 'date'))} label="选择目标日期" />
+        </Field>
+        <Field label="待处理订单数" htmlFor="order-count" error={modeError(fields, 'count')} helper="留空 = 处理全部订单">
+          <Stepper id="order-count" value={count} onChange={setCount} invalid={Boolean(modeError(fields, 'count'))} />
         </Field>
 
-        <Field label="待处理订单数" error={modeError(fields, 'count')}>
-          <Stepper value={count} onChange={setCount} invalid={Boolean(modeError(fields, 'count'))} />
-          <p className="mt-1 text-[11px] text-muted-foreground">留空=全部订单</p>
-        </Field>
+        {isAdmin && (
+          <div className="mb-3.5 flex items-center gap-2 text-[12px] text-muted-foreground">
+            <Switch checked={remember} onCheckedChange={setRemember} aria-label="保存到系统凭据管理器" />
+            <span>保存到系统凭据管理器</span>
+          </div>
+        )}
+      </div>
 
-        <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
-          <Switch checked={remember} onCheckedChange={setRemember} aria-label="保存到系统凭据管理器" />
-          <span>保存到系统凭据管理器</span>
-        </div>
-        </div>
+      <BottomDock
+        status={<SaveStatus state={saveState} onRetry={retry} />}
+        primaryLabel={operationActive ? '已有操作进行中' : '开始处理'}
+        primaryDisabled={operationActive}
+        primaryBusy={busy}
+        onPrimary={validateAndPreview}
+        workerAlive={workerAlive}
+        logReveal={logReveal}
+        tools={<ToolsMenu mode="order" />}
+      />
 
-      <BottomDock>
-        <ActionBar
-          startLabel="开始处理"
-          onStart={onStart}
-          startBusy={busy}
-          startDisabled={workerAlive}
-          logReveal={logReveal}
-        />
-        <ToolsMenu mode="order" />
-      </BottomDock>
+      <ConfirmActionDialog
+        open={confirmOpen}
+        onOpenChange={setConfirmOpen}
+        title="确认开始订单处理"
+        description="将按当前配置读取订单并写入排单表；这不是闪时送真实下单，但仍会修改服务端文件。"
+        details={<StartSummary items={[
+          ['目标日期', date || '今天'],
+          ['处理数量', count === null ? '全部' : `${count} 条`],
+          ['排单表', excel || '使用已配置路径'],
+          ['登录账号', phone || '使用服务端预设'],
+        ]} />}
+        acknowledge="我确认以上信息正确，并了解该操作会读取订单并写入排单表"
+        confirmLabel="确认开始处理"
+        busy={busy}
+        onConfirm={performStart}
+      />
+
       {browser && (
         <FileBrowserDialog
           open
@@ -305,105 +406,113 @@ function OrderForm({ logReveal }: { logReveal?: LogReveal }) {
 /* 闪时送下单                                                           */
 /* ------------------------------------------------------------------ */
 
+type SssExecutionMode = 'dry_run' | 'preflight' | 'live'
+
 function SssForm({ logReveal }: { logReveal?: LogReveal }) {
-  const { config, passwords, startSss, workerAlive, isAdmin } = useApp()
+  const {
+    config, passwords, startSss, workerAlive, operationActive, operationView, isAdmin, passwordReset,
+  } = useApp()
+  const sssResetVersion = passwordResetVersion(passwordReset, 'sss')
   const [url, setUrl] = useState(config?.sss_url ?? '')
   const [account, setAccount] = useState(config?.sss_account ?? '')
-  const [password, setPassword] = useState(passwords.sss ?? '')
+  const [passwordDraft, setPasswordDraft] = useState({
+    value: passwords.sss ?? '',
+    version: sssResetVersion,
+  })
+  const password = passwordDraft.version === sssResetVersion ? passwordDraft.value : ''
+  const setPassword = (value: string) => setPasswordDraft({ value, version: sssResetVersion })
   const [excel, setExcel] = useState(config?.sss_excel_path ?? '')
   const [orderSource, setOrderSource] = useState<'wps' | 'excel'>(config?.sss_order_source ?? 'wps')
   const [productName, setProductName] = useState(config?.sss_product_name ?? '轻食')
-  // 固定地址配置当前不在界面中编辑，直接由 config 派生，避免未使用 setter。
+  const [executionMode, setExecutionMode] = useState<SssExecutionMode>(() => {
+    if (config?.sss_dry_run) return 'dry_run'
+    if (config?.sss_preflight) return 'preflight'
+    return 'live'
+  })
+  const [remember, setRemember] = useState(true)
+  const [fields, setFields] = useState<FieldErrors | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [advancedOpen, setAdvancedOpen] = useState(() =>
+    Boolean(!config?.sss_url || !config?.sss_account || !config?.sss_excel_path),
+  )
+  const [browser, setBrowser] = useState<'open' | 'save' | null>(null)
+  const [dayPreview, setDayPreview] = useState<SssDayOrders | null>(null)
+  const [dayKey, setDayKey] = useState('')
+  const [dayLoading, setDayLoading] = useState(false)
+  const [dayError, setDayError] = useState('')
+
   const commonAddress = config?.sss_common_address ?? ''
   const useFixedAddress = config?.sss_use_fixed_address ?? true
   const fixedLnt = String(config?.sss_fixed_lnt ?? '119.728224')
   const fixedLat = String(config?.sss_fixed_lat ?? '30.256632')
   const fixedAreaCode = config?.sss_fixed_area_code ?? '330110'
   const fixedAddressDetail = config?.sss_fixed_address_detail ?? '浙江农林大学东湖校区'
-  const [remember, setRemember] = useState(true)
-  const [dryRun, setDryRun] = useState(config?.sss_dry_run ?? true)
-  const [preflight, setPreflight] = useState(config?.sss_preflight ?? false)
-  const [fields, setFields] = useState<FieldErrors | null>(null)
-  const [busy, setBusy] = useState(false)
-  const [dayBusy, setDayBusy] = useState(false)
-  // 网页版的服务端文件浏览器：null 表示未打开。
-  const [browser, setBrowser] = useState<'open' | 'save' | null>(null)
 
-  // 字段停止变化后自动落盘（切页签/退出重进都从后端还原，配置不丢失）。
-  const scheduleSave = useDebouncedSave(() => {
-    if (!isApiReady()) return
-    api()
-      .save_sss_config({
-        url,
-        account,
-        excel,
-        order_source: orderSource,
-        product_name: productName,
-        common_address: commonAddress,
-        use_fixed_address: useFixedAddress,
-        fixed_lnt: fixedLnt,
-        fixed_lat: fixedLat,
-        fixed_area_code: fixedAreaCode,
-        fixed_address_detail: fixedAddressDetail,
-        dry_run: dryRun,
-        preflight,
-      })
-      .catch(() => {})
-  })
+  const dryRun = executionMode === 'dry_run'
+  const preflight = executionMode === 'preflight'
+
+  const save = useCallback(async () => {
+    if (!isWebTransport() || !isApiReady()) {
+      return { ok: false, reason: '后端未连接，配置尚未保存' }
+    }
+    return api().save_sss_config({
+      url, account, excel, order_source: orderSource, product_name: productName,
+      common_address: commonAddress, use_fixed_address: useFixedAddress,
+      fixed_lnt: fixedLnt, fixed_lat: fixedLat, fixed_area_code: fixedAreaCode,
+      fixed_address_detail: fixedAddressDetail, dry_run: dryRun, preflight,
+    })
+  }, [
+    url, account, excel, orderSource, productName, commonAddress, useFixedAddress,
+    fixedLnt, fixedLat, fixedAreaCode, fixedAddressDetail, dryRun, preflight,
+  ])
+  const { state: saveState, schedule, retry } = useConfigSave(save)
   const firstSave = useRef(true)
   useEffect(() => {
     if (firstSave.current) {
       firstSave.current = false
       return
     }
-    scheduleSave()
+    schedule()
   }, [
-    url, account, excel, productName, commonAddress, useFixedAddress,
-    fixedLnt, fixedLat, fixedAreaCode, fixedAddressDetail, dryRun, preflight,
-    orderSource,
-    scheduleSave,
+    url, account, excel, orderSource, productName, commonAddress, useFixedAddress,
+    fixedLnt, fixedLat, fixedAreaCode, fixedAddressDetail, dryRun, preflight, schedule,
   ])
 
+  const currentDayKey = previewLocalKey({
+    url, account, orderSource, productName, executionMode,
+  })
+  const dayPreviewFresh = Boolean(dayPreview?.ok && dayKey === currentDayKey)
+  const needsDayPreview = orderSource === 'wps' && !dayPreviewFresh
+  const advancedMissing = Boolean(!config?.sss_url || !config?.sss_account || !config?.sss_excel_path)
   const excelError = modeError(fields, 'excel')
-  const excelOk = !excelError && excel && !fields ? '文件已准备' : undefined
 
-  async function onStart() {
-    if (busy) return
-    setBusy(true)
-    setFields(null)
+  async function readDayOrders() {
+    if (dayLoading || operationActive) return
+    setDayLoading(true)
+    setDayError('')
     try {
-      const payload: SssFormPayload = {
-        url,
-        account,
-        password,
-        excel,
-        order_source: orderSource,
-        product_name: productName,
-        common_address: commonAddress,
-        use_fixed_address: useFixedAddress,
-        fixed_lnt: fixedLnt,
-        fixed_lat: fixedLat,
-        fixed_area_code: fixedAreaCode,
-        fixed_address_detail: fixedAddressDetail,
-        remember,
-        dry_run: dryRun,
-        preflight,
-      }
-      const errors = await startSss(payload)
-      if (errors) setFields(errors)
+      const result = await api().sss_day_orders()
+      setDayPreview(result)
+      setDayKey(currentDayKey)
+      if (!result.ok) setDayError(result.reason || '读取云端当天名单失败')
+    } catch (error) {
+      setDayError(classifyRequestError(error).detail)
     } finally {
-      setBusy(false)
+      setDayLoading(false)
     }
   }
 
   function applyExcelResult(result: { path: string; error: string }) {
-    if (result.path) setExcel(result.path)
+    if (result.path) {
+      setExcel(result.path)
+      setFields((prev) => ({ ...prev, excel: undefined }))
+    }
     if (result.error) setFields((prev) => ({ ...prev, excel: { message: result.error } }))
   }
 
   async function chooseFile() {
     if (!isApiReady()) return
-    // 网页版走服务端文件浏览器（同订单处理页签：选的是手机上的路径）。
     if (isWebTransport()) {
       setBrowser('open')
       return
@@ -420,7 +529,6 @@ function SssForm({ logReveal }: { logReveal?: LogReveal }) {
     applyExcelResult(await api().new_template('sss'))
   }
 
-  /** 文件浏览器选中路径后回填，并让后端按同一套规则校验/落盘。 */
   async function onBrowserPick(path: string) {
     const picked = browser
     setBrowser(null)
@@ -431,163 +539,210 @@ function SssForm({ logReveal }: { logReveal?: LogReveal }) {
     applyExcelResult(await api().choose_excel('sss', path))
   }
 
-  /** 读取云端当天名单（东湖午餐/东湖晚餐）并留档，不下单。 */
-  async function readDayOrders() {
-    if (dayBusy) return
-    setDayBusy(true)
+  function validateAndConfirm() {
+    if (needsDayPreview) {
+      void readDayOrders()
+      return
+    }
+    const errors = validateSssDraft({ isAdmin, url, account, password, excel, orderSource })
+    if (Object.keys(errors).length > 0) {
+      setFields(toFieldErrors(errors))
+      if (errors.url || errors.account || errors.password || errors.excel) setAdvancedOpen(true)
+      return
+    }
+    setFields(null)
+    setConfirmOpen(true)
+  }
+
+  async function performStart() {
+    setBusy(true)
     try {
-      const result = await api().sss_day_orders()
-      if (!result.ok) {
-        toast.error(result.reason ?? '读取云端当天名单失败', { duration: 8000 })
+      const payload: SssFormPayload = {
+        url, account, password, excel, order_source: orderSource,
+        product_name: productName, common_address: commonAddress,
+        use_fixed_address: useFixedAddress, fixed_lnt: fixedLnt, fixed_lat: fixedLat,
+        fixed_area_code: fixedAreaCode, fixed_address_detail: fixedAddressDetail,
+        remember, dry_run: dryRun, preflight,
+      }
+      const errors = await startSss(payload)
+      if (errors && Object.keys(errors).length > 0) {
+        setFields(errors)
+        setConfirmOpen(false)
+        if (errors.url || errors.account || errors.password || errors.excel) setAdvancedOpen(true)
         return
       }
-      const parts = Object.entries(result.meals ?? {}).map(([name, info]) =>
-        info.skipped
-          ? `${name}不下单（${info.reason || '没有当天列'}）`
-          : `${name} ${info.orders} 人（标 1 共 ${info.marked}，大西/小 ${info.skipped_address} 人不送）`,
-      )
-      toast.success(
-        `云端当天名单 ${result.target_date ?? ''} ${result.date_text ?? ''}：${parts.join('；') || '没有数据'}`,
-        { duration: 8000 },
-      )
-      if (result.archive_error) {
-        toast.error(`留档 Excel 写入失败：${result.archive_error}`, { duration: 8000 })
-      }
-    } catch (error) {
-      toast.error(`读取失败：${String(error)}`)
+      setConfirmOpen(false)
     } finally {
-      setDayBusy(false)
+      setBusy(false)
     }
   }
 
+  const modeLabel = executionMode === 'live' ? '正式下单' : executionMode === 'preflight' ? '预检' : '模拟执行'
+  const modeTone = executionMode === 'live' ? 'danger' : executionMode === 'preflight' ? 'warning' : 'success'
+  const primaryLabel = operationActive
+    ? '已有操作进行中'
+    : needsDayPreview
+      ? (dayLoading ? '正在读取云端名单…' : '先读取云端名单')
+      : executionMode === 'live'
+        ? '开始正式下单'
+        : executionMode === 'preflight'
+          ? '开始预检'
+          : '开始模拟执行'
+  const flow = [
+    { key: 'prepare', label: '准备', state: 'done' as const },
+    {
+      key: 'preview',
+      label: orderSource === 'wps' ? '名单预览' : '文件校验',
+      state: orderSource === 'wps'
+        ? (needsDayPreview ? 'active' as const : 'done' as const)
+        : (confirmOpen ? 'done' as const : 'active' as const),
+    },
+    { key: 'confirm', label: '确认', state: confirmOpen ? 'active' as const : 'todo' as const },
+    { key: 'run', label: '执行', state: workerAlive ? 'active' as const : operationView.key === 'success' ? 'done' as const : 'todo' as const },
+    {
+      key: 'result', label: '结果',
+      state: operationView.key === 'error' ? 'error' as const : operationView.needsReview ? 'warning' as const : operationView.key === 'success' ? 'done' as const : 'todo' as const,
+      detail: operationView.detail,
+    },
+  ]
+
   return (
     <div className="flex min-w-0 min-h-0 flex-1 flex-col">
-      {/* 与订单处理页签同构：字段区滚动 + 操作条做真页脚（不再 sticky） */}
-      <div className="scroll-contain min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-1 sm:px-5">
+      <div className="scroll-contain min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-3 sm:px-5">
+        <FlowStrip steps={flow} label="闪时送执行流程" />
+
+        <Callout tone={modeTone === 'danger' ? 'danger' : modeTone === 'warning' ? 'warning' : 'success'} title={`本次执行方式：${modeLabel}`}>
+          {executionMode === 'live'
+            ? '正式下单会真实创建订单并可能产生费用/占用余额。'
+            : executionMode === 'preflight'
+              ? '预检会登录并检查余额/已有单，但不会创建订单。'
+              : '模拟执行只组装并预览下单报文，不会创建真实订单。'}
+        </Callout>
+
+        <Callout tone={operationView.tone === 'danger' ? 'danger' : operationView.tone === 'warning' ? 'warning' : 'neutral'} title={operationView.label}>
+          {operationView.detail}
+        </Callout>
+
         {isAdmin && (
-          <>
-        <Field label="闪时送网址" htmlFor="sss-url" error={modeError(fields, 'url')} helper="闪时送下单平台地址">
-          <TextInput id="sss-url" value={url} onChange={(e) => setUrl(e.target.value)} />
-        </Field>
+          <AdvancedSection
+            id="sss-advanced"
+            title="闪时送网址、账号与文件路径"
+            summary={advancedMissing ? '首次使用需先补齐' : '已配置，可展开修改'}
+            open={advancedOpen}
+            onOpenChange={setAdvancedOpen}
+            notice={advancedMissing ? '缺少网址、账号或本地 Excel 路径。云端名单模式可暂时留空 Excel；本地名单模式必须选择文件。' : undefined}
+          >
+            <Field label="闪时送网址" htmlFor="sss-url" error={modeError(fields, 'url')} helper="闪时送下单平台地址">
+              <TextInput id="sss-url" value={url} onChange={(e) => setUrl(e.target.value)} autoComplete="url" />
+            </Field>
+            <Field label="闪时送账号" htmlFor="sss-account" error={modeError(fields, 'account')} helper="用于登录闪时送平台">
+              <TextInput id="sss-account" value={account} onChange={(e) => setAccount(e.target.value)} autoComplete="username" />
+            </Field>
+            <Field label="登录密码" htmlFor="sss-password" error={modeError(fields, 'password')} helper="只保存在系统凭据管理器">
+              <TextInput id="sss-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
+            </Field>
+            <Field
+              label="本地名单 Excel（本地模式必填）"
+              htmlFor="sss-excel"
+              error={excelError}
+              helper={orderSource === 'wps' ? '云端模式仅作为留档文件，可留空' : '午餐/晚餐两表：A=姓名 B=门牌号 C=电话'}
+            >
+              <div className="flex flex-wrap gap-1.5">
+                <TextInput id="sss-excel" value={excel} onChange={(e) => setExcel(e.target.value)} className="min-w-[12rem] flex-1" placeholder="选择闪时送 .xlsx 文件" />
+                <GhostButton onClick={() => void chooseFile()}>选择文件</GhostButton>
+                <GhostButton onClick={() => void newTemplate()}>新建模板</GhostButton>
+              </div>
+            </Field>
+            <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
+              <Switch checked={remember} onCheckedChange={setRemember} aria-label="保存到系统凭据管理器" />
+              <span>保存到系统凭据管理器</span>
+            </div>
+          </AdvancedSection>
+        )}
 
-        <Field label="闪时送账号" htmlFor="sss-account" error={modeError(fields, 'account')} helper="用于登录闪时送平台">
-          <TextInput id="sss-account" value={account} onChange={(e) => setAccount(e.target.value)} />
-        </Field>
-
-        <Field label="登录密码" htmlFor="sss-password" error={modeError(fields, 'password')} helper="密码仅保存在系统凭据管理器中">
-          <TextInput
-            id="sss-password"
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
+        <Field label="执行方式" helper="正式与模拟使用不同确认文字，不能仅靠按钮颜色">
+          <SegmentedControl
+            value={executionMode}
+            onChange={setExecutionMode}
+            label="闪时送执行方式"
+            disabled={operationActive}
+            options={[
+              { value: 'dry_run', label: '模拟执行', description: '不创建订单，只预览报文', tone: 'neutral' },
+              { value: 'preflight', label: '预检', description: '登录检查，不创建订单', tone: 'warning' },
+              { value: 'live', label: '正式下单', description: '真实创建订单，可能产生费用', tone: 'danger' },
+            ]}
           />
         </Field>
 
-          </>
-        )}
-        {!isAdmin && (
-          <p className="mb-4 mt-1 rounded-[4px] border border-border bg-card px-3 py-2 text-[12px] text-muted-foreground">
-            本账号按管理员预设的闪时送账号与文件运行，无需填写网址/账号/密码。
-          </p>
-        )}
-        <Field
-          label="名单来源"
-          helper={
-            orderSource === 'wps'
-              ? '每次下单前读取东湖午餐/东湖晚餐「当天列标 1」的人；地址是大西/小的不下单'
-              : '读取《闪时送.xlsx》里的名单（人工准备），不做云端读取'
-          }
-        >
-          <div className="flex gap-1.5" role="group" aria-label="名单来源">
-            <SourceButton
-              active={orderSource === 'wps'}
-              onClick={() => setOrderSource('wps')}
-            >
-              云端当天名单
-            </SourceButton>
-            <SourceButton
-              active={orderSource === 'excel'}
-              onClick={() => setOrderSource('excel')}
-            >
-              本地 Excel
-            </SourceButton>
-          </div>
-        </Field>
-
-        <Field
-          label="订单 Excel 文件"
-          htmlFor="sss-excel"
-          error={excelError}
-          okMessage={excelOk}
-          helper={
-            orderSource === 'wps'
-              ? '云端模式：作为当天名单的留档文件，可留空'
-              : '午餐/晚餐两表，A=姓名 B=门牌号 C=电话'
-          }
-        >
-          <div className="flex gap-1.5">
-            <TextInput
-              id="sss-excel"
-              value={excel}
-              onChange={(e) => setExcel(e.target.value)}
-              state={excel && !excelError ? 'valid' : undefined}
-              className="min-w-0 flex-1"
-              placeholder="选择闪时送 .xlsx 文件"
-            />
-            <GhostButton onClick={chooseFile}>选择文件</GhostButton>
-            <GhostButton onClick={newTemplate}>新建模板</GhostButton>
-          </div>
+        <Field label="名单来源" helper="云端模式会先读取东湖午餐/晚餐当天标 1 的人；本地模式读取 Excel">
+          <SegmentedControl
+            value={orderSource}
+            onChange={(value) => setOrderSource(value)}
+            label="名单来源"
+            options={[
+              { value: 'wps', label: '云端当天名单', description: '读取 WPS 当天标 1' },
+              { value: 'excel', label: '本地 Excel', description: '人工准备名单文件' },
+            ]}
+          />
         </Field>
 
         {orderSource === 'wps' && (
-          <div className="mb-4 -mt-1 flex items-center gap-2">
-            <GhostButton onClick={readDayOrders} disabled={dayBusy || workerAlive}>
-              {dayBusy ? '读取中…' : '读取云端当天名单'}
-            </GhostButton>
-            <span className="text-[11px] text-muted-foreground">
-              只读取并写留档，不下单
-            </span>
+          <div className="mb-3.5">
+            {needsDayPreview ? (
+              <Callout tone={dayError ? 'danger' : 'warning'} title={dayError ? '名单预览失败' : '名单预览已失效或尚未读取'}>
+                {dayError || (dayPreview ? '配置或执行方式已变化，请重新读取名单预览。' : '执行前需要先只读读取云端当天名单，生成结构化预览。')}
+                <button type="button" className="mt-1.5 block text-left font-medium text-primary underline" disabled={dayLoading || operationActive} onClick={() => void readDayOrders()}>
+                  {dayLoading ? '正在读取…' : '重新读取云端名单'}
+                </button>
+              </Callout>
+            ) : dayPreview ? (
+              <DayPreviewCard preview={dayPreview} />
+            ) : null}
           </div>
         )}
 
         <Field label="商品名称" htmlFor="sss-product" helper="下单时商品“名称”的默认值">
-          <TextInput
-            id="sss-product"
-            value={productName}
-            onChange={(e) => setProductName(e.target.value)}
-          />
+          <TextInput id="sss-product" value={productName} onChange={(e) => setProductName(e.target.value)} />
         </Field>
+      </div>
 
-        <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
-          <Switch checked={remember} onCheckedChange={setRemember} aria-label="保存到系统凭据管理器" />
-          <span>保存到系统凭据管理器</span>
-        </div>
+      <BottomDock
+        status={<SaveStatus state={saveState} onRetry={retry} />}
+        primaryLabel={primaryLabel}
+        primaryDisabled={operationActive || dayLoading}
+        primaryBusy={busy}
+        onPrimary={validateAndConfirm}
+        workerAlive={workerAlive}
+        logReveal={logReveal}
+        tools={<ToolsMenu mode="sss" />}
+      />
 
-        <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
-          <Switch checked={dryRun} onCheckedChange={setDryRun} aria-label="干跑：只预览报文，不创建订单" />
-          <span>干跑：只预览报文，不创建订单</span>
-        </div>
+      <ConfirmActionDialog
+        open={confirmOpen}
+        onOpenChange={setConfirmOpen}
+        title={`确认${modeLabel}`}
+        description={executionMode === 'live'
+          ? '这是真实下单操作。服务端会创建订单，可能扣款或占用余额。请再次核对账号、名单来源与文件。'
+          : executionMode === 'preflight'
+            ? '预检会登录平台并检查，但不会创建订单；如发现风险会安全停止。'
+            : '模拟执行只组装并预览报文，不会创建真实订单。'}
+        details={<StartSummary items={[
+          ['执行方式', modeLabel],
+          ['名单来源', orderSource === 'wps' ? `云端当天名单${dayPreview?.target_date ? `（${dayPreview.target_date}）` : ''}` : '本地 Excel'],
+          ['账号', account || '使用服务端预设'],
+          ['本地文件', excel || (orderSource === 'wps' ? '云端模式可不选' : '使用已配置路径')],
+        ]} />}
+        acknowledge={executionMode === 'live'
+          ? '我确认执行真实下单，并已核对账号、名单与执行方式'
+          : executionMode === 'preflight'
+            ? '我确认执行预检，不会创建真实订单'
+            : '我确认执行模拟，不会创建真实订单'}
+        confirmLabel={executionMode === 'live' ? '确认正式下单' : executionMode === 'preflight' ? '开始预检' : '开始模拟'}
+        busy={busy}
+        danger={executionMode === 'live'}
+        onConfirm={performStart}
+      />
 
-        <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
-          <Switch
-            checked={preflight}
-            onCheckedChange={setPreflight}
-            aria-label="预检：登录并检查，不创建订单"
-          />
-          <span>预检：登录并检查余额/订单，不创建订单</span>
-        </div>
-        </div>
-
-      <BottomDock>
-        <ActionBar
-          startLabel="开始下单"
-          onStart={onStart}
-          startBusy={busy}
-          startDisabled={workerAlive}
-          logReveal={logReveal}
-        />
-        <ToolsMenu mode="sss" />
-      </BottomDock>
       {browser && (
         <FileBrowserDialog
           open
@@ -601,139 +756,140 @@ function SssForm({ logReveal }: { logReveal?: LogReveal }) {
   )
 }
 
-/* ------------------------------------------------------------------ */
-/* 共享：主操作条 + 工具菜单                                              */
-/* ------------------------------------------------------------------ */
-
-/** 名单来源分段按钮（云端当天名单 / 本地 Excel） */
-function SourceButton({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean
-  onClick: () => void
-  children: ReactNode
-}) {
+function DayPreviewCard({ preview }: { preview: SssDayOrders }) {
+  const meals = Object.entries(preview.meals ?? {})
   return (
-    <button
-      type="button"
-      aria-pressed={active}
-      onClick={onClick}
-      className={cn(
-        'h-[38px] flex-1 rounded-[4px] border px-3 text-xs transition-colors sm:h-[34px]',
-        active
-          ? 'border-primary bg-secondary font-medium text-primary-strong'
-          : 'border-border bg-card text-muted-foreground hover:border-primary hover:text-primary-strong',
+    <div className="rounded-lg border bg-card p-3">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">
+        <span className="font-medium text-foreground">云端当天名单预览</span>
+        <span className="text-muted-foreground">目标日期：<b className="tabular text-foreground">{preview.target_date || '—'}</b></span>
+        {preview.date_text && <span className="text-muted-foreground">{preview.date_text}</span>}
+      </div>
+      {meals.length === 0 ? (
+        <p className="mt-1.5 text-[11px] text-muted-foreground">没有返回可展示的餐次结构化数据</p>
+      ) : (
+        <div className="mt-2 grid gap-1.5 sm:grid-cols-2">
+          {meals.map(([name, info]) => (
+            <div key={name} className="rounded-md border bg-secondary/30 px-2.5 py-2 text-[11px]">
+              <p className="font-medium text-foreground">{name}</p>
+              {info.skipped ? (
+                <p className="mt-0.5 text-warning">不下单：{info.reason || '没有当天列'}</p>
+              ) : (
+                <p className="mt-0.5 text-muted-foreground">
+                  下单 <b className="tabular text-foreground">{info.orders}</b> 人 · 标 1 <b className="tabular">{info.marked}</b> · 地址不送 <b className="tabular">{info.skipped_address}</b>
+                </p>
+              )}
+              {info.warnings?.length ? <p className="mt-0.5 text-warning">{info.warnings.join('；')}</p> : null}
+            </div>
+          ))}
+        </div>
       )}
-    >
-      {children}
-    </button>
-  )
-}
-
-/** 表单底部停靠坞：更多菜单 + 主操作条整体吸底 */
-/**
- * 表单底部操作条 —— **非滚动的真页脚**。
- *
- * 它原本是滚动容器内部的 `sticky bottom-0`：内容不足一屏时不会被撑到底部，
- * 「更多」下方就露出滚动容器的空白，而滚动时表单内容又会从它后面滑过。
- * 现在它是滚动区的兄弟节点，永远贴住面板底部，也不再需要负边距对齐
- * （横向内边距由自己给）。底部安全区不在这里加：手机最底部是 tab 栏。
- */
-function BottomDock({ children }: { children: ReactNode }) {
-  return (
-    <div className="shrink-0 border-t bg-background px-3 pb-3 pt-2.5 sm:px-5">
-      {children}
+      {preview.archive_error && <p className="mt-1.5 text-[11px] text-destructive">留档 Excel 写入失败：{preview.archive_error}</p>}
     </div>
   )
 }
 
-function ActionBar({
-  startLabel,
-  onStart,
-  startBusy,
-  startDisabled,
-  logReveal,
-}: {
-  startLabel: string
-  onStart: () => void
-  startBusy: boolean
-  startDisabled: boolean
-  /** 手机端：把「开始」按钮的位置交给日志扩散动画当圆心。 */
-  logReveal?: LogReveal
-}) {
-  const { stopTask, workerAlive } = useApp()
-  const [confirming, setConfirming] = useState(false)
+/* ------------------------------------------------------------------ */
+/* 共享：底栏、返回、工具菜单、密码清除、摘要                          */
+/* ------------------------------------------------------------------ */
 
+function StartSummary({ items }: { items: Array<[string, string]> }) {
   return (
-    <>
-      {/* 顶边与上间距由 BottomDock 提供，这里不再重复画 border-t。
-          「日志」按钮已从这里移除：日志入口唯一化到右下角悬浮按钮
-          （见 components/LogFab.tsx），腾出的位置让主按钮更宽。 */}
+    <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 rounded-md border bg-secondary/40 px-3 py-2 text-[11px]">
+      {items.map(([label, value]) => (
+        <div key={label} className="contents">
+          <dt className="text-muted-foreground">{label}</dt>
+          <dd className="min-w-0 truncate text-foreground">{value}</dd>
+        </div>
+      ))}
+    </dl>
+  )
+}
+
+function SaveStatus({ state, onRetry }: { state: ReturnType<typeof useConfigSave>['state']; onRetry: () => void }) {
+  const view = saveStateView(state)
+  return (
+    <span className="inline-flex min-w-0 items-center gap-1 text-[11px]">
+      <span className={cn(
+        'truncate',
+        view.tone === 'warn' && 'text-warning',
+        view.tone === 'success' && 'text-success',
+        view.tone === 'progress' && 'text-primary',
+        view.tone === 'muted' && 'text-muted-foreground',
+      )}>{view.label}</span>
+      {view.canRetry && (
+        <button type="button" onClick={onRetry} className="shrink-0 font-medium text-primary underline">
+          重试保存
+        </button>
+      )}
+    </span>
+  )
+}
+
+function BottomDock({
+  status,
+  primaryLabel,
+  primaryDisabled,
+  primaryBusy,
+  onPrimary,
+  workerAlive,
+  logReveal,
+  tools,
+}: {
+  status: ReactNode
+  primaryLabel: string
+  primaryDisabled: boolean
+  primaryBusy: boolean
+  onPrimary: () => void
+  workerAlive: boolean
+  logReveal?: LogReveal
+  tools?: ReactNode
+}) {
+  const { stopTask } = useApp()
+  const [confirmingStop, setConfirmingStop] = useState(false)
+  return (
+    <div
+      className="shrink-0 border-t bg-background/95 px-3 pt-2.5 backdrop-blur sm:px-5"
+      style={{ paddingBottom: 'calc(0.75rem + var(--safe-bottom) + var(--keyboard-inset, 0px))' }}
+    >
+      <div className="mb-2 flex min-h-5 min-w-0 items-center gap-2 text-[11px] text-muted-foreground">
+        {status}
+        {tools}
+      </div>
       <div className="flex gap-2">
         <Button
-          className="btn-serif-primary h-[38px] flex-1 rounded-[6px] text-sm"
-          disabled={startDisabled || startBusy}
-          onClick={(event) => {
-            // 只记下圆心，**不立刻展开**：真正展开由 App 在任务跑起来
-            // （workerAlive）时触发，这样表单校验失败时不会弹出日志挡住报错。
-            logReveal?.rememberFrom(pointFromEvent(event))
-            onStart()
-          }}
+          className="btn-serif-primary h-10 flex-1 rounded-[8px] text-sm"
+          disabled={primaryDisabled || primaryBusy}
+          onClick={onPrimary}
         >
-          {startBusy ? '校验中…' : startLabel}
+          {primaryBusy ? '执行中…' : primaryLabel}
         </Button>
+        {logReveal && (
+          <Button
+            variant="outline"
+            className="h-10 w-14 rounded-[8px] px-0 text-xs"
+            onClick={(event) => logReveal.toggleFrom(pointFromEvent(event))}
+            aria-label="打开或收起运行日志"
+            aria-controls="phone-log-sheet"
+          >
+            <ScrollText className="size-4" />
+          </Button>
+        )}
         <Button
           variant="outline"
-          className="h-[38px] w-24 rounded-[6px] border-destructive/45 bg-card text-[13px] text-destructive hover:bg-destructive/5 hover:text-destructive"
+          className="h-10 w-20 rounded-[8px] border-destructive/45 bg-card text-xs text-destructive hover:bg-destructive/5 hover:text-destructive"
           disabled={!workerAlive}
-          onClick={() => setConfirming(true)}
+          onClick={() => setConfirmingStop(true)}
         >
           停止
         </Button>
       </div>
-      <ConfirmStopDialog open={confirming} onOpenChange={setConfirming} onConfirm={stopTask} />
-    </>
+      <ConfirmStopDialog open={confirmingStop} onOpenChange={setConfirmingStop} onConfirm={stopTask} />
+    </div>
   )
 }
 
-function ToolsMenu({ mode }: { mode: TaskMode }) {
-  const { clearPassword, checkUpdates, isAdmin } = useApp()
-  const [confirmClear, setConfirmClear] = useState(false)
-
-  // 清密码与检查更新都需要管理员权限（后端也会拦），普通用户直接不显示入口。
-  if (!isAdmin) return null
-
-  return (
-    <>
-      <nav className="mt-3 flex items-center text-xs text-muted-foreground">
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <button
-              className="flex items-center gap-1 rounded px-2 py-1 hover:bg-secondary hover:text-foreground"
-              aria-label="更多工具"
-            >
-              <MoreHorizontal className="size-4" />
-              更多
-            </button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="rounded-md text-xs">
-            <DropdownMenuItem onClick={() => setConfirmClear(true)}>清除密码</DropdownMenuItem>
-            <DropdownMenuItem onClick={() => checkUpdates(true)}>检查更新</DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </nav>
-      <ConfirmClearPassword
-        open={confirmClear}
-        onOpenChange={setConfirmClear}
-        onConfirm={() => clearPassword(mode === 'sss' ? 'sss' : 'order')}
-      />
-    </>
-  )
-}
-
-/* 停止确认（对齐旧版 askyesnocancel 语义：是=停止 / 否=继续 / 取消=返回） */
+/* 停止确认：是=停止 / 否=继续 / 取消=返回；文案去掉旧浏览器时代内容。 */
 function ConfirmStopDialog({
   open,
   onOpenChange,
@@ -741,73 +897,45 @@ function ConfirmStopDialog({
 }: {
   open: boolean
   onOpenChange: (v: boolean) => void
-  onConfirm: () => void
+  onConfirm: () => void | Promise<void>
 }) {
+  const [busy, setBusy] = useState(false)
+  async function confirm() {
+    setBusy(true)
+    try {
+      await onConfirm()
+      onOpenChange(false)
+    } finally {
+      setBusy(false)
+    }
+  }
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={(next) => { if (!busy) onOpenChange(next) }}>
       <DialogContent className="sm:max-w-sm rounded-lg">
         <DialogHeader>
-          <DialogTitle className="font-serif">暂停处理</DialogTitle>
-          <DialogDescription>是否停止当前任务？停止后需等待浏览器操作结束。</DialogDescription>
-        </DialogHeader>
-        <DialogFooter className="gap-2">
-          <Button variant="ghost" className="h-8 text-xs" onClick={() => onOpenChange(false)}>
-            取消
-          </Button>
-          <Button
-            variant="outline"
-            className="h-8 rounded-[6px] border-border bg-card text-xs text-foreground hover:bg-secondary"
-            onClick={() => {
-              onOpenChange(false)
-            }}
-          >
-            继续处理
-          </Button>
-          <Button
-            className="h-8 rounded-[6px] bg-destructive text-xs text-white hover:bg-destructive/90"
-            onClick={() => {
-              onOpenChange(false)
-              onConfirm()
-            }}
-          >
-            停止任务
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-function ConfirmClearPassword({
-  open,
-  onOpenChange,
-  onConfirm,
-}: {
-  open: boolean
-  onOpenChange: (v: boolean) => void
-  onConfirm: () => void
-}) {
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-sm rounded-lg">
-        <DialogHeader>
-          <DialogTitle className="font-serif">清除密码</DialogTitle>
+          <DialogTitle className="font-serif">停止当前任务</DialogTitle>
           <DialogDescription>
-            将从系统凭据管理器删除本机保存的密码，输入框也会清空。继续吗？
+            停止后服务端会等待当前操作安全收尾，并保留未完成状态供核对。请查看日志确认结果。
           </DialogDescription>
         </DialogHeader>
         <DialogFooter className="gap-2">
-          <Button variant="ghost" className="h-8 text-xs" onClick={() => onOpenChange(false)}>
-            取消
+          <Button variant="ghost" className="h-9 text-xs" disabled={busy} onClick={() => onOpenChange(false)}>
+            返回
           </Button>
           <Button
-            className="h-8 rounded-[6px] text-xs"
-            onClick={() => {
-              onOpenChange(false)
-              onConfirm()
-            }}
+            variant="outline"
+            className="h-9 rounded-[6px] text-xs"
+            disabled={busy}
+            onClick={() => onOpenChange(false)}
           >
-            清除
+            继续执行
+          </Button>
+          <Button
+            className="h-9 rounded-[6px] bg-destructive text-xs text-white hover:bg-destructive/90"
+            disabled={busy}
+            onClick={() => void confirm()}
+          >
+            {busy ? '停止中…' : '停止任务'}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -815,30 +943,62 @@ function ConfirmClearPassword({
   )
 }
 
-/* ------------------------------------------------------------------ */
-/* 防抖自动保存：字段停止变化 delay ms 后把表单值持久化到后端配置。          */
-/* 只在 isApiReady（真实桌面端）且已从 config 完成首次填充后触发，避免     */
-/* 初始化瞬间把默认值写回配置，也避免浏览器 mock 态空跑。                  */
-/* ------------------------------------------------------------------ */
-function useDebouncedSave(save: () => void, delay = 500): () => void {
-  const timer = useRef<number | undefined>(undefined)
-  const saveRef = useRef(save)
-  useEffect(() => {
-    saveRef.current = save
-  }, [save])
-  const cancel = useCallback(() => {
-    if (timer.current !== undefined) {
-      clearTimeout(timer.current)
-      timer.current = undefined
+function ToolsMenu({ mode }: { mode: TaskMode }) {
+  const { clearPassword, checkUpdates, isAdmin } = useApp()
+  const isSss = mode === 'sss'
+  const passwordLabel = isSss ? '清除闪时送密码' : '清除管理后台密码'
+  const toolsLabel = isSss ? '闪时送更多工具' : '订单处理更多工具'
+  const accountHint = isSss ? '闪时送账号' : '管理后台账号'
+  const [clearOpen, setClearOpen] = useState(false)
+  const [clearing, setClearing] = useState(false)
+  const [clearError, setClearError] = useState('')
+
+  if (!isAdmin) return null
+
+  async function doClear() {
+    setClearing(true)
+    setClearError('')
+    const result = await clearPassword(mode === 'sss' ? 'sss' : 'order')
+    setClearing(false)
+    if (result.ok) {
+      setClearOpen(false)
+    } else {
+      setClearError([result.reason || '清除密码失败，请重试', result.next_action]
+        .filter(Boolean).join('；'))
     }
-  }, [])
-  const trigger = useCallback(() => {
-    cancel()
-    timer.current = window.setTimeout(() => {
-      timer.current = undefined
-      saveRef.current()
-    }, delay)
-  }, [cancel, delay])
-  useEffect(() => cancel, [cancel])
-  return trigger
+  }
+
+  return (
+    <>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <button className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-muted-foreground hover:bg-secondary hover:text-foreground" aria-label={toolsLabel}>
+            <MoreHorizontal className="size-3.5" />
+            更多
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" className="rounded-md text-xs">
+          <DropdownMenuItem onClick={() => { setClearError(''); setClearOpen(true) }}>{passwordLabel}</DropdownMenuItem>
+          <DropdownMenuItem onClick={() => checkUpdates(true)}>检查更新</DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      <Dialog open={clearOpen} onOpenChange={(next) => { if (!clearing) setClearOpen(next) }}>
+        <DialogContent className="sm:max-w-sm rounded-lg">
+          <DialogHeader>
+            <DialogTitle className="font-serif">{passwordLabel}</DialogTitle>
+            <DialogDescription>
+              将从系统凭据管理器删除本机保存的{accountHint}密码；服务端确认成功后，当前表单密码框会同步清空。失败或结果未知时会保留草稿。
+            </DialogDescription>
+          </DialogHeader>
+          {clearError && <p role="alert" className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">{clearError}</p>}
+          <DialogFooter className="gap-2">
+            <Button variant="ghost" className="h-9 text-xs" disabled={clearing} onClick={() => setClearOpen(false)}>取消</Button>
+            <Button className="h-9 rounded-[6px] text-xs" disabled={clearing} onClick={() => void doClear()}>
+              {clearing ? '清除中…' : '确认清除'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  )
 }

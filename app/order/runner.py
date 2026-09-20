@@ -94,6 +94,9 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
     ``order_count`` 为空或 0 时表示自动处理目标日期当天的全部订单。
     ``pending_address_callback`` 在写入 Excel 前收到去重后的待确认地址，
     返回 ``{原始地址: 用户填写的最终地址}``；返回空串/缺失的写法保留待确认流程。
+
+    失败语义：清旧表失败、取消、全部详情抓取失败时都不保存工作簿，原文件
+    保持不动；返回值用 ``status``/``next_action``/``summary`` 统一表达结果。
     """
     configured_excel = getattr(config, "excel_path", None)
     if not configured_excel:
@@ -107,6 +110,7 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
         target_date if target_date is not None else getattr(config, "order_date", "")
     )
     today = _dt.date.today()
+    historical_mode = selected_date < today
     if password is None:
         password = getattr(config, "password", "")
     # Validate aliases before backing up or touching the workbook.
@@ -125,14 +129,32 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
     refunded_numbers: list[int] = []
     applied_numbers: list[int] = []
     pending_orders: list[OrderInfo] = []
+    # 本次计划处理的正常单、失败单与未写入单，用于统一结果摘要。
+    planned_numbers: list[int] = []
+    failed_codes: list[str] = []
+    unwritten_codes: list[str] = []
+    abort_reason = ""
 
     def process_orders(api_get: Callable[[str], dict[str, Any]]) -> None:
-        nonlocal processed, refunded_numbers, applied_numbers, pending_orders
+        nonlocal processed, found, refunded_numbers, applied_numbers, pending_orders, abort_reason
+        planned_numbers.clear()
+        failed_codes.clear()
+        unwritten_codes.clear()
+        if stop_event.is_set():
+            abort_reason = "stopped"
+            _emit(progress_callback,
+                  "任务在拉取订单前已取消：本轮不清空、不写入、不保存，原 Excel 保持不变")
+            return
         list_start = time.perf_counter()
         rows = _api_list_waimai_orders(api_get, selected_date, progress_callback,
                                         concurrent_pages=True)
         _emit(progress_callback,
               f"拉取订单列表耗时 {(time.perf_counter() - list_start):.1f} 秒")
+        if stop_event.is_set():
+            abort_reason = "stopped"
+            _emit(progress_callback,
+                  "任务在拉取订单后已取消：本轮不清空、不写入、不保存，原 Excel 保持不变")
+            return
 
         # 先按目标日期筛选，再遍历当天实际存在的订单，避免先遍历全部 W 编号。
         rows_by_pick = _group_orders_by_pick(_filter_rows_by_date(rows, selected_date))
@@ -145,6 +167,7 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
         # 列表剔除，但保留编号用于结尾日志汇总「退款成功 / 申请退款中」两类。
         normal_numbers, refunded_numbers, applied_numbers = split_refund_orders(
             rows_by_pick, numbers)
+        planned_numbers.extend(normal_numbers)
         refund_label = []
         if refunded_numbers:
             refund_label.append(f"已退款 {len(refunded_numbers)} 单："
@@ -194,6 +217,8 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
             if written:
                 found += 1
             else:
+                if order.order_no not in unwritten_codes:
+                    unwritten_codes.append(order.order_no)
                 _emit(progress_callback, f"{order.order_no} 未识别到午餐或晚餐，未写入表格")
             _emit(progress_callback, "-------")
 
@@ -240,9 +265,17 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
                 break
             processed += 1
             if order is None:
+                if code not in failed_codes:
+                    failed_codes.append(code)
                 _emit(progress_callback, "-------")
                 continue
             collected.append(order)
+
+        if stop_event.is_set():
+            abort_reason = "stopped"
+            _emit(progress_callback,
+                  "任务已取消：本轮不清空旧表、不写入、不保存，原 Excel 保持不变")
+            return
 
         certain_orders: list[OrderInfo] = []
         pending_orders = []
@@ -297,26 +330,59 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
             if resolved_count:
                 _emit(progress_callback, f"已按手动填写修正 {resolved_count} 个订单的地址")
 
-        # 每次写入前先清空六张校区子表第 2 行后的旧数据，避免新旧混排；
-        # 清空只发生在确认当天有订单要写之后（numbers 为空已提前返回）。
-        try:
-            if clear_campus_sub_sheets(wb):
-                _emit(progress_callback, "已清空六张校区子表旧数据")
-        except Exception as exc:  # 清空失败则按原样追加写入，避免丢单。
-            _emit(progress_callback, f"清空旧数据失败（已跳过，继续写入）：{exc}")
+        if not certain_orders and not pending_orders:
+            abort_reason = "fetch_failed"
+            _emit(progress_callback,
+                  "所有订单详情均未成功读取：本轮不清空旧表、不保存，原 Excel 保持不变")
+            return
 
+        total_to_write = len(certain_orders) + len(pending_orders)
+        if historical_mode:
+            # 历史补单只追加到对应日期表，绝不能清空当前六张校区表。
+            _emit(progress_callback,
+                  f"历史补单模式（{selected_date.isoformat()}）：保留当前校区表，"
+                  "仅追加到历史日期表")
+        else:
+            # 每次写入前先清空六张校区子表第 2 行后的旧数据，避免新旧混排。
+            # 清空失败必须整体中止，绝不继续追加后保存污染结果。
+            try:
+                cleared = clear_campus_sub_sheets(wb)
+            except Exception as exc:
+                abort_reason = "clear_failed"
+                _emit(progress_callback,
+                      f"清空旧数据失败：{exc}；本轮不写入、不保存，原文件保持不变")
+                return
+            if cleared:
+                _emit(progress_callback, "已清空六张校区子表旧数据")
+
+        # 清空成功或历史模式后，逐单写入；写入途中若取消，同样放弃保存。
         for order in certain_orders:
+            if stop_event.is_set():
+                abort_reason = "stopped"
+                _emit(progress_callback,
+                      "写入途中取消：本轮不保存，原 Excel 保持不变")
+                return
             commit_order(order, pending=False)
         for order in pending_orders:
+            if stop_event.is_set():
+                abort_reason = "stopped"
+                _emit(progress_callback,
+                      "写入途中取消：本轮不保存，原 Excel 保持不变")
+                return
             dp = order.metadata.get("delivery_point") or {}
             _emit(progress_callback,
                   f"{order.order_no} 地址待确认（{dp.get('reason') or '无法确定点位'}），"
                   "已以原始地址追加到表尾")
             commit_order(order, pending=True)
 
-        if not stop_event.is_set():
+        if stop_event.is_set():
+            abort_reason = "stopped"
             _emit(progress_callback,
-                  f"写入 Excel 耗时 {(time.perf_counter() - write_start):.1f} 秒")
+                  "写入完成后接收到取消信号：本轮不保存，原 Excel 保持不变")
+            return
+        _emit(progress_callback,
+              f"写入 Excel 耗时 {(time.perf_counter() - write_start):.1f} 秒"
+              f"（计划写入 {total_to_write} 个订单）")
 
     try:
         _emit(progress_callback, "正在通过接口登录管理后台…")
@@ -330,17 +396,58 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
 
         process_orders(client.get_json)
 
-        report_items = _pending_report_items(pending_orders)
-        report_path = write_pending(report_items, target_date=selected_date)
-        _emit(progress_callback, f"待确认地址报告：{report_path}（{len(report_items)} 种写法）")
-        try:
-            if sort_campus_sub_sheets(wb):
-                _emit(progress_callback, "已按地址整理")
-        except Exception as exc:  # 排序失败不应阻断主流程，原样保存并提示。
-            _emit(progress_callback, f"地址排序失败（已跳过，按原顺序保存）：{exc}")
-        _save_workbook_with_retry(wb, excel_path, save_decision_callback)
+        if not abort_reason:
+            report_items = _pending_report_items(pending_orders)
+            # 即使本次没有待确认地址也要写空报告，避免上一次运行留下的旧清单误导。
+            report_path = write_pending(report_items, target_date=selected_date)
+            _emit(progress_callback,
+                  f"待确认地址报告：{report_path}（{len(report_items)} 种写法）")
+            if historical_mode:
+                _emit(progress_callback, "历史补单模式：跳过当天校区表地址整理")
+            else:
+                try:
+                    if sort_campus_sub_sheets(wb):
+                        _emit(progress_callback, "已按地址整理")
+                except Exception as exc:  # 排序失败不应阻断主流程，原样保存并提示。
+                    _emit(progress_callback, f"地址排序失败（已跳过，按原顺序保存）：{exc}")
+            _save_workbook_with_retry(wb, excel_path, save_decision_callback)
     finally:
         wb.close()
+
+    target_count = len(planned_numbers)
+    issues = len(failed_codes) + len(unwritten_codes)
+    if abort_reason == "stopped" or stop_event.is_set():
+        status = "stopped"
+        next_action = ("已取消，本轮未保存；原 Excel 未被修改。"
+                       "重新运行前先核对站内订单与原表备份，不要手工追加。")
+    elif abort_reason == "clear_failed":
+        status = "failed"
+        next_action = ("清空旧表失败，本轮未保存；原文件未被修改。"
+                       "请关闭 Excel/WPS 占用或检查文件权限后重新运行。")
+    elif abort_reason == "fetch_failed":
+        status = "failed"
+        next_action = ("全部订单详情未读取成功，本轮未保存；原文件未被修改。"
+                       "请检查接口/网络后重跑，必要时先只读对账。")
+    elif not planned_numbers:
+        status = "no_orders"
+        next_action = ""
+    elif found == 0:
+        status = "failed"
+        next_action = ("未写入任何订单；请检查失败单号与订单餐品/地址后重跑，"
+                       "原文件未被修改。")
+    elif issues:
+        status = "partial"
+        next_action = (f"已写入 {found}/{target_count} 个订单；"
+                       "失败或未识别餐品的单号见 failed_orders，"
+                       "核对后再处理，勿在原表上手工追加。")
+    else:
+        status = "confirmed"
+        next_action = ""
+    if status == "confirmed" and pending_orders:
+        next_action = "订单已写入；待确认地址已按原始地址追加并生成报告，请人工核对后整理。"
+    if status == "no_orders" and (refunded_numbers or applied_numbers):
+        next_action = "目标日期订单均为退款状态，无需写表；如仍要处理请联系平台确认。"
+
     _emit(progress_callback, f"处理完成：找到 {found}/{processed} 个订单")
     # 结尾统一汇总退款订单：哪些已退款、哪些仍在申请退款中（均为本次目标日期内）。
     if refunded_numbers or applied_numbers:
@@ -354,10 +461,45 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
     pending_numbers = [order.order_no for order in pending_orders]
     if pending_numbers:
         _emit(progress_callback, "待确认地址（已用原始地址写到表尾）：" + "、".join(pending_numbers))
-    return {"processed": processed, "found": found,
-            "refunded": refunded_numbers, "refund_applied": applied_numbers,
-            "address_pending": len(pending_numbers),
-            "address_pending_orders": pending_numbers}
+    if failed_codes or unwritten_codes:
+        labels = "、".join(failed_codes + [code for code in unwritten_codes if code not in failed_codes])
+        _emit(progress_callback, f"未完成订单：{labels}；请核对后处理，勿手工追加旧表")
+    if next_action:
+        _emit(progress_callback, f"下一步：{next_action}")
+
+    unconfirmed = max(0, target_count - found)
+    failed_count = issues
+    if status == "failed" and failed_count == 0 and target_count:
+        # 清表失败等“零个订单进入明细失败、但整轮操作失败”的情况，
+        # 也让 summary.failed 至少反映本轮失败，而不是显示 0。
+        failed_count = 1
+    summary = {
+        "status": status,
+        "confirmed": found,
+        "unconfirmed": unconfirmed,
+        "stopped": status == "stopped",
+        "failed": failed_count if status in {"failed", "partial"} else 0,
+        "next_action": next_action,
+    }
+    result = {
+        "status": status,
+        "processed": processed,
+        "found": found,
+        "refunded": refunded_numbers,
+        "refund_applied": applied_numbers,
+        "address_pending": len(pending_numbers),
+        "address_pending_orders": pending_numbers,
+        "planned": target_count,
+        "failed_orders": failed_codes,
+        "unwritten_orders": unwritten_codes,
+        "unconfirmed": unconfirmed,
+        "next_action": next_action,
+        "summary": summary,
+    }
+    if abort_reason:
+        result["abort_reason"] = abort_reason
+    return result
+
 
 __all__ = [
     "AdminApiClient",

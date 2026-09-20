@@ -26,6 +26,10 @@ def _bridge(tmp_path) -> Bridge:
     bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
     bridge._config.excel_path = tmp_path / "排单.xlsx"
     bridge._config.excel_path.write_bytes(b"x")
+    # W5：云同步默认关闭（wps_enabled=False）时服务端直接拒绝预览/上传。
+    # 本文件测的是**已开启**时的预览守卫，因此显式开启；关闭态的行为见
+    # tests/test_bridge_wps_gates.py。
+    bridge._config.wps_enabled = True
     return bridge
 
 
@@ -106,7 +110,12 @@ def test_effective_tables_error_is_surfaced(preview_env):
 
     got = bridge.wps_preview()
 
-    assert got == {"ok": False, "reason": "目标表已过期"}
+    assert got["ok"] is False
+    assert got["status"] == "rejected"
+    assert got["code"] == "effective_tables_error"
+    assert got["reason"] == "目标表已过期"
+    assert got["next_action"]
+    assert got["operation_id"] == ""
 
 
 def test_unauthenticated_cli_is_refused(preview_env):
@@ -128,7 +137,11 @@ def test_cloud_error_while_building_the_plan_is_surfaced(preview_env):
 
     monkeypatch.setattr(bridge_module, "build_plan", boom)
 
-    assert bridge.wps_preview() == {"ok": False, "reason": "云端表读不了"}
+    got = bridge.wps_preview()
+    assert got["ok"] is False
+    assert got["status"] == "failed"
+    assert got["code"] == "plan_failed"
+    assert got["reason"] == "云端表读不了"
 
 
 def test_unexpected_exception_is_reported_not_raised(preview_env):
@@ -212,8 +225,18 @@ def test_success_shape(preview_env):
     got = bridge.wps_preview()
 
     assert got["ok"] is True
+    assert got["status"] == "preview_ready"
     assert got["text"] == "预览正文"
     assert got["summary"] == {"to_update": 1, "to_append": 2}
+    assert got["stats"] == got["summary"]
+    # 一次性上传令牌与失效判定输入。
+    assert got["preview_id"]
+    assert got["expires_in"] >= 0
+    assert len(got["local_sha256"]) == 64
+    assert got["plan_fingerprint"] and got["context_fingerprint"]
+    assert got["next_action"] == "wps_upload(preview_id)"
+    assert got["tables"] and got["tables"][0]["sheet"] == "东湖中餐"
+    assert got["operation_id"] == ""
     # test_mode 如实反映当前配置（注意 AppConfig 默认**开启**测试模式）
     assert got["test_mode"] == bridge._config.wps_test_mode
     assert _dt.date.fromisoformat(got["target_date"])

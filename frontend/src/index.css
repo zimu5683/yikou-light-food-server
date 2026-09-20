@@ -1,79 +1,75 @@
 @import "tailwindcss";
 
 /* ============================================================
-   全麦早市 Wheat Press — 冻结 token（design/DESIGN-WEB.md §5）
-   C 早市版式骨架 × A 全麦配色；浅色默认，.dark 由桥接层持久化。
+   一口轻食 · 运营工作台 token
+   浅色明亮、深色护眼；全麦色作为主强调，不使用大面积高饱和。
    ============================================================ */
 
 @custom-variant dark (&:where(.dark, .dark *));
 
 :root {
-  --background: #faf7f1; /* 面粉白画布 */
-  --foreground: #2a241c; /* 油墨深褐，非纯黑 */
-  --card: #ffffff; /* 卡片 = 小票纸 */
-  --card-foreground: #2a241c;
+  --background: #f4f7f4;
+  --foreground: #17211b;
+  --card: #ffffff;
+  --card-foreground: #17211b;
   --popover: #ffffff;
-  --popover-foreground: #2a241c;
-  --primary: #7a5a3a; /* 全麦棕 */
+  --popover-foreground: #17211b;
+  --primary: #7a5a36;
+  --primary-strong: #65482a;
+  --primary-soft: #f1e7d8;
   --primary-foreground: #ffffff;
-  /* DESIGN-WEB §5 冻结 token 规定了下面两个值，但一直没落到 CSS 上，
-     导致 bg-primary-soft / text-primary-strong / hover:bg-primary-strong
-     共 8 处引用全部解析为空：模式 tab 的选中态与悬停态、主按钮 hover、
-     日志筛选选中态、无命中提示框底色。 */
-  --primary-strong: #6b4e31; /* primary 悬停 */
-  --primary-soft: #f0e6d8; /* 选中态底、开关底 */
-  --secondary: #efe8dd; /* 麸皮 */
-  --secondary-foreground: #2a241c;
-  --muted: #efe8dd;
-  --muted-foreground: #7a6f5e;
-  --accent: #f0e6d8; /* 全麦浅：选中态底 */
-  --accent-foreground: #2a241c;
-  --destructive: #c0442e; /* 番茄红：仅危险语义 */
+  --secondary: #eaf0ea;
+  --secondary-foreground: #17211b;
+  --muted: #eaf0ea;
+  --muted-foreground: #5f6d64;
+  --accent: #e3efe7;
+  --accent-foreground: #17211b;
+  --destructive: #b9382c;
   --destructive-foreground: #ffffff;
-  --border: #e5dccc;
-  --input: #e5dccc;
-  --ring: #7a5a3a;
-
-  /* Wheat Press 扩展 token（非 shadcn 标准） */
-  --success: #3e7c4f; /* 生菜绿：仅成功语义 */
-  --warning: #c88a16; /* 芥末：仅警示语义 */
-  --ink-faint: #a99c88; /* 占位/时间戳 */
-  --hit: rgba(200, 138, 22, 0.22); /* 日志命中高亮 */
-  --receipt-edge: rgba(42, 36, 28, 0.25); /* 小票投影 */
-  --dashed-line: rgba(42, 36, 28, 0.3); /* 虚线裁切线 */
-
-  --radius: 0.5rem;
+  --border: #d7e0d8;
+  --input: #d7e0d8;
+  --ring: #7a5a36;
+  --success: #2f7d4f;
+  --warning: #a86a10;
+  --ink-faint: #8a988e;
+  --hit: rgba(168, 106, 16, 0.18);
+  --receipt-edge: rgba(23, 33, 27, 0.16);
+  --dashed-line: rgba(23, 33, 27, 0.18);
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --radius: 0.625rem;
 }
 
 .dark {
-  --background: #1d1710; /* 烤面包底 */
-  --foreground: #f3ede3;
-  --card: #262019;
-  --card-foreground: #f3ede3;
-  --popover: #262019;
-  --popover-foreground: #f3ede3;
-  --primary: #a67b4f; /* 棕金 */
-  --primary-foreground: #ffffff;
-  --primary-strong: #b98a5c; /* primary 悬停（深色） */
-  --primary-soft: #3a2f22; /* 选中态底（深色） */
-  --secondary: #2e271d;
-  --secondary-foreground: #f3ede3;
-  --muted: #2e271d;
-  --muted-foreground: #b3a78f;
-  --accent: #3a2f22;
-  --accent-foreground: #f3ede3;
-  --destructive: #e0705a;
-  --destructive-foreground: #ffffff;
-  --border: #3b3325;
-  --input: #3b3325;
-  --ring: #a67b4f;
-
-  --success: #6fb583;
-  --warning: #dfae4c;
-  --ink-faint: #7d715c;
-  --hit: rgba(223, 174, 76, 0.3);
-  --receipt-edge: rgba(0, 0, 0, 0.45);
-  --dashed-line: rgba(243, 237, 227, 0.32);
+  --background: #0f1713;
+  --foreground: #e8efe9;
+  --card: #18221d;
+  --card-foreground: #e8efe9;
+  --popover: #18221d;
+  --popover-foreground: #e8efe9;
+  --primary: #d6a563;
+  --primary-strong: #e4b87a;
+  --primary-soft: #3a2e1f;
+  --primary-foreground: #1b140b;
+  --secondary: #24312a;
+  --secondary-foreground: #e8efe9;
+  --muted: #24312a;
+  --muted-foreground: #a8b7ad;
+  --accent: #22342b;
+  --accent-foreground: #e8efe9;
+  --destructive: #e47060;
+  --destructive-foreground: #1b0d0a;
+  --border: #31423a;
+  --input: #31423a;
+  --ring: #d6a563;
+  --success: #75c38d;
+  --warning: #e0b25a;
+  --ink-faint: #7f9186;
+  --hit: rgba(224, 178, 90, 0.26);
+  --receipt-edge: rgba(0, 0, 0, 0.5);
+  --dashed-line: rgba(232, 239, 233, 0.22);
 }
 
 @theme inline {
@@ -98,16 +94,15 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
-  /* 扩展 */
   --color-success: var(--success);
   --color-warning: var(--warning);
   --color-ink-faint: var(--ink-faint);
   --color-hit: var(--hit);
 
-  --radius-xs: calc(var(--radius) - 6px); /* 2px 徽章/LED */
-  --radius-sm: calc(var(--radius) - 4px); /* 4px 输入 */
-  --radius-md: calc(var(--radius) - 2px); /* 6px 按钮 */
-  --radius-lg: var(--radius); /* 8px 卡片 */
+  --radius-xs: calc(var(--radius) - 6px);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
 
   --font-sans: "MiSans", "HarmonyOS Sans SC", "Noto Sans SC", "PingFang SC",
     "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif;
@@ -124,18 +119,39 @@
   body,
   #root {
     height: 100%;
+    min-height: 0;
+  }
+  @supports (height: 100dvh) {
+    html,
+    body,
+    #root {
+      height: 100dvh;
+    }
   }
   body {
-    @apply bg-background text-foreground font-sans antialiased select-none;
-    /* 用 rem 而不是写死 13px：桌面仍是 13px（16px 根字号），手机上随根字号一起放大 */
+    @apply bg-background text-foreground font-sans antialiased;
     font-size: 0.8125rem;
     line-height: 1.5;
+    -webkit-text-size-adjust: 100%;
+    overscroll-behavior: none;
   }
   input,
-  textarea {
+  textarea,
+  select {
     @apply select-text;
   }
-  /* 数字统一 tabular（DESIGN-WEB：全部数字 tabular-mono） */
+  button:focus-visible,
+  [role="tab"]:focus-visible,
+  a:focus-visible,
+  input:focus-visible,
+  textarea:focus-visible,
+  [tabindex]:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+  ::selection {
+    background: var(--hit);
+  }
   .tabular {
     font-variant-numeric: tabular-nums;
   }
@@ -148,33 +164,68 @@
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }
 
-/* ============================================================
-   Wheat Press 专用组件类（自 final-wheat-press.html mock 移植）
-   ============================================================ */
+/* 手机触控目标：不改变桌面密度。 */
+@media (pointer: coarse) {
+  .touch-target {
+    min-height: 42px;
+  }
+  input,
+  textarea,
+  select {
+    font-size: 1rem;
+  }
+}
 
-/* 小票锯齿顶边（SVG 三角齿平铺，颜色跟随 --card） */
+/* 横屏 / 矮视口：给表单单更多滚动空间，底部固定栏仍然安全。 */
+@media (orientation: landscape) and (max-height: 560px) {
+  .landscape-compact {
+    padding-top: 0.25rem !important;
+    padding-bottom: 0.25rem !important;
+  }
+}
+
+/* 小屏（360x800 档）：减少横向内边距，避免卡片被挤爆。 */
+@media (max-width: 380px) {
+  .scroll-contain {
+    padding-left: 0.625rem;
+    padding-right: 0.625rem;
+  }
+}
+
+/* 内部滚动容器：避免滚动传递给页面；软键盘弹出时给底部留白。 */
+.scroll-contain {
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  scroll-padding-bottom: calc(6rem + var(--safe-bottom));
+}
+
+/* 小票/全麦细节（保留品牌记忆点，但不影响运营清晰度）。 */
 .receipt-tear {
-  height: 8px;
-  flex: 0 0 8px;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M0 8 L6 0 L12 8 Z' fill='white'/%3E%3C/svg%3E");
+  height: 7px;
+  flex: 0 0 7px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='7'%3E%3Cpath d='M0 7 L6 0 L12 7 Z' fill='%23ffffff'/%3E%3C/svg%3E");
   background-repeat: repeat-x;
   background-position: bottom;
 }
 .dark .receipt-tear {
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M0 8 L6 0 L12 8 Z' fill='%23262019'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='7'%3E%3Cpath d='M0 7 L6 0 L12 7 Z' fill='%2318221d'/%3E%3C/svg%3E");
 }
-
-/* 宋体主按钮（印刷铅字感，字距 4px） */
 .btn-serif-primary {
   font-family: var(--font-serif);
   font-weight: 600;
-  letter-spacing: 4px;
+  letter-spacing: 2px;
+}
+.receipt-row + .receipt-row {
+  border-top: 1px dashed var(--dashed-line);
+}
+.receipt-paper {
+  box-shadow: 0 8px 18px -14px var(--receipt-edge);
 }
 
-/* 运行徽章呼吸 LED */
 @keyframes led-breathe {
   50% { opacity: 0.3; }
 }
@@ -185,59 +236,7 @@
   .led-breathe { animation: none; }
 }
 
-/* 日志虚线裁切分隔（票据语言） */
-.receipt-row + .receipt-row {
-  border-top: 1px dashed var(--dashed-line);
-}
-
-/* 小票纸投影 */
-.receipt-paper {
-  box-shadow: 0 6px 14px -10px var(--receipt-edge);
-}
-
-/* ============================================================
-   响应式基础 —— 网页版要同时跑在手机和电脑上
-   ------------------------------------------------------------
-   规范冻结的是桌面窗口（13px 正文、≥36px 触达目标、无边框窗口）。
-   搬到浏览器后只需补三件事：按屏宽缩放字号、手指够用的触控目标、
-   刘海/手势条安全区。色板、圆角、小票语言一律不动。
-   ============================================================ */
-
-html {
-  /* 所有 rem 类（text-xs/sm/base、间距）以它为基准缩放。
-     手机与桌面统一 16px：规范冻结的就是这套紧凑密度（正文 13px、
-     信息密度优先），手机上单独放大反而显得笨重。 */
-  font-size: 16px;
-  -webkit-text-size-adjust: 100%; /* 横屏时禁止浏览器再放大一次 */
-}
-
-/* 手机浏览器：height:100% 按「大视口」计算，底部会被地址栏/手势条盖住；
-   而本应用是整屏不滚动的布局，被盖住就等于看不全。dvh 跟随实际可见高度。 */
-@supports (height: 100dvh) {
-  html,
-  body,
-  #root {
-    height: 100dvh;
-  }
-}
-
-/* 安全区（刘海屏 / 手势条 / 圆角屏） */
-:root {
-  --safe-top: env(safe-area-inset-top, 0px);
-  --safe-bottom: env(safe-area-inset-bottom, 0px);
-  --safe-left: env(safe-area-inset-left, 0px);
-  --safe-right: env(safe-area-inset-right, 0px);
-}
-
-/* 触控目标：规范要求桌面 ≥36px。手指操作给 38px——比桌面略大够点准，
-   但不采用 44px 那档，否则整页会明显变笨重。 */
-@media (pointer: coarse) {
-  .touch-target {
-    min-height: 38px;
-  }
-}
-
-/* 内部滚动容器不要把滚动传给页面（手机上容易误触下拉刷新） */
-.scroll-contain {
-  overscroll-behavior: contain;
+/* 兼容旧组件：sr-only 等由 Tailwind 提供；这里显式保证 [hidden] 不会被覆盖。 */
+[hidden] {
+  display: none !important;
 }

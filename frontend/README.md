@@ -24,6 +24,22 @@ pnpm lint       # oxlint
 - `src/components/` — 业务组件；`components/ui/` 为无领域 UI 原子
 - `src/App.tsx` — 手机/平板/桌面三种响应式布局
 
+## 浏览器交互检查与变异检查
+
+```bash
+pnpm build
+node scripts/browser-interaction-check.mjs      # 合成 mock 后端 + 本机 Headless Chrome，退出码非 0 表示有断言失败
+SCENARIO=uncertain-operation-as-success node scripts/mutation-check.mjs   # 只跑 FE-1（R6-8）变异
+node scripts/mutation-check.mjs                 # 全部变异场景
+```
+
+- `scripts/browser-interaction-check.mjs`：只服务 `dist/index.html`，`/api/*` 全部是脚本内合成 JSON
+  与请求计数；不连真实 WPS/闪时送、不读系统凭据、不写正式文件。断言基于真实渲染与真实点击。
+- `scripts/mutation-check.mjs`：把 `frontend/` 复制到临时目录（`node_modules` 走符号链接），在副本里
+  注入变异并重新构建，要求「指定断言必须变成 FAIL、控制组必须仍然 PASS」，用来证明断言不是空转。
+- FE-1（R6-8：uncertain 不得被渲染成“已完成”）的缺口、断言清单与三段式证据：
+  `docs/OPTIMIZATION-R6-8-FE1-BROWSER-GATE.md`。
+
 ## 手机端日志：悬浮按钮 + 水波扩散
 
 手机布局（<640px）下日志面板由右下角悬浮按钮 `components/LogFab.tsx` 开合，

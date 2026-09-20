@@ -84,9 +84,26 @@ from app.wps.common import (
     target_date_for,
     weekday_number,
 )
-from app.wps.errors import WpsCloudError
+from app.wps.atomicio import (
+    AtomicWriteError,
+    FileLock,
+    LockTimeout,
+    atomic_write_text,
+    lock_path_for,
+    operation_lock_path_for,
+)
+from app.wps.errors import (
+    JournalCorruptError,
+    JournalError,
+    LedgerCorruptError,
+    WpsCloudError,
+)
 from app.wps.models import Change, CloudOrder, InsertBlock, SheetPlan
+from app.wps.journal import SyncJournal, journal_path_for, new_operation_id
 from app.wps.ledger import SyncLedger, default_state_path
+from app.wps.recovery import (classify_journal_sheet, recover_pending_operations,
+                              recovery_status, resolve_pending_operation,
+                              retire_guarded_operation, retire_pending_operation)
 from app.wps.reader import LOCAL_COL, LOCAL_SHEETS, read_local_orders
 from app.wps.planner import (
     _build_sheet_plan,
@@ -307,7 +324,14 @@ __all__ = [
     "SORT_KEY_WIDTH",
     "SORT_PROBE_WIDTH",
     "STRUCT_COLUMN_KEYS",
+    "AtomicWriteError",
+    "FileLock",
+    "JournalCorruptError",
+    "JournalError",
+    "LedgerCorruptError",
+    "LockTimeout",
     "SheetPlan",
+    "SyncJournal",
     "SyncLedger",
     "TITLE_ROW",
     "WPS_PLAN_WORKERS",
@@ -328,7 +352,9 @@ __all__ = [
     "build_address_ranks",
     "build_format_ops",
     "build_plan",
+    "atomic_write_text",
     "canonical_address",
+    "classify_journal_sheet",
     "column_name",
     "content_last_col",
     "date_headers",
@@ -343,13 +369,22 @@ __all__ = [
     "format_sort_key",
     "formula_cells_for_new_rows",
     "learn_row_format",
+    "journal_path_for",
+    "lock_path_for",
     "natural_key",
+    "new_operation_id",
+    "operation_lock_path_for",
     "normalize_phone",
     "parse_date_header",
     "person_key",
     "probe_sort_area",
     "read_local_orders",
     "read_person_rows",
+    "recover_pending_operations",
+    "recovery_status",
+    "resolve_pending_operation",
+    "retire_guarded_operation",
+    "retire_pending_operation",
     "scan_bounds",
     "sort_key_column",
     "sort_key_value",

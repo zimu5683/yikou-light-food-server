@@ -15,6 +15,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
+from app.integrations.sss_url import canonical_sss_origin
+
 
 class ApiError(RuntimeError):
     """纯接口模式下请求失败或响应异常时抛出。"""
@@ -69,11 +71,31 @@ class SssTransportError(ApiError):
 
 
 def origin_from_url(url: str) -> str:
-    """从完整 URL 中提取协议+域名，例如 https://m.icall.me/admin/#/login → https://m.icall.me。"""
-    parts = urlsplit(url or "")
-    if not parts.scheme or not parts.netloc:
+    """从 URL 提取规范网络 origin（协议+主机+非默认端口）。
+
+    规范规则（SssApiClient 实际请求与权威安全状态共用）：
+    - scheme、hostname 转小写；
+    - http:80 / https:443 去掉默认端口；
+    - 非默认端口保留；
+    - IPv6 主机保留/补上方括号；
+    - path/query/fragment 一律忽略。
+    """
+    parts = urlsplit(str(url or ""))
+    if not parts.scheme or not parts.hostname:
         raise ValueError(f"无法从网址提取源：{url}")
-    return f"{parts.scheme}://{parts.netloc}"
+    scheme = parts.scheme.lower()
+    host = parts.hostname.lower()
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError(f"无法从网址提取源：{url}") from exc
+    if ":" in host:
+        host = f"[{host}]"
+    if port is not None and not (
+            (scheme == "http" and port == 80)
+            or (scheme == "https" and port == 443)):
+        host = f"{host}:{port}"
+    return f"{scheme}://{host}"
 
 
 def _browser_headers(origin: str, *, admin: bool = True) -> dict[str, str]:
@@ -347,6 +369,11 @@ class SssApiClient:
 
     ``timeout`` 统一用秒（调用方传毫秒时必须先除以 1000）。内部拆分为
     ``(connect, read)`` 二元组，避免一次慢响应卡死整个批量任务。
+
+    R8-S1：构造时就调用 ``canonical_sss_origin`` 校验网址。非规范/不支持的
+    写法（尾点、非 ASCII 域名、缺协议、非法端口等）在**任何请求之前**抛
+    ``SssUrlConfigError``，避免配置写法变化切换 authority scope 后重复下单。
+    管理后台 ``AdminApiClient`` 不走这条规则，仍使用 ``origin_from_url``。
     """
 
     RETRYABLE_STATUS = (429, 500, 502, 503, 504)
@@ -354,7 +381,7 @@ class SssApiClient:
     def __init__(self, url: str, account: str, password: str,
                  timeout: float | tuple[float, float] = 15,
                  pool_size: int = 20) -> None:
-        self.origin = origin_from_url(url)
+        self.origin = canonical_sss_origin(url)
         self.account = account
         self.password = password
         self.timeout = _normalize_timeout(timeout)
