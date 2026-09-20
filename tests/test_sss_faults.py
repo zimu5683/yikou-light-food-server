@@ -2196,7 +2196,12 @@ def test_run_sss_job_clears_journal_when_readonly_reconcile_confirms(monkeypatch
         meta={"delivery_date": fixed_date.isoformat(), "source": "excel",
               "account": account, "platform": "https://example.invalid",
               # 批次开始时间必须早于站内订单创建时间，否则被 created_after 正确排除。
-              "batch_started_at": dt.datetime(2026, 9, 16, 9, 59, 0).timestamp()})
+              # 站内订单的裸时间字符串按 UTC+8 解释（见 reconcile._record_created_timestamp），
+              # 批次开始时间必须用同一时区构造，否则在非 UTC+8 机器（如 CI 的 UTC）上会被
+              # created_after 误排除，测试将随本机时区变化而失败。
+              "batch_started_at": dt.datetime(
+                  2026, 9, 16, 9, 59, 0,
+                  tzinfo=dt.timezone(dt.timedelta(hours=8))).timestamp()})
     monkeypatch.setattr(sss_runner, "expected_delivery_date", lambda now: fixed_date)
     monkeypatch.setattr(sss_runner, "SssApiClient",
                         _blocked_fake_client(post_records, [station_record]))
