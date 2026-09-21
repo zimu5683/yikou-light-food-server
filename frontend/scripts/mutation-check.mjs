@@ -35,6 +35,12 @@ const WPS_FAILURE = 'src/lib/wpsFailure.ts'
 const SINGLE_FLIGHT = 'src/lib/singleFlight.ts'
 const OPERATION_STATUS = 'src/lib/operationStatus.ts'
 const MAIN_ENTRY = 'src/main.tsx'
+const APP_ENTRY = 'src/App.tsx'
+const LOG_CONSOLE = 'src/components/LogConsole.tsx'
+const STYLES = 'src/index.css'
+const LOG_DISPLAY = 'src/lib/logDisplay.ts'
+const TASK_PANEL = 'src/components/TaskPanel.tsx'
+const CLOUD_FORM = 'src/components/CloudForm.tsx'
 const BROWSER_CHECK = 'scripts/browser-interaction-check.mjs'
 
 /** 入口脚本的渲染调用：R8 页面异常注入的锚点。 */
@@ -262,6 +268,206 @@ const SCENARIOS = [
     mustStillPass: [
       '布局无横向溢出 360x800',
       'W3 备注过短本地拦截，不发出请求',
+    ],
+  },
+  {
+    name: 'toast-back-to-overlay',
+    description: '手机端提示条退回浮层（不占布局空间）—— 提示又会盖住状态区/横幅，ISSUE-05 的形态',
+    mutations: [
+      {
+        file: STYLES,
+        name: '把提示区域里的 sonner 容器改回 position: fixed（不再参与文档流）',
+        find: `.phone-notice-region .phone-notice-toaster[data-sonner-toaster] {
+  position: static;`,
+        replace: `.phone-notice-region .phone-notice-toaster[data-sonner-toaster] {
+  position: fixed;`,
+      },
+    ],
+    mustFail: [
+      '有提示时：区域占据布局空间（高度 > 0），主内容从区域下方开始',
+      '提示不遮任务工作台头部的权威状态区（不相交 + 状态胶囊命中自身 + 状态文案/说明仍在）',
+      '多条提示在区域内依次排布（互不重叠）、区域高度随之增长，且不遮日志按钮',
+      '字体放大（20px）后：提示区域仍受 45vh 上限约束（超出则区域内滚动），日志按钮与底栏主按钮仍可点',
+    ],
+    mustStillPass: [
+      '布局无横向溢出 360x800',
+      '无提示时提示区域完全不占布局（高度 0；标题栏仍从安全区起，主内容紧接标题栏）',
+      '桌面布局没有提示区域（不做流式占位），提示仍是右下角浮层',
+      // 控制组：这条变异下提示条仍落在横幅下方，所以横幅断言应当保持 PASS
+      // （它锁的是「提示不与横幅相交」，不是「提示占不占布局」）。
+      '提示不遮失败原因横幅（不相交 + 横幅文案仍在 + 中心命中横幅自身）',
+    ],
+  },
+  {
+    name: 'log-fab-not-wired',
+    description: '右上角日志悬浮按钮不再开合面板（用户报障形态：入口在别处、按钮点了没反应）',
+    mutations: [
+      {
+        file: APP_ENTRY,
+        name: 'LogFab 的 onToggle 换成只记圆心的旧接口（点击不再开合）',
+        find: '            onToggle={() => reveal.toggleFrom(null)}',
+        replace: '            onToggle={() => reveal.rememberFrom(null)}',
+      },
+    ],
+    mustFail: [
+      '点右上角按钮展开：面板可见可交互、中心可命中，按钮层级在其之上',
+      '运行中点按钮可退出日志；退出后任务仍在运行、停止按钮仍可用（关闭不停止任务）',
+      '快速点 5 次（奇数次）后停在「展开」一致态，没有中间态残留',
+      'FE-1 uncertain 日志面板展开后仍然显示不确定状态（不显示已完成）',
+    ],
+    mustStillPass: [
+      '布局无横向溢出 360x800',
+      'Tab 方向键切换并聚焦',
+      '手机竖屏：日志按钮在右上角可见、可点、在可视视口内，且全页只此一个',
+      '收起状态：日志面板隐藏且不可交互（裁剪半径 0 / visibility hidden / inert）',
+      '水波圆心 = 右上角按钮中心（真实布局解析，误差 ≤1px）',
+    ],
+  },
+  {
+    name: 'log-close-stuck-closing',
+    description: '关闭动画收尾不落 closed：面板停在半开遮罩，用户退不出日志层',
+    mutations: [
+      {
+        file: LOG_CONSOLE,
+        name: '关闭收尾把 phase 又写回 closing（不再落 closed）',
+        find: `      if (revealAnimation.current === animation) revealAnimation.current = null
+      element.style.clipPath = frames.to
+      setPhase('closed')`,
+        replace: `      if (revealAnimation.current === animation) revealAnimation.current = null
+      element.style.clipPath = frames.to
+      setPhase('closing')`,
+      },
+    ],
+    mustFail: [
+      '再点同一按钮收回：面板回到隐藏不可交互，按钮状态复位',
+      '运行中点按钮可退出日志；退出后任务仍在运行、停止按钮仍可用（关闭不停止任务）',
+    ],
+    mustStillPass: [
+      '布局无横向溢出 360x800',
+      '手机竖屏：日志按钮在右上角可见、可点、在可视视口内，且全页只此一个',
+      '点右上角按钮展开：面板可见可交互、中心可命中，按钮层级在其之上',
+      '水波圆心 = 右上角按钮中心（真实布局解析，误差 ≤1px）',
+    ],
+  },
+  {
+    name: 'log-duplicate-expand',
+    description: '日志重复展示回归：可展开只看长度、展开追加全文、搜索不揭示隐藏命中',
+    mutations: [
+      {
+        file: LOG_DISPLAY,
+        name: '「可展开」退回按字符串长度判断（长单行与订单摘要多出重复的展开明细）',
+        find: `  const expandable = !orderSummary && fullLines.slice(1).some((line) => line.trim() !== '')`,
+        replace: `  const expandable = fullLines.length > 1 || msg.length > 120`,
+      },
+      {
+        file: LOG_DISPLAY,
+        name: '展开退回「摘要 + 追加全文」（同一份内容同屏出现两次）',
+        find: `    lines: full ? view.fullLines : view.visibleLines,`,
+        replace: `    lines: full ? [...view.visibleLines, ...view.fullLines] : view.visibleLines,`,
+      },
+      {
+        file: LOG_DISPLAY,
+        name: '搜索命中隐藏行时不再强制展开（命中内容被折叠藏住）',
+        find: `    revealForSearch: hiddenHits.length > 0,`,
+        replace: `    revealForSearch: false,`,
+      },
+    ],
+    mustFail: [
+      '长单行（>120 字、只有一行）直接显示完整内容，不给「展开明细」',
+      '订单摘要逐字段显示完整，不再提供重复全文的「展开明细」',
+      '展开明细 = 原位替换摘要：完整内容只出现一份，首行不重复',
+      '搜索命中隐藏行：自动展开让命中内容可见，并标出命中行',
+      '搜索命中的那一条被滚进可视区（不是只渲染出来让用户自己找）',
+    ],
+    mustStillPass: [
+      '布局无横向溢出 360x800',
+      '多行日志折叠时只显示首行，展开入口标明还有几行',
+      '收起后回到首行摘要（不残留第二份全文）',
+      '复制保留完整原文：隐藏行、订单摘要分隔符、长单行都不丢，且每条只出现一次',
+      '低频操作都在工具菜单里，级别默认「全部」；警告/错误条数留在入口角标上（不是藏起来）',
+    ],
+  },
+  {
+    name: 'batch2-duplicate-status-restored',
+    description: '批 2 回归：页签内又出现重复的权威状态块（订单页 + 云文档页）',
+    mutations: [
+      {
+        file: TASK_PANEL,
+        name: '订单页流程条下方重新加回重复的 operationView Callout',
+        find: `        <FlowStrip steps={flow} label="订单处理流程" />\n`,
+        replace: `        <FlowStrip steps={flow} label="订单处理流程" />\n\n        <Callout tone="neutral" title={operationView.label}>\n          {operationView.detail}\n        </Callout>\n`,
+      },
+      {
+        file: CLOUD_FORM,
+        name: '云文档页重新加回 operationView 依赖',
+        find: `    config, isAdmin, hasValidToken, authError, operationActive, reconnect,\n  } = useApp()`,
+        replace: `    config, isAdmin, hasValidToken, authError, operationActive, operationView, reconnect,\n  } = useApp()`,
+      },
+      {
+        file: CLOUD_FORM,
+        name: '云文档页重新加回重复的 operationView Callout',
+        find: `        {!hasValidToken && (\n`,
+        replace: `        <Callout tone="neutral" title={operationView.label}>\n          {operationView.detail}\n        </Callout>\n\n        {!hasValidToken && (\n`,
+      },
+    ],
+    mustFail: [
+      '批2 ready · order：权威状态只在任务工作台头部一处（页签内无重复状态块）',
+      '批2 ready · cloud：权威状态只在任务工作台头部一处（页签内无重复状态块）',
+      '批2 就绪 · order：同一句状态说明在整页只出现 1 次（普通状态不再同屏重复）',
+      '批2 就绪 · cloud：同一句状态说明在整页只出现 1 次（普通状态不再同屏重复）',
+    ],
+    mustStillPass: [
+      '批2 ready · sss：权威状态只在任务工作台头部一处（页签内无重复状态块）',
+      '批2 就绪 · sss：同一句状态说明在整页只出现 1 次（普通状态不再同屏重复）',
+      '批2 error · order：状态说明完整可见（无横向省略号/纵向裁切）且无横向溢出',
+      '批2 凭据开关已移入高级设置，且默认仍是「保存」（data-state=checked）',
+      '布局无横向溢出 360x800',
+    ],
+  },
+  {
+    name: 'batch2-header-detail-truncated',
+    description: '批 2 回归：头部状态说明退回单行 truncate，长失败原因被省略号截掉',
+    mutations: [
+      {
+        file: TASK_PANEL,
+        name: '头部说明行退回单行 truncate',
+        find: `              className="break-words text-[11px] text-muted-foreground"`,
+        replace: `              className="truncate text-[11px] text-muted-foreground"`,
+      },
+    ],
+    mustFail: [
+      '批2 error · order：状态说明完整可见（无横向省略号/纵向裁切）且无横向溢出',
+      '批2 uncertain · order：状态说明完整可见（无横向省略号/纵向裁切）且无横向溢出',
+      '批2 uncertain · cloud：状态说明完整可见（无横向省略号/纵向裁切）且无横向溢出',
+      '批2 待核对 · 订单 @360x800：状态只在头部一处、说明完整、无横向溢出',
+    ],
+    mustStillPass: [
+      '批2 ready · order：状态说明完整可见（无横向省略号/纵向裁切）且无横向溢出',
+      '批2 ready · order：权威状态只在任务工作台头部一处（页签内无重复状态块）',
+      '批2 就绪 · order：同一句状态说明在整页只出现 1 次（普通状态不再同屏重复）',
+      '批2 凭据开关已移入高级设置，且默认仍是「保存」（data-state=checked）',
+      '布局无横向溢出 360x800',
+    ],
+  },
+  {
+    name: 'batch2-remember-default-flipped',
+    description: '批 2 回归：凭据开关移入高级设置时默认值被改掉（原来是默认「保存」）',
+    mutations: [
+      {
+        file: TASK_PANEL,
+        name: '订单页凭据开关默认值 true → false',
+        find: `  const [count, setCount] = useState<number | null>(config?.order_count ?? null)\n  const [remember, setRemember] = useState(true)`,
+        replace: `  const [count, setCount] = useState<number | null>(config?.order_count ?? null)\n  const [remember, setRemember] = useState(false)`,
+      },
+    ],
+    mustFail: [
+      '批2 凭据开关已移入高级设置，且默认仍是「保存」（data-state=checked）',
+    ],
+    mustStillPass: [
+      '批2 凭据开关不再常驻主流程（未展开高级设置时订单页没有这个开关）',
+      '批2 页签来回切换不丢草稿（订单数量 3 + 闪时送商品名都还在）',
+      '批2 ready · order：权威状态只在任务工作台头部一处（页签内无重复状态块）',
+      '布局无横向溢出 360x800',
     ],
   },
   ...PAGE_ERROR_SCENARIOS,

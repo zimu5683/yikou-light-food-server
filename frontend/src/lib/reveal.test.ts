@@ -11,6 +11,7 @@ import test from 'node:test'
 
 import {
   FAB,
+  FAB_CLEARANCE,
   LOG_REVEAL_ORIGIN,
   LOG_REVEAL_RADIUS,
   REVEAL_TIMING,
@@ -264,4 +265,23 @@ test('closeFramesCss 是 openFramesCss 的倒放', () => {
   const closed = closeFramesCss()
   assert.equal(closed.from, opened.to)
   assert.equal(closed.to, opened.from)
+})
+
+// ----------------------------------------------------------------------
+// 让位表达式：按钮是 fixed 的、不占布局，标题栏/日志头部必须按同一套几何让位
+// ----------------------------------------------------------------------
+test('FAB_CLEARANCE 与圆心表达式同源（都从 FAB 的 rightPx/sizePx 推导）', () => {
+  assert.ok(FAB_CLEARANCE.includes('var(--safe-right)'))
+  assert.ok(LOG_REVEAL_ORIGIN.includes(`${FAB.rightPx + FAB.sizePx / 2}px`))
+  assert.ok(FAB_CLEARANCE.includes(`${FAB.rightPx + FAB.sizePx + FAB.clearanceGapPx}px`))
+})
+
+test('FAB_CLEARANCE 让出的宽度不小于按钮实际占位，且不过度留白', () => {
+  const matched = FAB_CLEARANCE.match(/\+ (\d+)px\)$/)
+  assert.ok(matched, `让位表达式里应当有明确的像素值：${FAB_CLEARANCE}`)
+  const clearance = Number.parseInt(matched![1], 10)
+  const fabOccupied = FAB.rightPx + FAB.sizePx
+  // 小于占位 → 文字/筛选控件仍会被按钮压住；大太多 → 窄屏白白浪费横向空间。
+  assert.ok(clearance >= fabOccupied, `让位 ${clearance}px 小于按钮占位 ${fabOccupied}px`)
+  assert.ok(clearance - fabOccupied <= 16, `让位 ${clearance}px 比按钮占位多出太多`)
 })

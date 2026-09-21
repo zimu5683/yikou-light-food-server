@@ -9,7 +9,7 @@
  * - 密码清除只在服务端成功后同步清空表单草稿。
  */
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react'
-import { MoreHorizontal, ScrollText } from 'lucide-react'
+import { MoreHorizontal } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { CloudForm } from '@/components/CloudForm'
 import {
@@ -45,14 +45,12 @@ import { toFieldErrors, validateOrderDraft, validateSssDraft } from '@/lib/formV
 import { passwordResetVersion } from '@/lib/passwordDraft'
 import { classifyRequestError } from '@/lib/requestError'
 import { previewLocalKey } from '@/lib/preview'
-import { pointFromEvent } from '@/lib/reveal'
-import type { LogReveal } from '@/lib/useLogReveal'
 import { saveStateView } from '@/lib/saveState'
 import { cn } from '@/lib/utils'
 
 const TAB_ORDER: TaskMode[] = ['order', 'cloud', 'sss']
 
-export function TaskPanel({ logReveal }: { logReveal?: LogReveal }) {
+export function TaskPanel() {
   const { mode, setMode, config, operationView } = useApp()
   const formKey = config ? 'ready' : 'loading'
 
@@ -87,7 +85,18 @@ export function TaskPanel({ logReveal }: { logReveal?: LogReveal }) {
         <div className="mb-2 flex min-w-0 items-center gap-2">
           <div className="min-w-0 flex-1">
             <h1 className="font-serif text-base font-semibold tracking-[1px]">任务工作台</h1>
-            <p className="truncate text-[11px] text-muted-foreground">{operationView.detail}</p>
+            {/* 唯一的权威状态说明。原来是单行 `truncate`：长失败原因会被省略号截掉，
+                而页签内那份完整的重复 Callout 已按批 2 方案删除 —— 所以这里改成允许
+                折行，失败原因必须完整可见，并保留 danger 时的 alert 语义。
+                不截断由门禁「批2 三页签状态矩阵」按 scrollWidth/scrollHeight 锁住。 */}
+            <p
+              data-operation-detail="true"
+              className="break-words text-[11px] text-muted-foreground"
+              title={operationView.detail}
+              role={operationView.tone === 'danger' ? 'alert' : undefined}
+            >
+              {operationView.detail}
+            </p>
           </div>
           <StatusPill label={operationView.label} tone={operationView.tone} live={operationView.active} />
         </div>
@@ -113,7 +122,7 @@ export function TaskPanel({ logReveal }: { logReveal?: LogReveal }) {
         className="min-h-0 flex-1 flex-col data-[hidden=false]:flex"
         data-hidden={mode !== 'order'}
       >
-        <OrderForm key={formKey} logReveal={logReveal} />
+        <OrderForm key={formKey} />
       </div>
       <div
         id="task-panel-cloud"
@@ -123,7 +132,7 @@ export function TaskPanel({ logReveal }: { logReveal?: LogReveal }) {
         className="min-h-0 flex-1 flex-col data-[hidden=false]:flex"
         data-hidden={mode !== 'cloud'}
       >
-        <CloudForm key={formKey} logReveal={logReveal} />
+        <CloudForm key={formKey} />
       </div>
       <div
         id="task-panel-sss"
@@ -133,7 +142,7 @@ export function TaskPanel({ logReveal }: { logReveal?: LogReveal }) {
         className="min-h-0 flex-1 flex-col data-[hidden=false]:flex"
         data-hidden={mode !== 'sss'}
       >
-        <SssForm key={formKey} logReveal={logReveal} />
+        <SssForm key={formKey} />
       </div>
     </section>
   )
@@ -180,7 +189,7 @@ function ModeTab({
 /* 订单处理                                                             */
 /* ------------------------------------------------------------------ */
 
-function OrderForm({ logReveal }: { logReveal?: LogReveal }) {
+function OrderForm() {
   const { config, passwords, startOrder, workerAlive, operationActive, operationView, isAdmin, passwordReset } = useApp()
   const orderResetVersion = passwordResetVersion(passwordReset, 'order')
   const [url, setUrl] = useState(config?.target_url ?? '')
@@ -290,7 +299,6 @@ function OrderForm({ logReveal }: { logReveal?: LogReveal }) {
     }
   }
 
-  const resultTone = operationView.tone === 'danger' ? 'danger' : operationView.tone === 'warning' ? 'warning' : 'neutral'
   const flow: Array<{ key: string; label: string; state: 'todo' | 'active' | 'done' | 'warning' | 'error'; detail?: string }> = [
     { key: 'prepare', label: '准备', state: 'done' },
     { key: 'validate', label: '校验', state: confirmOpen ? 'done' : 'active' },
@@ -299,8 +307,8 @@ function OrderForm({ logReveal }: { logReveal?: LogReveal }) {
     {
       key: 'result',
       label: '结果',
+      // 只保留「结果这一步处于什么状态」这一独有信息；重复的说明文本已删除（批 2）。
       state: operationView.key === 'error' ? 'error' : operationView.needsReview ? 'warning' : operationView.key === 'success' ? 'done' : 'todo',
-      detail: operationView.detail,
     },
   ]
 
@@ -308,10 +316,6 @@ function OrderForm({ logReveal }: { logReveal?: LogReveal }) {
     <div className="flex min-w-0 min-h-0 flex-1 flex-col">
       <div className="scroll-contain min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-3 sm:px-5">
         <FlowStrip steps={flow} label="订单处理流程" />
-
-        <Callout tone={resultTone} title={operationView.label}>
-          {operationView.detail}
-        </Callout>
 
         {isAdmin && (
           <AdvancedSection
@@ -338,6 +342,11 @@ function OrderForm({ logReveal }: { logReveal?: LogReveal }) {
                 <GhostButton onClick={() => void newTemplate()}>新建模板</GhostButton>
               </div>
             </Field>
+            {/* 低频设置：与闪时送页一致放进高级设置。默认值、保存语义与清除凭据行为都不变。 */}
+            <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
+              <Switch checked={remember} onCheckedChange={setRemember} aria-label="保存到系统凭据管理器" />
+              <span>保存到系统凭据管理器</span>
+            </div>
           </AdvancedSection>
         )}
         {!isAdmin && (
@@ -353,12 +362,6 @@ function OrderForm({ logReveal }: { logReveal?: LogReveal }) {
           <Stepper id="order-count" value={count} onChange={setCount} invalid={Boolean(modeError(fields, 'count'))} />
         </Field>
 
-        {isAdmin && (
-          <div className="mb-3.5 flex items-center gap-2 text-[12px] text-muted-foreground">
-            <Switch checked={remember} onCheckedChange={setRemember} aria-label="保存到系统凭据管理器" />
-            <span>保存到系统凭据管理器</span>
-          </div>
-        )}
       </div>
 
       <BottomDock
@@ -368,7 +371,6 @@ function OrderForm({ logReveal }: { logReveal?: LogReveal }) {
         primaryBusy={busy}
         onPrimary={validateAndPreview}
         workerAlive={workerAlive}
-        logReveal={logReveal}
         tools={<ToolsMenu mode="order" />}
       />
 
@@ -408,7 +410,7 @@ function OrderForm({ logReveal }: { logReveal?: LogReveal }) {
 
 type SssExecutionMode = 'dry_run' | 'preflight' | 'live'
 
-function SssForm({ logReveal }: { logReveal?: LogReveal }) {
+function SssForm() {
   const {
     config, passwords, startSss, workerAlive, operationActive, operationView, isAdmin, passwordReset,
   } = useApp()
@@ -578,7 +580,6 @@ function SssForm({ logReveal }: { logReveal?: LogReveal }) {
   }
 
   const modeLabel = executionMode === 'live' ? '正式下单' : executionMode === 'preflight' ? '预检' : '模拟执行'
-  const modeTone = executionMode === 'live' ? 'danger' : executionMode === 'preflight' ? 'warning' : 'success'
   const primaryLabel = operationActive
     ? '已有操作进行中'
     : needsDayPreview
@@ -601,8 +602,8 @@ function SssForm({ logReveal }: { logReveal?: LogReveal }) {
     { key: 'run', label: '执行', state: workerAlive ? 'active' as const : operationView.key === 'success' ? 'done' as const : 'todo' as const },
     {
       key: 'result', label: '结果',
+      // 只保留「结果这一步处于什么状态」这一独有信息；重复的说明文本已删除（批 2）。
       state: operationView.key === 'error' ? 'error' as const : operationView.needsReview ? 'warning' as const : operationView.key === 'success' ? 'done' as const : 'todo' as const,
-      detail: operationView.detail,
     },
   ]
 
@@ -610,18 +611,6 @@ function SssForm({ logReveal }: { logReveal?: LogReveal }) {
     <div className="flex min-w-0 min-h-0 flex-1 flex-col">
       <div className="scroll-contain min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-3 sm:px-5">
         <FlowStrip steps={flow} label="闪时送执行流程" />
-
-        <Callout tone={modeTone === 'danger' ? 'danger' : modeTone === 'warning' ? 'warning' : 'success'} title={`本次执行方式：${modeLabel}`}>
-          {executionMode === 'live'
-            ? '正式下单会真实创建订单并可能产生费用/占用余额。'
-            : executionMode === 'preflight'
-              ? '预检会登录并检查余额/已有单，但不会创建订单。'
-              : '模拟执行只组装并预览下单报文，不会创建真实订单。'}
-        </Callout>
-
-        <Callout tone={operationView.tone === 'danger' ? 'danger' : operationView.tone === 'warning' ? 'warning' : 'neutral'} title={operationView.label}>
-          {operationView.detail}
-        </Callout>
 
         {isAdmin && (
           <AdvancedSection
@@ -713,7 +702,6 @@ function SssForm({ logReveal }: { logReveal?: LogReveal }) {
         primaryBusy={busy}
         onPrimary={validateAndConfirm}
         workerAlive={workerAlive}
-        logReveal={logReveal}
         tools={<ToolsMenu mode="sss" />}
       />
 
@@ -833,7 +821,6 @@ function BottomDock({
   primaryBusy,
   onPrimary,
   workerAlive,
-  logReveal,
   tools,
 }: {
   status: ReactNode
@@ -842,7 +829,6 @@ function BottomDock({
   primaryBusy: boolean
   onPrimary: () => void
   workerAlive: boolean
-  logReveal?: LogReveal
   tools?: ReactNode
 }) {
   const { stopTask } = useApp()
@@ -856,6 +842,8 @@ function BottomDock({
         {status}
         {tools}
       </div>
+      {/* 底栏只留业务动作：日志入口唯一化到右上角悬浮按钮（components/LogFab.tsx），
+          展开/收起都由它负责，这里不再放第二颗「日志」按钮。 */}
       <div className="flex gap-2">
         <Button
           className="btn-serif-primary h-10 flex-1 rounded-[8px] text-sm"
@@ -864,17 +852,6 @@ function BottomDock({
         >
           {primaryBusy ? '执行中…' : primaryLabel}
         </Button>
-        {logReveal && (
-          <Button
-            variant="outline"
-            className="h-10 w-14 rounded-[8px] px-0 text-xs"
-            onClick={(event) => logReveal.toggleFrom(pointFromEvent(event))}
-            aria-label="打开或收起运行日志"
-            aria-controls="phone-log-sheet"
-          >
-            <ScrollText className="size-4" />
-          </Button>
-        )}
         <Button
           variant="outline"
           className="h-10 w-20 rounded-[8px] border-destructive/45 bg-card text-xs text-destructive hover:bg-destructive/5 hover:text-destructive"

@@ -71,8 +71,6 @@ import {
 } from '@/lib/wpsFailure'
 import { classifyRequestError } from '@/lib/requestError'
 import { splitAddressLines } from '@/lib/format'
-import { pointFromEvent } from '@/lib/reveal'
-import type { LogReveal } from '@/lib/useLogReveal'
 import { saveStateView } from '@/lib/saveState'
 import { cn } from '@/lib/utils'
 
@@ -101,9 +99,9 @@ interface Message {
   text: string
 }
 
-export function CloudForm({ logReveal }: { logReveal?: LogReveal }) {
+export function CloudForm() {
   const {
-    config, isAdmin, hasValidToken, authError, operationActive, operationView, reconnect,
+    config, isAdmin, hasValidToken, authError, operationActive, reconnect,
   } = useApp()
 
   const [status, setStatus] = useState<WpsStatus | null>(null)
@@ -583,10 +581,6 @@ export function CloudForm({ logReveal }: { logReveal?: LogReveal }) {
           </Callout>
         )}
 
-        <Callout tone={operationView.tone === 'danger' ? 'danger' : operationView.tone === 'warning' ? 'warning' : 'neutral'} title={operationView.label}>
-          {operationView.detail}
-        </Callout>
-
         {needSetupNotice && (
           <Callout tone="warning" title="先完成云同步准备">
             {needSetupNotice}
@@ -825,17 +819,6 @@ export function CloudForm({ logReveal }: { logReveal?: LogReveal }) {
             {busy === 'upload' ? <Loader2 className="mr-1 size-4 animate-spin" /> : null}
             {busy === 'upload' ? '上传中…' : primaryLabel}
           </Button>
-          {logReveal && (
-            <Button
-              variant="outline"
-              className="h-10 w-14 rounded-[8px] px-0 text-xs"
-              aria-label="打开或收起运行日志"
-              aria-controls="phone-log-sheet"
-              onClick={(event) => logReveal.toggleFrom(pointFromEvent(event))}
-            >
-              日志
-            </Button>
-          )}
         </div>
       </div>
 

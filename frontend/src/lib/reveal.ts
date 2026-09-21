@@ -59,6 +59,13 @@ export const FAB = {
   rightPx: 12,
   /** 量不到按钮位置时的兜底顶边距（正常由 ref 实测中心）。 */
   fallbackTopPx: 0,
+  /**
+   * 让位后与相邻内容保留的呼吸间隙。
+   *
+   * 按钮是 `fixed` 的，不占布局；标题栏/日志头部的右侧文字与筛选控件若不让位，
+   * 就会被它压住（点不到、看不清）。间隙取 8px，正好在触控目标之间留出视觉分隔。
+   */
+  clearanceGapPx: 8,
 } as const
 
 /** 从指针事件里取视口坐标。 */
@@ -143,6 +150,16 @@ export function closeFrames(origin: Point, rect: RectLike): RevealFrames {
 export const LOG_REVEAL_ORIGIN =
   `calc(100% - var(--safe-right) - ${FAB.rightPx + FAB.sizePx / 2}px) ` +
   `calc(var(--safe-top) + ${FAB.sizePx / 2}px)`
+
+/**
+ * 给右上角日志按钮让出的右侧空间（CSS 表达式，含 8px 呼吸间隙）。
+ *
+ * 与 `LOG_REVEAL_ORIGIN` 同源：都从 `FAB.rightPx / FAB.sizePx` 推导，改按钮尺寸时
+ * 圆心与让位一起变，不会出现「按钮挪了、标题栏文字或日志筛选控件还被压着」。
+ * 用法：`padding-right: var(--fab-clearance)`（未定义时调用方给 0px 兜底）。
+ */
+export const FAB_CLEARANCE =
+  `calc(var(--safe-right) + ${FAB.rightPx + FAB.sizePx + FAB.clearanceGapPx}px)`
 
 /** 屏幕对角线最大值是 141.42vmax；142vmax 刚好盖满全屏，不做过多的无效扩大。 */
 export const LOG_REVEAL_RADIUS = '142vmax'

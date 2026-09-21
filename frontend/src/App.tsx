@@ -1,7 +1,7 @@
 /**
  * 应用根组件：手机 APK 优先的工作台布局。
  *
- * - phone：任务面板 + 底栏主动作，日志由底栏按钮展开为全屏层；
+ * - phone：任务面板 + 底栏主动作，日志由右上角悬浮按钮（LogFab）展开为全屏层；
  * - tablet/desktop：任务/日志左右或上下分栏，保留可拖拽比例；
  * - 顶栏固定显示任务类型、权威运行状态与安全模式；
  * - 全局请求错误统一呈现“哪里失败 + 下一步”，断线只标记连接，不篡改任务状态。
@@ -22,12 +22,14 @@ import {
   UpdateAvailableDialog,
 } from '@/components/dialogs'
 import { LogConsole } from '@/components/LogConsole'
+import { LogFab } from '@/components/LogFab'
 import { TaskPanel } from '@/components/TaskPanel'
 import { TitleBar } from '@/components/TitleBar'
 import { useApp } from '@/hooks/appContext'
 import { interactionRecoveryView, interactionKindLabel } from '@/lib/interactionRecovery'
 import { useLogReveal } from '@/lib/useLogReveal'
 import { layoutForWidth } from '@/lib/layout'
+import { FAB_CLEARANCE } from '@/lib/reveal'
 import { cn } from '@/lib/utils'
 
 const RATIO_MIN = 0.3
@@ -61,6 +63,9 @@ export default function App() {
   const reveal = useLogReveal()
   const containerRef = useRef<HTMLDivElement>(null)
   const dragging = useRef(false)
+  const noticeRef = useRef<HTMLDivElement>(null)
+  /** 手机端提示区域实测高度 + 其底边在视口里的位置（无提示时都为 0）。 */
+  const [notice, setNotice] = useState({ height: 0, bottom: 0 })
 
   // 软键盘安全区：visualViewport 变小（adjustResize 失败）时把底栏抬到键盘之上。
   useEffect(() => {
@@ -86,6 +91,35 @@ export default function App() {
     wasRunning.current = workerAlive
   }, [workerAlive, layout, openRemembered])
 
+  /**
+   * 把手机端提示区域的**真实高度**同步成 CSS 变量，供全屏日志层让位。
+   *
+   * 提示区域是正常布局的一部分（见 index.css 的 `.phone-notice-region`），
+   * 但全屏日志层是 `fixed inset-0`：日志展开时它覆盖整屏，所以日志内容必须按
+   * 提示区域的高度整体下移，提示条才不会盖住日志头部（状态/搜索/工具）。
+   * 用 ResizeObserver 实测而不是固定像素：长提示、多条提示、字体放大、
+   * 横竖屏切换时高度都会变，写死数字迟早对不上。
+   */
+  useEffect(() => {
+    const element = noticeRef.current
+    if (layout !== 'phone' || !element) {
+      setNotice((current) => (current.height === 0 && current.bottom === 0 ? current : { height: 0, bottom: 0 }))
+      return
+    }
+    const sync = () => {
+      const rect = element.getBoundingClientRect()
+      const height = Math.round(rect.height)
+      // 无提示时区域高度为 0：此时不参与让位，布局与改动前完全一致。
+      const bottom = height > 0 ? Math.round(rect.bottom) : 0
+      setNotice((current) => (current.height === height && current.bottom === bottom ? current : { height, bottom }))
+    }
+    sync()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(sync)
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [layout])
+
   const onDividerDown = useCallback((e: ReactPointerEvent) => {
     dragging.current = true
     ;(e.target as HTMLElement).setPointerCapture(e.pointerId)
@@ -107,7 +141,15 @@ export default function App() {
   return (
     <div
       className="flex h-full min-h-0 flex-col overflow-hidden"
-      style={{ '--keyboard-inset': `${keyboardInset}px` } as React.CSSProperties}
+      style={{
+        '--keyboard-inset': `${keyboardInset}px`,
+        // 手机端右上角常驻日志按钮：标题栏与日志头部据此在右侧让位，
+        // 避免 fixed 按钮压住主题切换、日志标题/筛选控件。
+        ...(layout === 'phone' ? { '--fab-clearance': FAB_CLEARANCE } : {}),
+        // 手机端提示区域实测高度与底边：全屏日志层据此整体下移（见下面的 effect）。
+        '--phone-notice-height': `${layout === 'phone' ? notice.height : 0}px`,
+        '--phone-notice-bottom': `${layout === 'phone' ? notice.bottom : 0}px`,
+      } as React.CSSProperties}
     >
       <TitleBar />
       <AuthBanner message={authError} />
@@ -116,12 +158,40 @@ export default function App() {
 
       {layout === 'phone' ? (
         <>
+          {/* 手机端提示区域：提示条在这里**占正常布局空间**（不是浮层），
+              下面的任务面板整体下移 —— 标题栏状态、右上角日志按钮、底栏动作、
+              待处理输入与弹窗都不可能被它盖住（弹窗 z-50 仍在区域 z-40 之上）。
+              上限有两条：`45vh`（常规视口，占屏不超过 45%）与
+              `calc(100vh - 15rem)`（极短视口的安全线：15rem ≈ 标题栏 + 任务面板
+              固定 chrome 的实测上界，rem 随系统字体缩放一起长）。两者取小，
+              配合 `overflow-y-auto`：空间不够时提示改为**区域内滚动**，
+              而不会把底栏「开始/停止」挤出屏幕（横屏 320 高 + 1.25× 字体实测）。 */}
+          <div
+            ref={noticeRef}
+            data-phone-notice-region="true"
+            className="phone-notice-region relative z-40 min-h-0 max-h-[min(45vh,calc(100vh-15rem))] overflow-y-auto"
+          >
+            <Toaster
+              position="top-center"
+              expand
+              className="toaster phone-notice-toaster"
+              richColors
+              closeButton
+            />
+          </div>
           <main className="flex min-h-0 flex-1 flex-col">
             <div className="flex min-h-0 flex-1">
-              <TaskPanel logReveal={reveal} />
+              <TaskPanel />
             </div>
           </main>
           <LogConsole layout="phone" reveal={reveal} />
+          {/* 日志的唯一入口：始终浮在右上角、全屏日志层(z-30)之上，
+              点它展开、再点同一个按钮收回。running 用权威运行状态点亮呼吸 LED。 */}
+          <LogFab
+            open={reveal.open}
+            running={workerAlive}
+            onToggle={() => reveal.toggleFrom(null)}
+          />
         </>
       ) : (
         <main
@@ -158,11 +228,11 @@ export default function App() {
       <DecisionDialog />
       <CaptchaDialog />
       <UpdateAvailableDialog />
-      <Toaster
-        position={layout === 'phone' ? 'top-center' : 'bottom-right'}
-        richColors
-        closeButton
-      />
+      {/* 桌面/平板：sonner 默认的右下角浮层，行为与改动前完全一致。
+          手机端的提示区域在上面（占布局空间），两者互斥渲染。 */}
+      {layout !== 'phone' && (
+        <Toaster position="bottom-right" richColors closeButton />
+      )}
     </div>
   )
 }

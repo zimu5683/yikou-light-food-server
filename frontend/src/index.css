@@ -236,6 +236,49 @@
   .led-breathe { animation: none; }
 }
 
+/* ------------------------------------------------------------------
+   手机端提示区域（.phone-notice-region）—— 提示条占据正常布局空间，不做浮层。
+
+   为什么：贴顶/贴角的浮层提示总会压住某个关键内容（右上角日志按钮、标题栏
+   状态行、日志头部、底栏动作都曾被它压住），靠调偏移量只是把问题挪到别处。
+   这里让提示区域成为 flex 列里的一段普通布局：它下面的任务面板整体下移，
+   标题栏仍在上方、底栏仍在最底，因此**不可能**盖住它们。
+   只覆盖 sonner 的定位/堆叠方式，不动它的展示时长、配色与关闭按钮。
+
+   层级：区域 z-40（高于全屏日志层 z-30，低于对话框/覆盖层 z-50）；
+   全屏日志层的内容按 --phone-notice-height 下移（见 LogConsole.tsx），
+   所以提示条也不会盖住日志头部（状态/搜索/工具）。
+   ------------------------------------------------------------------ */
+.phone-notice-region .phone-notice-toaster[data-sonner-toaster] {
+  position: static;
+  inset: auto;
+  width: 100%;
+  height: auto;
+  z-index: auto;
+  transform: none;
+  transition: none;
+}
+.phone-notice-region .phone-notice-toaster[data-sonner-toaster] [data-sonner-toast] {
+  /* 参与文档流：每条提示正常排布，相互不重叠、也不越出区域。 */
+  position: relative;
+  left: auto;
+  right: auto;
+  width: auto;
+  transform: none;
+  /* 允许在区域内滚动查看长提示（sonner 默认 none 是给左右滑走手势用的）。 */
+  touch-action: auto;
+  margin: 8px calc(10px + var(--safe-right)) 0 calc(10px + var(--safe-left));
+  transition: opacity 200ms;
+}
+.phone-notice-region .phone-notice-toaster[data-sonner-toaster] [data-sonner-toast]:last-child {
+  margin-bottom: 8px;
+}
+/* sonner 在展开态按浮层堆叠写死 `height: var(--initial-height)`；
+   流式排布必须以内容高度为准，否则字体放大 / 多行长提示会被截断。 */
+.phone-notice-region .phone-notice-toaster[data-sonner-toaster] [data-sonner-toast][data-mounted='true'] {
+  height: auto;
+}
+
 /* 兼容旧组件：sr-only 等由 Tailwind 提供；这里显式保证 [hidden] 不会被覆盖。 */
 [hidden] {
   display: none !important;

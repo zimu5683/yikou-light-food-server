@@ -9,6 +9,9 @@
  *
  * 层级 z-40：高于全屏日志面板(z-30)，低于对话框与 Toast(z-50)，
  * 保证全屏日志时仍能点它收起，弹窗出现时也不会被按钮压住。
+ *
+ * 这颗按钮是 `fixed` 定位、不占布局，所以标题栏与日志头部要用
+ * `--fab-clearance`（见 lib/reveal.ts 的 FAB_CLEARANCE）在右侧让位。
  */
 import { ScrollText } from 'lucide-react'
 
@@ -28,13 +31,15 @@ export function LogFab({
   return (
     <button
       type="button"
+      // 交互检查脚本与自动化定位用的稳定钩子（文案会随开合变化，不适合当锚点）。
+      data-log-fab="true"
       aria-label={open ? '收起运行日志' : '展开运行日志'}
       aria-expanded={open}
       aria-controls="phone-log-sheet"
       onClick={onToggle}
       style={{
         top: 'var(--safe-top)',
-        right: 'calc(var(--safe-right) + 12px)',
+        right: `calc(var(--safe-right) + ${FAB.rightPx}px)`,
         width: FAB.sizePx,
         height: FAB.sizePx,
       }}

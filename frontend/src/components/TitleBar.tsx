@@ -1,6 +1,15 @@
 /**
- * 紧凑顶栏：品牌/版本 + 当前任务 + 权威运行状态 + 安全模式 + 深浅主题。
+ * 紧凑顶栏：品牌/版本 + 当前任务类型 + 安全模式 + 深浅主题。
  * 手机 APK 优先；状态不靠颜色单独表达，均有文字。
+ *
+ * **权威运行状态不在这里**（批 2 方案）：它只在「任务工作台」头部出现一次
+ * （状态胶囊 + 说明，见 `TaskPanel.tsx`）。这里原先还有一行
+ * `状态：<label> · <detail>`，与头部逐字重复，已删除；品牌、版本、当前任务类型、
+ * 安全模式与主题入口全部保留。
+ *
+ * 手机端右上角常驻日志按钮（`LogFab`，fixed 定位不占布局），所以第一行在窄屏
+ * 用 `--fab-clearance` 在右侧让位，保证「主题切换」不会被按钮压住；≥640px 没有
+ * 悬浮按钮，恢复普通内边距。
  */
 import { useEffect, useState } from 'react'
 import { Moon, Sun } from 'lucide-react'
@@ -17,7 +26,7 @@ const MODE_LABELS = {
 } as const
 
 export function TitleBar() {
-  const { version, mocked, mode, operationView, config } = useApp()
+  const { version, mocked, mode, config } = useApp()
   const [theme, setTheme] = useState<Theme>(initialTheme)
 
   useEffect(() => {
@@ -50,7 +59,7 @@ export function TitleBar() {
       className="shrink-0 border-b bg-card/95 backdrop-blur"
       style={{ paddingTop: 'var(--safe-top)' }}
     >
-      <div className="flex h-11 items-center gap-2 px-3 sm:px-4">
+      <div className="flex h-11 items-center gap-2 pl-3 pr-[var(--fab-clearance,0px)] sm:pl-4 sm:pr-4">
         <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-[4px] bg-primary font-serif text-[13px] font-bold text-primary-foreground">
           轻
         </div>
@@ -77,13 +86,8 @@ export function TitleBar() {
         <span className="shrink-0 rounded-full border bg-secondary/60 px-2 py-0.5 text-foreground">
           {MODE_LABELS[mode]}
         </span>
-        <span className="min-w-0 truncate">
-          状态：
-          <b className={cn('font-medium', operationView.tone === 'danger' ? 'text-destructive' : operationView.tone === 'warning' ? 'text-warning' : operationView.tone === 'success' ? 'text-success' : 'text-foreground')}>
-            {operationView.label}
-          </b>
-          {operationView.detail ? ` · ${operationView.detail}` : ''}
-        </span>
+        {/* 权威运行状态只在任务工作台头部出现一次；这里不再复述（批 2）。
+            安全模式是保护信息，继续常驻。 */}
         <span className={cn('ml-auto shrink-0 whitespace-nowrap font-medium', safety.tone)}>
           安全模式：{safety.label}
         </span>
