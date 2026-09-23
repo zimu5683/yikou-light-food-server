@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,9 +68,11 @@ class TermuxPackage:
 PACKAGES: tuple[TermuxPackage, ...] = (
     TermuxPackage(
         name="proot",
-        version="5.1.107.92",
-        filename="proot_5.1.107.92_aarch64.deb",
-        sha256="1f1c983509701f6826f568482c70673ee453a9ba38c9f5fa445a472d6b7524e9",
+        # 2026-09-23：Termux 把 5.1.107.92 从 pool 移除，旧 pin 直接 404 卡住 APK 构建。
+        # 按 dists/stable/main/binary-aarch64/Packages 升到 .94，并重新冻结官方 SHA256。
+        version="5.1.107.94",
+        filename="proot_5.1.107.94_aarch64.deb",
+        sha256="b6fa26884d162f5234b0aba9f8a98971aad793706099464f7bd7eb1e21d63935",
         pool_group="p/proot",
         members={
             "data/data/com.termux/files/usr/bin/proot": PROOT_OUT,
@@ -121,8 +124,16 @@ def sha256_of_bytes(data: bytes) -> str:
 def _download(url: str, *, timeout: int = 120) -> bytes:
     print(f"  下载 {url}")
     request = urllib.request.Request(url, headers={"User-Agent": "yikou-android-runtime/1.0"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
-        return response.read()
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise SystemExit(
+                f"{url} 返回 404：Termux 轮转包版本时会把旧 .deb 从 pool 移除。"
+                f"请在 {TERMUX_BASE}/dists/stable/main/binary-aarch64/Packages 里查"
+                "新的 Filename 与 SHA256，更新 PACKAGES 后重跑本脚本。") from exc
+        raise
 
 
 def _read_ar_members(data: bytes) -> dict[str, bytes]:
