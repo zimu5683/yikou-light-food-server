@@ -84,7 +84,7 @@ def test_ar_parser_rejects_non_ar_data():
 def test_package_urls_match_termux_repository_paths():
     module = _load()
     expected = {
-        "proot": ("p/proot", "proot_5.1.107.92_aarch64.deb"),
+        "proot": ("p/proot", "proot_5.1.107.94_aarch64.deb"),
         "libtalloc": ("libt/libtalloc", "libtalloc_2.4.3_aarch64.deb"),
         "libandroid-shmem": ("liba/libandroid-shmem", "libandroid-shmem_0.7_aarch64.deb"),
     }
