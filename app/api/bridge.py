@@ -52,7 +52,23 @@ from app.integrations.sss_url import SssUrlConfigError, canonical_sss_origin
 from app.core.credentials import (delete_password, delete_sss_password, get_password,
                           get_sss_password, set_password, set_sss_password)
 from app.order.templates import write_order_template, write_sss_template
-from app.ordering.sss import expected_delivery_date, run_sss_job
+from app.ordering.sss import (
+    _REVIEW_WIDE_WINDOW_DAYS,
+    _SSS_REVIEW_TTL_S,
+    UncertainJournalError,
+    authoritative_uncertain_path,
+    batch_key,
+    batch_submission_lock,
+    discard_uncertain_records,
+    expected_delivery_date,
+    journal_fingerprint,
+    mask_contact,
+    pending_record_views,
+    platform_origin,
+    resolve_uncertain_records,
+    run_sss_job,
+    run_sss_review_job,
+)
 from app.ordering.cloud_import import ImportRefused, prepare_day_orders
 from app.api.operation import OperationCoordinator
 from app.api.preview import (PREVIEW_TTL_SECONDS, PreviewStore,
@@ -209,6 +225,10 @@ class Bridge:
         #: 任务完成事件幂等：同一 worker 生命周期只接受第一次 _finish_task/_task_error。
         self._task_finish_lock = threading.Lock()
         self._task_finished = False
+        #: 只读核对证据快照（仅内存）：管理员据“站内查不到”解除阻断前必须先有
+        #: 一次新鲜核对，快照就是那条证据；进程重启即失效，必须重新核对。
+        self._sss_review_snapshot: dict[str, Any] = {}
+        self._sss_review_lock = threading.Lock()
         self._authorize_operation_id = ""
         self._update_check_operation_id = ""
         self._update_install_operation_id = ""
@@ -910,6 +930,102 @@ class Bridge:
                 next_action="查看日志后重试")
             raise
 
+    def start_sss_review(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """启动「只读核对未决记录与站内订单」worker（仅管理员，绝不发 POST）。
+
+        为什么单独开一个入口：未决记录闸门在阻断时要求用户“只读核对站内订单与
+        本地记录”，但正式运行与预检都会在闸门处提前返回，用户拿不到核对结果。
+        本入口只做读操作，因此**允许在被阻断时使用**；它不会解除阻断 —— 解除必须
+        走 :meth:`sss_uncertain_resolve` 的人工确认入口。
+
+        请求：``POST /api/start_sss_review``，JSON 数组单对象::
+
+            {"password": "闪时送登录密码"}
+
+        本入口**不写任何凭据**（``remember`` 被忽略）：核对是只读动作，不该有
+        配置/密钥副作用。
+        """
+        data: dict[str, Any] = dict(payload) if isinstance(payload, dict) else {}
+        if not self.is_admin:
+            # 双保险：HTTP 白名单已经 403；直接调用（脚本/旧客户端）也必须拒绝，
+            # 否则受限角色能借这个入口用调用方提供的密码登录平台。
+            return {
+                "ok": False, "status": "forbidden", "code": "forbidden",
+                "reason": "只读核对入口仅管理员可用",
+                "next_action": "联系管理员处理",
+                "summary": {"message": "只读核对入口仅管理员可用"},
+            }
+        if self.worker_alive():
+            return self._busy_result_from_worker()
+        reservation = self._operations.try_reserve(
+            "sss_review", summary={"title": "闪时送只读核对"},
+            next_action="等待只读核对结束或查询 operation_status")
+        if not reservation.granted:
+            return self._operation_conflict_payload(reservation.conflict,
+                                                    action="启动闪时送只读核对")
+        operation = reservation.operation
+        assert operation is not None
+        try:
+            url = str(getattr(self._config, "sss_url", "") or "").strip()
+            account = str(getattr(self._config, "sss_account", "") or "").strip()
+            password = str(data.get("password", "") or "")
+            fields: dict[str, Any] = {}
+            if not url:
+                fields["url"] = {"message": "请先保存闪时送网址"}
+            else:
+                try:
+                    canonical_sss_origin(url)
+                except SssUrlConfigError as exc:
+                    fields["url"] = {"message": str(exc)}
+            if not account:
+                fields["account"] = {"message": "请先保存闪时送账号"}
+            if not password:
+                fields["password"] = {"message": "请输入登录密码"}
+            if fields:
+                self._operations.finish(
+                    operation, status="rejected", reason="validation_failed",
+                    summary={"fields": fields}, next_action="修正表单后重试")
+                return {
+                    "ok": False, "status": "rejected", "reason": "validation_failed",
+                    "next_action": "修正表单后重试", "summary": {"fields": fields},
+                    "operation_id": operation.operation_id, "fields": fields,
+                }
+            # 冻结配置快照：核对期间用户改配置不会改变本次作用域（与 start_sss 同）。
+            snapshot = copy.deepcopy(self._config)
+            self._task_operation_id = operation.operation_id
+            self._task_owner = self._request_identity()
+            self._task_owner_is_admin = bool(self.is_admin)
+            launched = self._launch("sss_review", snapshot, None, password)
+            if launched is False:
+                if self._task_operation_id == operation.operation_id:
+                    self._task_operation_id = ""
+                    self._task_owner = ""
+                    self._task_owner_is_admin = False
+                self._operations.finish(
+                    operation, status="rejected", reason="operation_conflict",
+                    summary={"message": "启动时发现已有任务正在运行"},
+                    next_action="等待当前操作结束后重试")
+                return self._busy_result_from_worker("已有任务正在运行，请先停止后再启动")
+            active = self._operations.is_active(operation)
+            return {
+                "ok": True,
+                "status": "running" if active else "success",
+                "reason": "",
+                "next_action": ("只读核对进行中；可用 bridge_ready/operation_status 跟踪进度"
+                                if active else ""),
+                "summary": {"message": "闪时送只读核对已启动"},
+                "operation_id": operation.operation_id,
+            }
+        except Exception:
+            if self._task_operation_id == operation.operation_id:
+                self._task_operation_id = ""
+                self._task_owner = ""
+                self._task_owner_is_admin = False
+            self._operations.finish_if_active(
+                operation, status="error", reason="start_failed",
+                next_action="查看日志后重试")
+            raise
+
     # 表单防抖即时保存：只落盘本次改动，不做启动校验、不触发任务。
     def save_order_config(self, payload: dict[str, Any]) -> dict[str, Any]:
         """只更新订单处理侧的配置字段并落盘（不触碰闪时送侧）。写盘失败回 ``write_failed``。"""
@@ -1014,6 +1130,411 @@ class Bridge:
             self.log("留档 Excel 写入失败：" + str(summary["archive_error"]), "WARN")
         return {"ok": True, **summary}
 
+    # ------------------------------------------------------------------
+    # 闪时送未决记录：只读核对 + 管理员带审计解除
+    #
+    # 背景：闪时送下单 POST 非幂等，POST 结果未知的记录会一直阻断后续运行。
+    # 闸门只把“站内确实查到的”记录自动 resolved；“站内查不到”不等于“没落单”，
+    # 所以必须由人核对后再决定。这里补上缺失的两个能力：
+    # * sss_uncertain_records：只读列出阻断记录（脱敏，仅管理员，无网络）；
+    # * sss_uncertain_resolve：管理员带确认/备注/证据地处置（永不发 POST、永不联网）。
+    # ------------------------------------------------------------------
+    #: 允许的处置决策。
+    _SSS_RESOLVE_DECISIONS = ("station_absent", "station_present", "keep")
+    #: 审计备注最短长度：强制写下“凭什么可以解除阻断”。
+    _SSS_RESOLVE_MIN_NOTE = 4
+
+    def _sss_batch_context(self) -> dict[str, Any]:
+        """当前账号/批次的权威未决记录上下文（origin 规则与正式运行完全一致）。"""
+        config = self._config
+        url = str(getattr(config, "sss_url", "") or "").strip()
+        if not url:
+            raise UncertainJournalError("尚未配置闪时送网址，无法定位未决记录")
+        canonical_sss_origin(url)
+        origin = platform_origin(config, url=url)
+        account = str(getattr(config, "sss_account", "") or "")
+        if not account:
+            raise UncertainJournalError("尚未配置闪时送账号，无法定位未决记录")
+        source = str(getattr(config, "sss_order_source", "wps") or "wps").strip().lower()
+        if source != "excel":
+            source = "wps"
+        delivery_date = expected_delivery_date()
+        return {
+            "origin": origin,
+            "account": account,
+            "source": source,
+            "delivery_date": str(delivery_date),
+            "batch_key": batch_key(delivery_date, source, account),
+            "journal": authoritative_uncertain_path(
+                config, origin=origin, account=account),
+        }
+
+    def _sss_review_view(self, view: dict[str, Any]) -> dict[str, Any]:
+        """把内存里的只读核对证据整理成前端可读字段（含是否仍然有效）。"""
+        empty = {
+            "available": False, "stale": False, "journal_matches": False,
+            "covers_active": False, "checked_at": "", "age_s": None,
+            "wide_window_days": _REVIEW_WIDE_WINDOW_DAYS,
+            "journal_fingerprint": "", "counts": {}, "classifications": {},
+            "cross_scope_conflicts": 0, "cross_scope_error": "",
+        }
+        with self._sss_review_lock:
+            snapshot = dict(self._sss_review_snapshot or {})
+        if not snapshot:
+            return empty
+        try:
+            current = journal_fingerprint(view["path"])
+        except UncertainJournalError:
+            return empty
+        checked_at = str(snapshot.get("checked_at") or "")
+        try:
+            age: float | None = max(0.0, (
+                _dt.datetime.now()
+                - _dt.datetime.fromisoformat(checked_at)).total_seconds())
+        except ValueError:
+            age = None
+        classifications = snapshot.get("classifications") if isinstance(
+            snapshot.get("classifications"), dict) else {}
+        active_ids: set[str] = set()
+        for record in view["records"]:
+            for identifier in (record.get("journal_id"), record.get("identifier")):
+                text = str(identifier or "")
+                if text:
+                    active_ids.add(text)
+        covers = bool(active_ids) and all(
+            identifier in classifications for identifier in active_ids)
+        return {
+            "available": True,
+            "stale": bool(age is None or age > _SSS_REVIEW_TTL_S),
+            "journal_matches": current == str(snapshot.get("journal_fingerprint") or ""),
+            "covers_active": covers,
+            "checked_at": checked_at,
+            "age_s": None if age is None else round(age, 1),
+            "wide_window_days": int(snapshot.get("wide_window_days")
+                                    or _REVIEW_WIDE_WINDOW_DAYS),
+            "journal_fingerprint": str(snapshot.get("journal_fingerprint") or ""),
+            "counts": dict(snapshot.get("counts") or {}),
+            "classifications": {str(key): str(value)
+                                for key, value in classifications.items()},
+            "cross_scope_conflicts": int(snapshot.get("cross_scope_conflicts") or 0),
+            "cross_scope_error": str(snapshot.get("cross_scope_error") or ""),
+        }
+
+    def sss_uncertain_records(self) -> dict[str, Any]:
+        """只读列出当前批次仍阻断的未决记录（仅管理员，无网络、不改文件）。
+
+        记录带客户姓名与掩码手机号，因此只给管理员：普通用户在 HTTP 白名单层
+        就被 403 拦掉，直接调用也拿到 forbidden。手机号已脱敏，保留核对所需的
+        最小信息（姓名 + 送达时间 + 门牌）。
+        """
+        if not self.is_admin:
+            return {
+                "ok": False, "status": "forbidden", "code": "forbidden",
+                "reason": "未决记录含客户信息，仅管理员可查看",
+                "next_action": "联系管理员处理", "read_only": True,
+                "contract_version": 1, "records": [], "counts": {}, "review": {},
+            }
+        try:
+            ctx = self._sss_batch_context()
+            view = pending_record_views(ctx["journal"], ctx["batch_key"])
+        except (UncertainJournalError, SssUrlConfigError) as exc:
+            return {
+                "ok": False, "status": "failed", "code": "journal_unreadable",
+                "reason": str(exc), "next_action": "人工核对本地记录后再运行",
+                "read_only": True, "contract_version": 1,
+                "records": [], "counts": {}, "review": {},
+            }
+        records = list(view["records"])
+        return {
+            "ok": True, "status": "ok", "code": "", "reason": "",
+            "read_only": True, "contract_version": 1,
+            "origin": ctx["origin"],
+            "account": mask_contact(ctx["account"]),
+            "journal": str(ctx["journal"]),
+            "batch_key": ctx["batch_key"],
+            "delivery_date": ctx["delivery_date"],
+            "counts": dict(view["counts"]),
+            "records": records,
+            "review": self._sss_review_view(view),
+            "next_action": ("先只读核对站内订单；确认后由管理员在未决记录面板解除阻断"
+                            if records else "当前批次没有活跃未决记录，无需处置"),
+        }
+
+    def _sss_uncertain_failure(self, code: str, reason: str, next_action: str, *,
+                               status: str = "rejected",
+                               extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        """统一失败形状：永不发 POST、永不写云端，changed 恒为 False。"""
+        payload: dict[str, Any] = {
+            "ok": False,
+            "status": str(status),
+            "code": str(code),
+            "reason": str(reason or code),
+            "next_action": str(next_action or ""),
+            "contract_version": 1,
+            "read_only": False,
+            "cloud_write": False,
+            "post_sent": False,
+            "changed": False,
+            "decision": "",
+            "record_ids": [],
+            "affected": 0,
+            "remaining": 0,
+            "audit": {},
+            "allowed_decisions": list(self._SSS_RESOLVE_DECISIONS),
+        }
+        if extra:
+            payload.update(extra)
+        return payload
+
+    def _sss_uncertain_success(self, *, status: str, decision: str,
+                               targets: list[str], affected: int, remaining: int,
+                               audit: dict[str, Any],
+                               next_action: str) -> dict[str, Any]:
+        """统一成功形状：只写本地 journal 审计，post_sent 恒为 False。"""
+        return {
+            "ok": True,
+            "status": str(status),
+            "code": "",
+            "reason": "",
+            "next_action": str(next_action),
+            "contract_version": 1,
+            "read_only": False,
+            "cloud_write": False,
+            "post_sent": False,
+            "changed": True,
+            "decision": str(decision),
+            "record_ids": list(targets),
+            "affected": int(affected),
+            "remaining": int(remaining),
+            "audit": dict(audit),
+            "allowed_decisions": list(self._SSS_RESOLVE_DECISIONS),
+        }
+
+    def sss_uncertain_resolve(self, payload: dict[str, Any] | None = None,
+                              **options: Any) -> dict[str, Any]:
+        """管理员专用：带确认、证据与审计地处置未决记录（永不发 POST、永不联网）。
+
+        请求（HTTP ``POST /api/sss_uncertain_resolve``，JSON 数组单对象或对象键值均可）::
+
+            {"decision": "station_absent" | "station_present" | "keep",
+             "confirm":  "<与 decision 完全相同的字符串>",
+             "note":     "人工核对说明（至少 4 个字符，写进审计）",
+             "record_ids": ["<journal_id>", ...]}
+
+        语义边界：
+
+        * ``station_present``（站内确实有这些订单）→ 只把记录标成 resolved，本批不再
+          重发；这是安全方向，即使判断错也不会因此多下单（提交前还会独立对账）。
+        * ``station_absent``（站内确实没有）→ 把记录标成 discarded 以解除阻断。它会让
+          下一轮真的重发，因此**必须**有一次新鲜的只读核对证据：该次核对要覆盖全部
+          所选记录、每条都判成 ``station_missing``，且 journal 指纹未变；宽窗内查到
+          订单、证据过期、journal 变过一律拒绝。
+        * ``keep`` → 什么都不改，保持阻断。
+
+        权限：仅管理员。普通用户 HTTP 403 ``admin_only``；绕过 HTTP 直接调用也会得到
+        ``ok=false, status=forbidden``。
+        """
+        data: dict[str, Any] = dict(payload) if isinstance(payload, dict) else {}
+        for key, value in options.items():
+            if value is not None:
+                data[key] = value
+        actor = self._request_identity() or "local-admin"
+        decision = str(data.get("decision") or "").strip().lower()
+        confirm = str(data.get("confirm") or "").strip()
+        note = str(data.get("note") or "").strip()
+        raw_ids = data.get("record_ids")
+        if isinstance(raw_ids, str):
+            raw_ids = [raw_ids]
+        record_ids = [str(item).strip() for item in (raw_ids or [])
+                      if str(item or "").strip()]
+
+        if not self.is_admin:
+            # 双保险：HTTP 白名单已经 403；直接调用（脚本/旧客户端）也必须拒绝。
+            return self._sss_uncertain_failure(
+                "forbidden", "解除未决记录阻断仅管理员可用", "联系管理员处理",
+                status="forbidden")
+        if decision not in self._SSS_RESOLVE_DECISIONS:
+            return self._sss_uncertain_failure(
+                "invalid_payload",
+                "decision 只允许 station_absent / station_present / keep",
+                "选择允许的 decision 后重试", status="invalid")
+        if decision == "keep":
+            return {
+                "ok": True, "status": "kept", "code": "", "reason": "",
+                "next_action": "已保留阻断：未决记录未做任何改动",
+                "contract_version": 1, "read_only": False, "cloud_write": False,
+                "post_sent": False, "changed": False, "decision": decision,
+                "record_ids": [], "affected": 0, "remaining": 0, "audit": {},
+                "allowed_decisions": list(self._SSS_RESOLVE_DECISIONS),
+            }
+        if len(note) < self._SSS_RESOLVE_MIN_NOTE:
+            return self._sss_uncertain_failure(
+                "note_required", "必须填写至少 4 个字符的人工核对说明（写入审计）",
+                "补充 note 后重试")
+        if confirm != decision:
+            return self._sss_uncertain_failure(
+                "confirmation_required",
+                "必须显式确认：confirm 必须与 decision 完全相同（" + decision + "）",
+                "重新提交并令 confirm=" + decision)
+        if not record_ids:
+            return self._sss_uncertain_failure(
+                "invalid_record_ids", "必须明确列出要处置的未决记录 id，不支持整库清空",
+                "在未决记录面板里勾选记录后重试")
+
+        reservation = self._operations.try_reserve(
+            "sss_uncertain_resolve", summary={"title": "解除闪时送未决记录阻断"},
+            next_action="等待处置结束或查询 operation_status")
+        if not reservation.granted:
+            conflict = self._operation_conflict_payload(
+                reservation.conflict, action="处置闪时送未决记录")
+            return self._sss_uncertain_failure(
+                "operation_conflict", str(conflict.get("reason") or "busy"),
+                str(conflict.get("next_action") or "等待当前操作结束后重试"),
+                status="rejected",
+                extra={"operation_id": str(conflict.get("operation_id") or "")})
+        operation = reservation.operation
+        assert operation is not None
+        result = self._sss_uncertain_failure(
+            "internal_error", "处置未完成（异常中止）", "查看日志后重试", status="error")
+        try:
+            result = self._sss_uncertain_resolve_impl(
+                decision=decision, note=note, actor=actor, record_ids=record_ids)
+        except UncertainJournalError as exc:
+            result = self._sss_uncertain_failure(
+                "journal_unreadable", str(exc), "人工核对本地记录文件后再试")
+        except OSError as exc:
+            result = self._sss_uncertain_failure(
+                "journal_write_failed", str(exc), "确认存储可写后重试")
+        finally:
+            if self._operations.is_active(operation):
+                self._operations.finish(
+                    operation, status="success" if result.get("ok") else "error",
+                    reason=str(result.get("code") or result.get("status") or "")[:200],
+                    summary={"title": "解除闪时送未决记录阻断",
+                             "decision": decision,
+                             "changed": bool(result.get("changed"))},
+                    next_action=str(result.get("next_action") or "")[:200])
+        return result
+
+    def _sss_uncertain_resolve_impl(self, *, decision: str, note: str, actor: str,
+                                    record_ids: list[str]) -> dict[str, Any]:
+        """实际写动作：先校验记录归属，再按证据分支 resolved/discarded。"""
+        ctx = self._sss_batch_context()
+        journal = ctx["journal"]
+        key = ctx["batch_key"]
+        guard = batch_submission_lock(journal, key)
+        try:
+            guard.acquire()
+        except UncertainJournalError as exc:
+            return self._sss_uncertain_failure(
+                "journal_write_failed", "无法获取未决记录锁：" + str(exc),
+                "等待另一个进程结束后重试")
+        try:
+            view = pending_record_views(journal, key)
+            active: dict[str, dict[str, Any]] = {}
+            for record in view["records"]:
+                for identifier in (record.get("journal_id"), record.get("identifier")):
+                    text = str(identifier or "")
+                    if text:
+                        active[text] = record
+            unknown = [identifier for identifier in record_ids
+                       if identifier not in active]
+            if unknown:
+                return self._sss_uncertain_failure(
+                    "unknown_record_ids",
+                    "选择的记录已不存在或不属于当前批次：" + "、".join(unknown[:5]),
+                    "刷新未决记录列表后重新选择",
+                    extra={"unknown_record_ids": unknown[:20],
+                           "remaining": len(view["records"])})
+            targets = sorted({str(active[identifier].get("journal_id") or identifier)
+                              for identifier in record_ids})
+            fingerprint = journal_fingerprint(journal)
+            timestamp = _dt.datetime.now().isoformat(timespec="seconds")
+
+            if decision == "station_present":
+                # 安全方向：站内确实有这些订单 → 标记 resolved，本批不再重发。
+                resolved = resolve_uncertain_records(
+                    journal, key, targets, note=note, actor=actor)
+                if resolved != len(targets):
+                    return self._sss_uncertain_failure(
+                        "journal_write_failed",
+                        "只写入 " + str(resolved) + "/" + str(len(targets))
+                        + " 条，状态不可信",
+                        "人工核对本地记录文件后再试", status="error")
+                remaining = len(pending_record_views(journal, key)["records"])
+                return self._sss_uncertain_success(
+                    status="resolved", decision=decision, targets=targets,
+                    affected=resolved, remaining=remaining,
+                    audit={"actor": actor, "note": note, "at": timestamp,
+                           "journal": str(journal),
+                           "journal_fingerprint": fingerprint, "reviewed_at": ""},
+                    next_action="已按“站内确实有”标记确认；重跑本批不会再提交这些订单")
+
+            # station_absent：解除阻断会让下一轮真的重发，因此必须先有一次新鲜的、
+            # 覆盖全部所选记录、且把每条都判成“站内缺失”的只读核对作为证据。
+            with self._sss_review_lock:
+                snapshot = dict(self._sss_review_snapshot or {})
+            if not snapshot:
+                return self._sss_uncertain_failure(
+                    "review_required", "必须先做一次只读核对，再用核对结果解除阻断",
+                    "先点“只读核对站内订单”，确认站内确实没有这些订单")
+            checked_at = str(snapshot.get("checked_at") or "")
+            try:
+                age = (_dt.datetime.now()
+                       - _dt.datetime.fromisoformat(checked_at)).total_seconds()
+            except ValueError:
+                age = _SSS_REVIEW_TTL_S + 1.0
+            if age < 0 or age > _SSS_REVIEW_TTL_S:
+                return self._sss_uncertain_failure(
+                    "review_stale",
+                    "只读核对结果已过期（" + str(int(max(age, 0.0))) + " 秒前）",
+                    "重新只读核对后再解除")
+            if str(snapshot.get("journal_fingerprint") or "") != fingerprint:
+                return self._sss_uncertain_failure(
+                    "journal_changed", "本地未决记录在只读核对之后发生了变化",
+                    "重新只读核对后再解除")
+            classifications = snapshot.get("classifications") if isinstance(
+                snapshot.get("classifications"), dict) else {}
+            found_other_day = [identifier for identifier in targets
+                               if str(classifications.get(identifier) or "")
+                               == "station_found_other_day"]
+            if found_other_day:
+                return self._sss_uncertain_failure(
+                    "station_state_changed",
+                    "只读核对在站内宽窗内找到了这些订单（送达日不同）："
+                    + "、".join(found_other_day[:5]),
+                    "先人工核对站内订单；若确认已落单，请改用“已在站内找到”")
+            not_covered = [identifier for identifier in targets
+                           if str(classifications.get(identifier) or "")
+                           != "station_missing"]
+            if not_covered:
+                return self._sss_uncertain_failure(
+                    "review_required",
+                    "这次只读核对没有覆盖全部所选记录（或扫描未完成）",
+                    "重新只读核对后再解除")
+
+            discarded = discard_uncertain_records(
+                journal, key, targets,
+                reason="人工核对站内无此订单，确认未落单（管理员带审计解除）",
+                note=note, actor=actor)
+            if discarded != len(targets):
+                return self._sss_uncertain_failure(
+                    "journal_write_failed",
+                    "只写入 " + str(discarded) + "/" + str(len(targets)) + " 条，状态不可信",
+                    "人工核对本地记录文件后再试", status="error")
+            remaining = len(pending_record_views(journal, key)["records"])
+            return self._sss_uncertain_success(
+                status="discarded", decision=decision, targets=targets,
+                affected=discarded, remaining=remaining,
+                audit={"actor": actor, "note": note, "at": timestamp,
+                       "journal": str(journal),
+                       "journal_fingerprint": fingerprint,
+                       "reviewed_at": checked_at},
+                next_action=("阻断已解除；重跑本批时提交前仍会再做一次只读对账，"
+                             "若站内已存在则不会重复提交"))
+        finally:
+            guard.release()
+
     def _launch(self, mode: str, config: AppConfig, count: int | None, password: str) -> bool:
         """启动 worker；已有任务时拒绝，返回 False（不覆盖在跑线程）。"""
         with self._worker_lock:
@@ -1023,8 +1544,12 @@ class Bridge:
             self._stop_event.clear()
             self._task_finished = False
             self._set_status("running")
-            self.log("开始处理订单..." if mode == "order" else "开始闪时送下单...")
-            target = self._run_order if mode == "order" else self._run_sss
+            self.log({
+                "order": "开始处理订单...",
+                "sss_review": "开始只读核对未决记录与站内订单（不会发送任何下单请求）...",
+            }.get(mode, "开始闪时送下单..."))
+            target = {"order": self._run_order,
+                      "sss_review": self._run_sss_review}.get(mode, self._run_sss)
             args = (config, count, password) if mode == "order" else (config, password)
             operation_id = self._task_operation_id
 
@@ -1119,6 +1644,40 @@ class Bridge:
         except Exception as exc:
             self._task_error(str(exc))
 
+    def _run_sss_review(self, config: AppConfig, password: str) -> None:
+        """只读核对 worker：只读站内订单与本地未决记录，绝不发送 POST。"""
+        try:
+            result = run_sss_review_job(
+                config, self._stop_event, lambda msg: self.log(msg),
+                password=password, captcha_callback=self._sss_captcha,
+                snapshot_sink=self._remember_sss_review)
+            self._finish_task(self._sss_review_message(result), result)
+        except Exception as exc:
+            self._task_error(str(exc))
+
+    def _remember_sss_review(self, snapshot: dict[str, Any]) -> None:
+        """保存逐条分类证据（仅内存）：写入口只认它，不认前端的自述。"""
+        with self._sss_review_lock:
+            self._sss_review_snapshot = dict(snapshot or {})
+
+    @staticmethod
+    def _sss_review_message(result: dict[str, Any]) -> str:
+        """只读核对的消息：读不到就说读不到，绝不写成“站内没有”。"""
+        review = result.get("review") if isinstance(result.get("review"), dict) else {}
+        counts = review.get("counts") if isinstance(review.get("counts"), dict) else {}
+        status = str(result.get("status") or "")
+        if status == "review_ok":
+            return ("只读核对完成：" + str(counts.get("station_confirmed", 0))
+                    + " 条未决记录已在站内确认并清理，阻断已解除")
+        if status == "review_failed":
+            return ("只读核对失败：没有拿到可用的核对结果，请查看日志后重试，"
+                    "不要据此解除阻断")
+        return ("只读核对完成：站内缺失 " + str(counts.get("station_missing", 0))
+                + " 条、宽窗内命中（送达日不同）"
+                + str(counts.get("station_found_other_day", 0))
+                + " 条、无法完成扫描 " + str(counts.get("scan_failed", 0))
+                + " 条；未确认前不要重跑或补发")
+
     @staticmethod
     def _order_task_message(result: dict[str, Any]) -> str:
         """订单 runner 明确 status 对应的保守完成消息，避免 failed/partial 被说成成功。"""
@@ -1174,6 +1733,11 @@ class Bridge:
             "duplicate_detected": "uncertain",
             "dry_run": "dry_run",
             "preflight_ok": "preflight_ok",
+            # 只读核对（review）：读成功但仍有阻断 → 仍是 blocked_uncertain；
+            # 核对失败 → error（绝不能落进 success/uncertain 的模糊地带）。
+            "review_ok": "success",
+            "review_blocked": "blocked_uncertain",
+            "review_failed": "error",
             "no_orders": "no_orders",
             "insufficient_balance": "insufficient_balance",
             "balance_unknown": "balance_unknown",

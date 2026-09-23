@@ -1269,8 +1269,13 @@ def append_uncertain_records(path: str | os.PathLike[str],
 
 
 def resolve_uncertain_records(path: str | os.PathLike[str], key: str,
-                              identifiers: set[str] | list[str] | tuple[str, ...]) -> int:
-    """只读对账确认后，把对应记录标记为 resolved（保留审计痕迹）。"""
+                              identifiers: set[str] | list[str] | tuple[str, ...],
+                              *, note: str = "", actor: str = "") -> int:
+    """只读对账确认后，把对应记录标记为 resolved（保留审计痕迹）。
+
+    ``note``/``actor`` 供**人工确认入口**填写：审计必须留下“谁、凭什么”把这条
+    未决记录判成已确认，事后才能追溯。自动对账路径不传，行为与以前完全一致。
+    """
     target = Path(path)
     with _journal_lock(target):
         with _journal_file_lock(target):
@@ -1290,7 +1295,10 @@ def resolve_uncertain_records(path: str | os.PathLike[str], key: str,
                 if record_id in wanted or task_id in wanted:
                     record["status"] = "resolved"
                     record["resolved_at"] = timestamp
-                    record["resolved_reason"] = "站内只读对账确认"
+                    record["resolved_reason"] = (str(note or "").strip()
+                                                 or "站内只读对账确认")
+                    if actor:
+                        record["resolved_by"] = str(actor)
                     resolved += 1
             if resolved:
                 _atomic_write(target, payload)
@@ -1299,7 +1307,8 @@ def resolve_uncertain_records(path: str | os.PathLike[str], key: str,
 
 def discard_uncertain_records(path: str | os.PathLike[str], key: str,
                               identifiers: set[str] | list[str] | tuple[str, ...],
-                              reason: str = "明确未发送/明确失败，有充分证据无需重试") -> int:
+                              reason: str = "明确未发送/明确失败，有充分证据无需重试",
+                              *, note: str = "", actor: str = "") -> int:
     """有充分证据证明 POST 未落单时关闭记录，避免误阻断后续运行。
 
     仅用于明确 401/余额不足/显式 success=false/从未派发等“未发送”证据。
@@ -1325,10 +1334,142 @@ def discard_uncertain_records(path: str | os.PathLike[str], key: str,
                     record["status"] = "discarded"
                     record["discarded_at"] = timestamp
                     record["discarded_reason"] = reason
+                    if note:
+                        # 人工核对说明单独留痕：reason 是机器可读的分类，note 是
+                        # “谁凭什么敢判它没落单”，事后追溯只看 note。
+                        record["discarded_note"] = str(note)
+                    if actor:
+                        record["discarded_by"] = str(actor)
                     discarded += 1
             if discarded:
                 _atomic_write(target, payload)
             return discarded
+
+
+_MASK_PHONE_RE = re.compile(r"^(\d{3})\d{4}(\d{4})$")
+
+
+def mask_contact(value: Any) -> str:
+    """手机号/账号脱敏：只保留前 3 后 4，非 11 位数字按首尾保留。
+
+    未决记录里带着客户姓名与电话。接口层只给管理员看，也不应把整份客户名单
+    原样吐进前端/日志（与 WPS 恢复入口“不含客户/路径”的既有口径一致）。
+    """
+    text = normalise_account(value)
+    if not text:
+        return ""
+    match = _MASK_PHONE_RE.match(text)
+    if match:
+        return f"{match.group(1)}****{match.group(2)}"
+    if len(text) <= 4:
+        return "*" * len(text)
+    return f"{text[:2]}{'*' * max(0, len(text) - 6)}{text[-4:]}"
+
+
+def pending_record_views(path: str | os.PathLike[str], key: str | None = None
+                         ) -> dict[str, Any]:
+    """只读列出未决记录（脱敏投影），供人工核对；**绝不改文件**。
+
+    ``key`` 非空时只返回该批次键下的活跃记录（只有它们会阻断本次运行），
+    ``counts`` 里的 active/inflight/unresolved 也按该批次口径统计，
+    resolved/discarded 则是整个 journal 的审计计数。读失败一律抛
+    ``UncertainJournalError``：调用方绝不能把它当成“没有未决记录”。
+    """
+    target = Path(path)
+    payload = load_journal(target)
+    records = [record for record in payload.get("records", [])
+               if isinstance(record, dict)]
+    counts = {"active": 0, "inflight": 0, "unresolved": 0,
+              "resolved": 0, "discarded": 0}
+    views: list[dict[str, Any]] = []
+    for record in records:
+        status = str(record.get("status") or "unresolved")
+        if status == "resolved":
+            counts["resolved"] += 1
+        elif status == "discarded":
+            counts["discarded"] += 1
+        if not _is_active_status(record):
+            continue
+        if key is not None and not _record_matches_batch(record, key):
+            continue
+        if status == "inflight":
+            counts["inflight"] += 1
+        else:
+            counts["unresolved"] += 1
+        counts["active"] += 1
+        fingerprint = record.get("fingerprint") if isinstance(
+            record.get("fingerprint"), dict) else {}
+        views.append({
+            "journal_id": str(record.get("journal_id") or ""),
+            "identifier": str(record.get("identifier") or ""),
+            "sheet": str(record.get("sheet") or ""),
+            "batch_id": str(record.get("batch_id") or ""),
+            "delivery_date": str(record.get("delivery_date") or ""),
+            "status": status,
+            "error": str(record.get("error") or ""),
+            "created_at": str(record.get("created_at") or ""),
+            "batch_started_at": record.get("batch_started_at"),
+            "name": str(fingerprint.get("receive_name") or ""),
+            "phone": mask_contact(fingerprint.get("receive_phone")),
+            "delivery_time": str(fingerprint.get("expected_delivery_time") or ""),
+            "door_num": str(fingerprint.get("door_num") or ""),
+            "account": mask_contact(record.get("account")),
+            "reason": str(record.get("scope_unknown_reason") or ""),
+        })
+    return {"records": views, "counts": counts, "path": str(target)}
+
+
+def journal_fingerprint(path: str | os.PathLike[str]) -> str:
+    """当前 journal 内容的稳定指纹（只读），用作核对快照与写入门禁的 CAS 锚点。
+
+    只对 records 做规范化 JSON 哈希：任何记录的新增/状态变化都会改变指纹，
+    因此“先只读核对、后解除”之间文件被改过就一定对不上，必须重新核对。
+    """
+    payload = load_journal(Path(path))
+    records = [record for record in payload.get("records", [])
+               if isinstance(record, dict)]
+    blob = json.dumps(records, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def journal_tasks(records: list[dict[str, Any]]
+                  ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """把未决记录还原成对账用的 tasks 与 ``{journal_id: record}`` 映射。
+
+    抽出来是为了让“正式运行的只读对账”和“管理员手动只读核对”用同一套还原
+    规则，避免两条路径各自解释 fingerprint 而出现结论差异。
+    """
+    tasks: list[dict[str, Any]] = []
+    by_id: dict[str, dict[str, Any]] = {}
+    for record in records:
+        journal_id = str(record.get("journal_id")
+                         or record.get("identifier") or "").strip()
+        if not journal_id:
+            journal_id = uuid.uuid4().hex
+        fingerprint_data = record.get("fingerprint") if isinstance(
+            record.get("fingerprint"), dict) else {}
+        kwargs = {field: str(fingerprint_data.get(field) or "")
+                  for field in OrderFingerprint._fields}
+        tasks.append({
+            "identifier": journal_id,
+            "payload": {},
+            "fingerprint": OrderFingerprint(**kwargs),
+            "account": normalise_account(record.get("account")),
+        })
+        by_id[journal_id] = record
+    return tasks, by_id
+
+
+def journal_created_after(records: list[dict[str, Any]]) -> float | None:
+    """本批最早开始时间减去时钟偏移；没有可解析时间时返回 None（不按时间过滤）。"""
+    started: list[float] = []
+    for record in records:
+        try:
+            if record.get("batch_started_at") not in (None, ""):
+                started.append(float(record["batch_started_at"]))
+        except (TypeError, ValueError):
+            continue
+    return (min(started) - _BATCH_CLOCK_SKEW_S) if started else None
 
 
 def resolve_pending_records(path: str | os.PathLike[str], key: str,
@@ -1343,30 +1484,10 @@ def resolve_pending_records(path: str | os.PathLike[str], key: str,
     if not records:
         return [], None, 0
 
-    tasks: list[dict[str, Any]] = []
-    by_id: dict[str, dict[str, Any]] = {}
-    started: list[float] = []
-    for record in records:
-        journal_id = str(record.get("journal_id") or record.get("identifier") or "").strip()
-        if not journal_id:
-            journal_id = uuid.uuid4().hex
-        fingerprint_data = record.get("fingerprint") if isinstance(record.get("fingerprint"), dict) else {}
-        kwargs = {field: str(fingerprint_data.get(field) or "")
-                  for field in OrderFingerprint._fields}
-        tasks.append({
-            "identifier": journal_id,
-            "payload": {},
-            "fingerprint": OrderFingerprint(**kwargs),
-            "account": normalise_account(record.get("account")),
-        })
-        by_id[journal_id] = record
-        try:
-            if record.get("batch_started_at") not in (None, ""):
-                started.append(float(record["batch_started_at"]))
-        except (TypeError, ValueError):
-            continue
-
-    created_after = (min(started) - _BATCH_CLOCK_SKEW_S) if started else None
+    # 还原规则与“管理员手动只读核对”共用同一份实现（journal_tasks /
+    # journal_created_after），避免两条路径对同一批记录给出不同结论。
+    tasks, by_id = journal_tasks(records)
+    created_after = journal_created_after(records)
     try:
         reconciliation = _safe_reconcile(
             tasks, fetch_json, callback, "跨运行不确定记录只读对账",
@@ -1403,9 +1524,13 @@ __all__ = [
     "cross_scope_unresolved_records",
     "default_uncertain_path",
     "describe_authority_location_conflicts",
+    "journal_created_after",
+    "journal_fingerprint",
+    "journal_tasks",
     "describe_cross_scope_conflicts",
     "legacy_uncertain_paths",
     "load_authority_locations",
+    "mask_contact",
     "merge_journals",
     "mirror_journal",
     "mirror_uncertain_paths",
@@ -1414,6 +1539,7 @@ __all__ = [
     "normalise_account",
     "platform_origin",
     "load_journal",
+    "pending_record_views",
     "pending_records",
     "resolve_pending_records",
     "resolve_uncertain_records",

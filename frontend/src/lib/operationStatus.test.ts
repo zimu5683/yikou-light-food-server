@@ -71,6 +71,20 @@ test('P0 新增结果：uncertain/partial/failed/blocked 不显示成功', () =>
   assert.equal(blocked.needsReview, true)
 })
 
+test('blocked_uncertain 文案始终指向未决记录面板，且不被服务端 next_action 覆盖', () => {
+  const view = operationViewFromAuthority(operation({
+    status: 'blocked_uncertain', active: false, mode: 'sss',
+    next_action: '先只读核对站内订单与本地记录；未确认前不要重跑或补发',
+  }), 'connected')
+  assert.equal(view.key, 'blocked_uncertain')
+  assert.equal(view.needsReview, true)
+  assert.notEqual(view.tone, 'success')
+  assert.match(view.detail, /未决记录/)
+  assert.match(view.detail, /只读核对站内订单/)
+  // 服务端 next_action 只作为补充，不能把面板入口挤掉。
+  assert.match(view.detail, /服务端说明/)
+})
+
 test('模拟/预检明确未下单；legacyStatusFromOperation 覆盖新状态', () => {
   const dry = operationViewFromAuthority(operation({ status: 'dry_run', active: false }), 'connected')
   assert.equal(dry.key, 'dry_run')

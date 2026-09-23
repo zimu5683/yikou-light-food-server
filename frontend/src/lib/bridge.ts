@@ -618,6 +618,157 @@ export interface SssDayOrders {
   >
 }
 
+
+/** 未决记录的活跃状态：inflight = POST 前置记录已写、等待响应/对账；unresolved = 响应不确定。 */
+export type SssUncertainRecordStatus = 'inflight' | 'unresolved'
+
+/** 只读核对对单条记录的分类。 */
+export type SssUncertainClassification =
+  | 'station_missing'
+  | 'station_found_other_day'
+  | 'station_confirmed'
+  | 'scan_failed'
+
+/**
+ * `sss_uncertain_records` 返回的一条未决记录（脱敏投影）。
+ *
+ * 电话/账号**已由后端掩码**（如 138****0001），前端只做兜底，绝不还原完整号码；
+ * `journal_id` 是解除操作 record_ids 要提交的取值。
+ */
+export interface SssUncertainRecord {
+  journal_id: string
+  identifier: string
+  sheet: string
+  batch_id: string
+  delivery_date: string
+  status: SssUncertainRecordStatus | string
+  error: string
+  created_at: string
+  batch_started_at: number | null
+  name: string
+  phone: string
+  delivery_time: string
+  door_num: string
+  account: string
+  reason: string
+}
+
+export interface SssUncertainCounts {
+  active: number
+  inflight: number
+  unresolved: number
+  resolved: number
+  discarded: number
+}
+
+export interface SssUncertainReviewCounts {
+  station_missing: number
+  station_found_other_day: number
+  station_confirmed: number
+  scan_failed: number
+}
+
+/**
+ * 上一次只读核对快照。没有快照时后端返回
+ * `{available:false, stale:false, journal_matches:false, counts:{}, classifications:{}, ...}`。
+ *
+ * `journal_matches=false` 表示核对之后本地记录变了（或还没核对过）；
+ * `station_absent` 解除必须先重新核对，否则服务端会以 review_required /
+ * review_stale / journal_changed 拒绝。
+ */
+export interface SssUncertainReview {
+  available: boolean
+  checked_at: string
+  age_s: number | null
+  stale: boolean
+  journal_fingerprint: string
+  journal_matches: boolean
+  wide_window_days: number
+  counts: Partial<SssUncertainReviewCounts> & Record<string, number>
+  classifications: Record<string, SssUncertainClassification | string>
+}
+
+/**
+ * `sss_uncertain_records()` 返回（**只读，仅管理员，无网络**）。
+ *
+ * `ok=false`（journal 损坏/不可读等）时只有 status/code/reason/next_action，
+ * 没有 counts/records/review；界面必须显示失败，绝不能当成“没有未决记录”。
+ */
+export interface SssUncertainState {
+  ok: boolean
+  status?: string
+  code?: string
+  reason?: string
+  next_action: string
+  read_only: boolean
+  contract_version: number
+  origin?: string
+  account?: string
+  journal?: string
+  batch_key?: string
+  delivery_date?: string
+  counts?: SssUncertainCounts
+  records?: SssUncertainRecord[]
+  review?: SssUncertainReview
+}
+
+export type SssUncertainDecision = 'station_absent' | 'station_present' | 'keep'
+
+/** `sss_uncertain_resolve` 请求体（数组里放**对象**，不要放 JSON 字符串）。 */
+export interface SssUncertainResolvePayload {
+  decision: SssUncertainDecision
+  /** 逐字确认：必须与 `decision` 完全相同。 */
+  confirm: string
+  /** 人工核对说明，≥4 字符，写入本地 journal 审计。 */
+  note: string
+  /** 要处置的未决记录 journal_id；至少一条。 */
+  record_ids: string[]
+}
+
+export interface SssUncertainResolveAudit {
+  actor: string
+  note: string
+  at: string
+  journal: string
+  journal_fingerprint: string
+  reviewed_at: string
+}
+
+/**
+ * `sss_uncertain_resolve` 返回。**唯一写入口，但永不发 POST**：
+ * `cloud_write=false`、`post_sent=false`；`changed=false` 时一个文件都没改。
+ */
+export interface SssUncertainResolveResult {
+  ok: boolean
+  status: string
+  code: string
+  reason: string
+  next_action: string
+  contract_version?: number
+  read_only?: boolean
+  cloud_write?: boolean
+  post_sent?: boolean
+  changed?: boolean
+  decision?: string
+  record_ids?: string[]
+  affected?: number
+  remaining?: number
+  audit?: SssUncertainResolveAudit
+  allowed_decisions?: string[]
+}
+
+/** `start_sss_review({password, remember})` 返回：启动只读核对 worker（零 POST）。 */
+export interface SssReviewStartResult {
+  ok: boolean
+  status: string
+  reason: string
+  next_action: string
+  summary?: { message?: string }
+  operation_id?: string
+  /** validation_failed 时的逐字段错误。 */
+  fields?: Record<string, { message?: string }>
+}
+
 export interface AppState {
   version: string
   status: StatusState
@@ -863,6 +1014,18 @@ interface BackendApi {
   start_order(payload: OrderFormPayload): Promise<FieldErrors>
   start_sss(payload: SssFormPayload): Promise<FieldErrors>
   sss_day_orders(): Promise<SssDayOrders>
+  /** 管理员专用只读：列出未决记录与上次核对快照；无网络、不改文件。 */
+  sss_uncertain_records(): Promise<SssUncertainState>
+  /**
+   * 管理员专用只读核对（零 POST）：启动 worker 扫描站内订单。
+   * 结果通过 task:done/task:error 事件返回，前端不轮询。
+   */
+  start_sss_review(payload: { password: string; remember: boolean }): Promise<SssReviewStartResult>
+  /**
+   * 管理员专用唯一写入口：按 decision 解除/确认/保留阻断。
+   * **永不发 POST**（post_sent=false），只写本地 journal 审计。
+   */
+  sss_uncertain_resolve(payload: SssUncertainResolvePayload): Promise<SssUncertainResolveResult>
   stop_task(): Promise<{ ok: boolean }>
   worker_alive(): Promise<boolean>
   resolve_decision(id: string, choice: string): Promise<{ ok: boolean }>
@@ -971,6 +1134,11 @@ const REQUEST_TIMEOUT_MS: Record<string, number> = {
   wps_preview: 120_000,
   sss_day_orders: 120_000,
   wps_check_copies: 120_000,
+  // 未决记录列表只是本地读盘；启动核对 worker 要等登录 + 扫站内订单，给足窗口；
+  // 解除只写本地审计，但仍可能重新读盘核对指纹，给 60s。
+  sss_uncertain_records: 30_000,
+  start_sss_review: 120_000,
+  sss_uncertain_resolve: 60_000,
   // `cloud_verified/cloud_untouched` 需要重新只读云端，给足窗口。
   wps_recovery_resolve: 120_000,
   install_update: 60_000,

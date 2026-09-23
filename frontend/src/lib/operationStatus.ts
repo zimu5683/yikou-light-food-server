@@ -85,7 +85,7 @@ export const STATUS_FALLBACK: Record<StatusState, FallbackView> = {
   insufficient_balance: { key: 'insufficient_balance', label: '余额不足，本批未提交', detail: '任务已安全停止，本批未提交；请先只读核对。', tone: 'warning', busy: false, needsReview: true, canStop: false },
   balance_unknown: { key: 'balance_unknown', label: '余额未知，本批未提交', detail: '任务已安全停止，本批未提交；请先确认余额并只读核对。', tone: 'warning', busy: false, needsReview: true, canStop: false },
   uncertain: { key: 'uncertain', label: '结果不确定 · 待核对', detail: '无法确认执行结果；请先只读核对云端与日志，不要直接重试或重跑本批。', tone: 'warning', busy: false, needsReview: true, canStop: false },
-  blocked_uncertain: { key: 'blocked_uncertain', label: '任务被阻断 · 待核对', detail: '任务被阻断，未确认前不要重发；请先只读核对站内订单与本地记录。', tone: 'danger', busy: false, needsReview: true, canStop: false },
+  blocked_uncertain: { key: 'blocked_uncertain', label: '任务被阻断 · 待核对', detail: '任务被阻断，未确认前不要重发；请在闪时送结果区「未决记录」面板查看未决记录并只读核对站内订单。', tone: 'danger', busy: false, needsReview: true, canStop: false },
   blocked_concurrent: { key: 'blocked_concurrent', label: '另一个任务正在运行', detail: '跨进程锁不可用或另一进程正在处理同一批次，本次没有发送任何请求；请等待后刷新，不要重复提交。', tone: 'warning', busy: false, needsReview: false, canStop: false },
   recovered: { key: 'recovered', label: '已恢复 · 待核对', detail: '服务端报告已恢复；请核对实际结果，不要直接重跑本批。', tone: 'warning', busy: false, needsReview: true, canStop: false },
   not_started: { key: 'not_started', label: '未开始', detail: '该操作未真正开始；请核对配置后决定是否重新执行。', tone: 'warning', busy: false, needsReview: true, canStop: false },
@@ -273,8 +273,19 @@ function viewOfOperation(operation: OperationInfo): OperationView {
     case 'uncertain':
       return resultView(modeLabel, 'uncertain', `${modeLabel}结果不确定 · 待核对`, '无法确认执行结果；请先只读核对云端与日志，不要直接重试或重跑本批。', 'warning', true, nextAction, reason, common)
     case 'blocked':
-    case 'blocked_uncertain':
-      return resultView(modeLabel, 'blocked_uncertain', `${modeLabel}被阻断 · 待核对`, '未确认前不要重发；请先只读核对站内订单与本地记录。', 'danger', true, nextAction, reason, common)
+    case 'blocked_uncertain': {
+      // 阻断文案必须始终指向未决记录面板（服务端 next_action 只作为补充说明），
+      // 否则用户只看到“先只读核对”却找不到记录与解除入口。
+      const panelHint = '请在闪时送结果区「未决记录」面板查看未决记录并只读核对站内订单；未确认前不要重发。'
+      const extra = (nextAction || reason).trim()
+      return {
+        key: 'blocked_uncertain',
+        label: `${modeLabel}被阻断 · 待核对`,
+        detail: `${panelHint}${extra ? ` 服务端说明：${extra}` : ''}`,
+        tone: 'danger', busy: false, needsReview: true, canStop: false, active: false,
+        modeLabel, nextAction, ...common,
+      }
+    }
     case 'blocked_concurrent': {
       // 本次没有发送任何请求，不需要对账；级别是 warning 不是 danger。
       // 统一并发文案必须始终出现（服务端的 next_action 只作为补充说明）。

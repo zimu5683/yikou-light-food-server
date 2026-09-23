@@ -187,6 +187,11 @@ def test_non_admin_password_never_returned(server, auth):
     "check_updates",
     "wps_authorize",          # 重新授权云文档
     "open_external",
+    # 闪时送未决记录：列表含客户信息、核对要登录、解除会放开重发闸门，
+    # 三者都默认仅管理员（白名单未登记 → 403）。
+    "sss_uncertain_records",
+    "start_sss_review",
+    "sss_uncertain_resolve",
 ])
 def test_non_admin_blocked_from_admin_methods(server, method):
     cookie = _token(server, USER, USER_PW)
@@ -251,6 +256,29 @@ def test_admin_is_allowed_the_same_method(server):
     cookie = _token(server, ADMIN, ADMIN_PW)
     status, _ = _api(server, cookie, "save_order_config", {})
     assert status == 200
+
+
+def test_admin_uncertain_records_fail_closed_without_config(server):
+    """管理员可调只读入口；但没配网址/账号时必须如实报错，不能假装“没有记录”。"""
+    cookie = _token(server, ADMIN, ADMIN_PW)
+    status, body = _api(server, cookie, "sss_uncertain_records")
+    assert status == 200
+    assert body["ok"] is False and body["code"] == "journal_unreadable"
+    assert body["records"] == []
+    assert "read_only" in body
+
+
+def test_admin_uncertain_resolve_requires_confirmation(server):
+    """管理员入口也必须走确认/备注校验；缺一不可，且不能返回 ok:true。"""
+    cookie = _token(server, ADMIN, ADMIN_PW)
+    status, body = _api(server, cookie, "sss_uncertain_resolve", {
+        "decision": "station_absent", "confirm": "wrong",
+        "note": "人工核对完成", "record_ids": ["cr-1"]})
+    assert status == 200
+    assert body["ok"] is False
+    assert body["code"] in ("confirmation_required", "journal_unreadable")
+    assert body["changed"] is False
+    assert body["post_sent"] is False
 
 
 def test_non_admin_cannot_change_target_via_short_field_names(server):

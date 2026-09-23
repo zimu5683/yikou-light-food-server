@@ -16,6 +16,7 @@ from app.ordering.cloud_import import prepare_day_orders
 from app.ordering.constants import (
     DEFAULT_SSS_URL,
     _CLIENT_IDEMPOTENCY_FIELD,
+    _REVIEW_WIDE_WINDOW_DAYS,
     _SSS_RUN_LOCK,
 )
 from app.ordering.models import _AuthExpired
@@ -26,6 +27,7 @@ from app.ordering.payload import (
     _prepare_store_and_address,
     _run_dry_run,
 )
+from app.ordering.reconcile import _reconcile_person_matches
 from app.ordering.submission import (
     _balance_precheck,
     _format_balance,
@@ -46,6 +48,9 @@ from app.ordering.uncertain import (
     describe_authority_location_conflicts,
     describe_cross_scope_conflicts,
     discard_uncertain_records,
+    journal_created_after,
+    journal_fingerprint,
+    journal_tasks,
     legacy_uncertain_paths,
     merge_journals,
     mirror_journal,
@@ -631,3 +636,253 @@ def run_sss_job(config: Any, stop_event: Any,
         if _batch_guard is not None:
             _batch_guard.release()
         client.close()
+
+
+@_exclusive_sss_job
+def run_sss_review_job(config: Any, stop_event: Any,
+                       progress_callback: Callable[[str], Any] | None = None,
+                       password: str | None = None,
+                       captcha_callback: Callable[[bytes], str] | None = None,
+                       snapshot_sink: Callable[[dict[str, Any]], None] | None = None
+                       ) -> dict[str, Any]:
+    """只读核对未决记录与站内订单：登录 + 订单列表查询，**绝不发送任何 POST**。
+
+    为什么需要它：闸门在阻断时要求用户“只读核对站内订单与本地记录”，但正式运行
+    与预检都会在闸门处提前返回（未决记录闸门在预检之前），用户拿不到任何核对
+    结果。本函数复用同一套登录/对账代码，只做读操作：
+
+    1. 先做一次严格只读对账：站内同一天能查到的未决记录自动 ``resolved``；
+    2. 对仍然存在的记录做 ±``_REVIEW_WIDE_WINDOW_DAYS`` 天宽窗复核，把每条记录
+       分类成 ``station_missing`` / ``station_found_other_day``（识别“落单了但
+       送达日被平台改过”这种情况）；
+    3. 逐条分类通过 ``snapshot_sink`` 交给调用方（管理员解除入口的写入依据），
+       返回值里只放计数，不带姓名/电话（事件通道不做 PII 广播）。
+
+    失败语义：登录/查询失败一律如实返回 ``review_failed``，**绝不当成“站内
+    没有”**，也绝不据此解除任何阻断。
+    """
+    now = _dt.datetime.now()
+    source = str(getattr(config, "sss_order_source", "wps") or "wps").strip().lower()
+    if source != "excel":
+        source = "wps"
+    url = str(getattr(config, "sss_url", "") or "").strip() or DEFAULT_SSS_URL
+    # 与正式运行共用同一套网址校验/origin 冻结，避免只读核对落到另一个作用域。
+    canonical_sss_origin(url)
+    origin = platform_origin(config, url=url)
+    account = str(getattr(config, "sss_account", "") or "")
+    if not account:
+        raise ValueError("尚未填写闪时送账号")
+    if password is None:
+        password = ""
+    try:
+        read_timeout_s = float(getattr(config, "sss_read_timeout_s", 20.0))
+    except (TypeError, ValueError):
+        read_timeout_s = 20.0
+    read_timeout_s = max(1.0, min(120.0, read_timeout_s))
+    delivery_date = expected_delivery_date(now)
+    journal_key = batch_key(delivery_date, source, account)
+    authoritative_journal = authoritative_uncertain_path(
+        config, origin=origin, account=account)
+    checked_at = now.isoformat(timespec="seconds")
+
+    def _empty_counts() -> dict[str, int]:
+        return {"active": 0, "station_missing": 0, "station_found_other_day": 0,
+                "station_confirmed": 0, "scan_failed": 0}
+
+    def _result(payload: dict[str, Any], *, status: str, next_action: str,
+                review: dict[str, Any]) -> dict[str, Any]:
+        """统一结果形状：只读、零 POST、只带计数（不带姓名/电话）。"""
+        review = dict(review)
+        review.setdefault("checked_at", checked_at)
+        review.setdefault("wide_window_days", _REVIEW_WIDE_WINDOW_DAYS)
+        review.setdefault("journal_fingerprint", "")
+        review.setdefault("counts", _empty_counts())
+        payload = dict(payload)
+        payload.update({
+            "status": status,
+            "next_action": next_action,
+            "source": source,
+            "semantics": "sss-uncertain-readonly-review",
+            "post_sent": False,
+            "authoritative_journal": str(authoritative_journal),
+            "batch_key": journal_key,
+            "review": review,
+            "failed": 0,
+            "stopped": False,
+            "partial": False,
+            "uncertain": False,
+            "created": int(payload.get("confirmed_on_station") or 0),
+        })
+        payload["summary"] = {
+            "status": status,
+            "confirmed": int(payload.get("confirmed_on_station") or 0),
+            "unconfirmed": int((review.get("counts") or {}).get("active") or 0),
+            "stopped": False,
+            "failed": 0,
+            "next_action": next_action,
+            "review": dict(review),
+            "post_sent": False,
+        }
+        return payload
+    _emit(progress_callback, "只读核对：本次不会发送任何下单请求（POST=0）")
+    _batch_guard = batch_submission_lock(authoritative_journal, journal_key)
+    try:
+        _batch_guard.acquire()
+    except UncertainJournalError as exc:
+        _emit(progress_callback, "只读核对无法获取批次锁：" + str(exc))
+        return _result({}, status="review_failed",
+                       next_action="另一个进程正在处理同一批次；请稍后重试只读核对，不要据此解除阻断",
+                       review={"counts": _empty_counts(), "total": 0,
+                               "error": str(exc)})
+
+    client: Any = None
+    try:
+        # 跨作用域只读核对（R8-S1）：有无法安全归属的旧写法记录时如实报告；
+        # 只读核对**不改写、不迁移、不登记**任何东西（位置登记属于正式运行的
+        # 写动作，必须留给用户明确发起的那一次运行）。
+        cross_scope: list[dict[str, Any]] = []
+        cross_scope_error = ""
+        try:
+            cross_scope = cross_scope_unresolved_records(
+                authoritative_journal, config=config, account=account, origin=origin)
+        except UncertainJournalError as exc:
+            cross_scope_error = str(exc)
+        if cross_scope:
+            _emit(progress_callback,
+                  "只读核对：另有 " + str(len(cross_scope))
+                  + " 条无法安全归属的活跃未决记录："
+                  + describe_cross_scope_conflicts(cross_scope))
+
+        _emit(progress_callback, "正在获取闪时送验证码…")
+        client = SssApiClient(origin, account, password,
+                              timeout=(5.0, read_timeout_s), pool_size=2)
+        captcha = client.fetch_captcha()
+        if captcha_callback is None:
+            raise RuntimeError(
+                "纯接口模式需要验证码输入回调，当前界面未提供 captcha 弹窗")
+        _emit(progress_callback, "正在登录闪时送（只读核对）…")
+        client.login(captcha_callback(captcha))
+
+        def relogin() -> None:
+            _emit(progress_callback, "登录态过期，重新获取验证码并登录…")
+            img = client.fetch_captcha()
+            if captcha_callback is None:
+                raise RuntimeError("纯接口模式需要验证码输入回调")
+            client.login(captcha_callback(img))
+            _emit(progress_callback, "重新登录成功")
+
+        def _fetch(path: str) -> dict[str, Any]:
+            return _with_auth_relogin(lambda: client.get_json(path), relogin,
+                                      progress_callback, "只读核对查询")
+
+        pending, _reconciliation, resolved = resolve_pending_records(
+            authoritative_journal, journal_key, _fetch, progress_callback)
+        if resolved:
+            _emit(progress_callback,
+                  "只读核对：站内已确认并清理 " + str(resolved) + " 条未决记录")
+        wide_tasks, wide_by_id = journal_tasks(pending)
+        counts = _empty_counts()
+        counts["active"] = len(pending)
+        counts["station_confirmed"] = resolved
+        classifications: dict[str, str] = {}
+        other_day_matches: dict[str, list[str]] = {}
+        duplicate_count = 0
+        total = len(pending) + resolved
+        if wide_tasks and not stop_event.is_set():
+            _emit(progress_callback,
+                  "只读核对：对剩余 " + str(len(wide_tasks)) + " 条做 ±"
+                  + str(_REVIEW_WIDE_WINDOW_DAYS) + " 天宽窗复核"
+                  "（识别“落单了但送达日被改过”）")
+            try:
+                # 严格对账按“预约时间逐字一致”匹配，改过送达日的订单在那里就是
+                # “缺失”；宽窗复核改用姓名 + 电话，才能把这种订单认出来。
+                person_matches = _reconcile_person_matches(
+                    wide_tasks, _fetch,
+                    created_after=journal_created_after(pending),
+                    days_margin=_REVIEW_WIDE_WINDOW_DAYS)
+            except Exception as exc:  # noqa: BLE001 - 读不到就必须如实说读不到
+                _emit(progress_callback, "只读核对：宽窗复核失败：" + str(exc))
+                for identifier in wide_by_id:
+                    classifications[identifier] = "scan_failed"
+                counts["scan_failed"] = len(wide_by_id)
+            else:
+                for identifier in wide_by_id:
+                    hits = person_matches.get(identifier) or []
+                    classifications[identifier] = (
+                        "station_found_other_day" if hits else "station_missing")
+                    if hits:
+                        other_day_matches[identifier] = [
+                            str(hit.get("delivery_time") or "") for hit in hits][:5]
+                counts["station_missing"] = sum(
+                    1 for value in classifications.values()
+                    if value == "station_missing")
+                counts["station_found_other_day"] = sum(
+                    1 for value in classifications.values()
+                    if value == "station_found_other_day")
+                _emit(progress_callback,
+                      "只读核对：站内缺失 " + str(counts["station_missing"]) + " 条，宽窗内命中"
+                      "（预约时间不同）" + str(counts["station_found_other_day"]) + " 条")
+        elif wide_tasks:
+            for identifier in wide_by_id:
+                classifications[identifier] = "scan_failed"
+            counts["scan_failed"] = len(wide_by_id)
+            _emit(progress_callback, "只读核对已被用户停止：未做宽窗复核")
+
+        fingerprint = journal_fingerprint(authoritative_journal)
+        review = {
+            "counts": counts,
+            "total": total,
+            "wide_window_days": _REVIEW_WIDE_WINDOW_DAYS,
+            "checked_at": _dt.datetime.now().isoformat(timespec="seconds"),
+            "journal_fingerprint": fingerprint,
+            "duplicate_count": duplicate_count,
+            "cross_scope_conflicts": len(cross_scope),
+            "cross_scope_error": cross_scope_error,
+        }
+        # 证据只在“每条都拿到了明确结论”时才留下：只要有 scan_failed，就不该让
+        # 管理员据此解除阻断（前端也会看到 review.available=false 而禁用按钮）。
+        if snapshot_sink is not None and counts["scan_failed"] == 0:
+            # 逐条分类只在内存里交给 Bridge：它是管理员解除阻断的唯一证据，
+            # 不进入事件/日志（那里只放计数）。
+            snapshot_sink({
+                "journal_fingerprint": fingerprint,
+                "checked_at": review["checked_at"],
+                "wide_window_days": _REVIEW_WIDE_WINDOW_DAYS,
+                "classifications": dict(classifications),
+                "other_day_matches": {key: list(value)
+                                      for key, value in other_day_matches.items()},
+                "record_ids": sorted(wide_by_id),
+                "counts": dict(counts),
+                "cross_scope_conflicts": len(cross_scope),
+                "cross_scope_error": cross_scope_error,
+            })
+
+        if pending and counts["scan_failed"] == len(pending):
+            # 严格对账与宽窗复核都没拿到站内结果：这是“读不到”，不是“站内没有”。
+            status = "review_failed"
+            next_action = ("只读核对没有拿到可用的站内结果（对账与宽窗复核都失败）；"
+                           "请查看日志后重试，不要据此解除阻断")
+        elif pending:
+            status = "review_blocked"
+            next_action = ("只读核对完成：站内仍查不到这些订单，未确认前不要重跑或补发；"
+                           "请在闪时送 App 里人工核对站内订单，再由管理员在“未决记录”"
+                           "面板决定是否解除阻断")
+        else:
+            status = "review_ok"
+            next_action = ("只读核对完成：未决记录已全部在站内确认并清理，阻断已解除，"
+                           "可以正常重跑本批")
+        if cross_scope_error:
+            next_action = str(cross_scope_error) + "；" + next_action
+        return _result({"confirmed_on_station": resolved,
+                        "pending_records": len(pending)},
+                       status=status, next_action=next_action, review=review)
+    except Exception as exc:  # noqa: BLE001 - 失败必须如实返回，绝不当作“站内没有”
+        _emit(progress_callback, "只读核对失败：" + str(exc))
+        return _result({}, status="review_failed",
+                       next_action="只读核对没有拿到结果；请查看日志后重试，不要据此解除阻断",
+                       review={"counts": _empty_counts(), "total": 0,
+                               "error": str(exc)})
+    finally:
+        if client is not None:
+            client.close()
+        _batch_guard.release()

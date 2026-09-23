@@ -29,6 +29,7 @@ import {
 import { Switch } from '@/components/ui/switch'
 import { DateField, Field, GhostButton, Stepper, TextInput } from '@/components/fields'
 import { FileBrowserDialog } from '@/components/FileBrowserDialog'
+import { UncertainPanel } from '@/components/UncertainPanel'
 import {
   AdvancedSection,
   Callout,
@@ -45,6 +46,7 @@ import { toFieldErrors, validateOrderDraft, validateSssDraft } from '@/lib/formV
 import { passwordResetVersion } from '@/lib/passwordDraft'
 import { classifyRequestError } from '@/lib/requestError'
 import { previewLocalKey } from '@/lib/preview'
+import { shouldShowUncertainPanel } from '@/lib/uncertainReview'
 import { saveStateView } from '@/lib/saveState'
 import { cn } from '@/lib/utils'
 
@@ -413,6 +415,7 @@ type SssExecutionMode = 'dry_run' | 'preflight' | 'live'
 function SssForm() {
   const {
     config, passwords, startSss, workerAlive, operationActive, operationView, isAdmin, passwordReset,
+    operation, operations,
   } = useApp()
   const sssResetVersion = passwordResetVersion(passwordReset, 'sss')
   const [url, setUrl] = useState(config?.sss_url ?? '')
@@ -453,6 +456,8 @@ function SssForm() {
 
   const dryRun = executionMode === 'dry_run'
   const preflight = executionMode === 'preflight'
+  // 只在闪时送任务结果被阻断或存在未决记录时挂载；面板展开时才只读记录（不轮询）。
+  const showUncertain = shouldShowUncertainPanel(operationView, operation, operations)
 
   const save = useCallback(async () => {
     if (!isWebTransport() || !isApiReady()) {
@@ -611,6 +616,8 @@ function SssForm() {
     <div className="flex min-w-0 min-h-0 flex-1 flex-col">
       <div className="scroll-contain min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-3 sm:px-5">
         <FlowStrip steps={flow} label="闪时送执行流程" />
+
+        {showUncertain && <UncertainPanel password={password} isAdmin={Boolean(isAdmin)} />}
 
         {isAdmin && (
           <AdvancedSection

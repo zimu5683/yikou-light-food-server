@@ -43,6 +43,15 @@ _LIST_PAGE_SIZE = 100
 
 _SERVER_PREFILTER_MARGIN_DAYS = 1
 
+#: 只读核对未决记录时的“宽窗”天数：站内订单的预约送达日可能被平台改到相邻日期，
+#: 严格按目标日过滤会把它判成“站内没有”，从而把“落单了但日期变了”误当成“没落单”。
+#: 宽窗复核只用于**报告分类**，不改变任何自动对账判定。
+_REVIEW_WIDE_WINDOW_DAYS = 3
+
+#: 只读核对证据的有效期（秒）。管理员据“站内查不到”解除阻断前，必须先有一次
+#: 新鲜的只读核对；超期或 journal 已变化就要求重新核对，避免拿旧结论下单。
+_SSS_REVIEW_TTL_S = 600.0
+
 _SSS_SERVER_PREFILTER = os.environ.get(
     "YIKOU_SSS_SERVER_PREFILTER", "").strip().lower() not in ("0", "false", "no", "off")
 

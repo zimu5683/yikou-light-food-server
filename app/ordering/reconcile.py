@@ -141,16 +141,43 @@ def _build_list_prefilter(tasks: list[dict[str, Any]],
     }
 
 
+def _expand_days(days: set[str], margin: int) -> set[str]:
+    """把目标送达日按 ±``margin`` 天展开；``margin<=0`` 时逐字返回原集合。
+
+    只给“人工只读核对”的宽窗复核用：站内订单的预约送达日可能被平台改到相邻
+    日期，严格按目标日过滤会把“落单了但日期变了”误判成“站内没有”。默认
+    ``margin=0`` 必须与改动前逐字等价（有专门的等价性测试锁定）。
+    """
+    margin = max(0, int(margin or 0))
+    if not margin:
+        return set(days)
+    expanded: set[str] = set()
+    for raw in days:
+        try:
+            base = _dt.datetime.strptime(str(raw), "%Y-%m-%d").date()
+        except ValueError:
+            # 读不出日期（空串/异形写法）时原样保留：宽窗不该因此放宽判定。
+            expanded.add(raw)
+            continue
+        for offset in range(-margin, margin + 1):
+            expanded.add((base + _dt.timedelta(days=offset)).isoformat())
+    return expanded
+
+
 def _list_pending_orders(fetch_json: Callable[[str], dict[str, Any]],
                          tasks: list[dict[str, Any]],
                          *,
-                         prefilter: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+                         prefilter: dict[str, Any] | None = None,
+                         days_margin: int = 0) -> list[dict[str, Any]]:
     """分页拉取订单列表并在本地按预约日期/状态过滤，不发任何写请求。
 
     ``prefilter`` 非空时只作为服务端粗筛条件（缩小翻页范围）；无论服务端返回
     什么，送达日与活跃状态的判定一律由本地过滤负责，判定标准不因预筛改变。
+    ``days_margin`` 只放宽本地“目标送达日”集合（默认 0 = 不放宽）。
     """
-    wanted_days = {_task_fingerprint(task).expected_delivery_time[:10] for task in tasks}
+    wanted_days = _expand_days(
+        {_task_fingerprint(task).expected_delivery_time[:10] for task in tasks},
+        days_margin)
     records: list[dict[str, Any]] = []
     page_no = 1
     page_token = ""
@@ -317,7 +344,8 @@ def _reconcile_tasks(tasks: list[dict[str, Any]],
                      fetch_json: Callable[[str], dict[str, Any]],
                      *, created_after: float | None = None,
                      created_before: float | None = None,
-                     prefilter: dict[str, Any] | None = None) -> _Reconciliation:
+                     prefilter: dict[str, Any] | None = None,
+                     days_margin: int = 0) -> _Reconciliation:
     """按订单身份对账，兼容列表接口的概要结构。
 
     匹配以「姓名 + 电话 + 预约时间」为核心；站内明确给出、却与任务不一致的
@@ -344,7 +372,8 @@ def _reconcile_tasks(tasks: list[dict[str, Any]],
 
     actual = Counter()
     seen_station_records: set[tuple[str, str]] = set()
-    for record in _list_pending_orders(fetch_json, tasks, prefilter=prefilter):
+    for record in _list_pending_orders(fetch_json, tasks, prefilter=prefilter,
+                                       days_margin=days_margin):
         identity = _station_record_identity(record)
         if identity is not None:
             if identity in seen_station_records:
@@ -389,6 +418,66 @@ def _reconcile_tasks(tasks: list[dict[str, Any]],
         missing.extend(grouped_tasks[min(len(grouped_tasks), on_site):])
         duplicate_count += max(0, on_site - len(grouped_tasks))
     return _Reconciliation(confirmed, missing, duplicate_count, sum(actual.values()))
+
+
+def _reconcile_person_matches(tasks: list[dict[str, Any]],
+                              fetch_json: Callable[[str], dict[str, Any]],
+                              *, created_after: float | None = None,
+                              days_margin: int = 0
+                              ) -> dict[str, list[dict[str, Any]]]:
+    """按「姓名 + 电话」在宽窗内找站内订单（**忽略预约时间是否一致**）。
+
+    只给“人工只读核对”的宽窗复核用。严格对账要求预约时间逐字一致，因此
+    “落单了、但送达日/时间被平台改过”在严格对账里表现为“站内缺失”；如果
+    据此解除阻断就会重复下单。这里放宽到姓名 + 电话，其余字段仍走同一套
+    ``_fingerprint_compatibility``（地址/门店/商品等冲突仍算他人订单）。
+
+    返回 ``{task_identifier: [{"order_id", "delivery_time", "undecidable"}]}``；
+    地址等字段缺失导致无法判定时**也算命中**（保守方向：宁可拒绝解除阻断）。
+    """
+    by_person: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for task in tasks:
+        fingerprint = _task_fingerprint(task)
+        person = (fingerprint.receive_name, fingerprint.receive_phone)
+        if not all(person):
+            continue
+        by_person.setdefault(person, []).append(task)
+    if not by_person:
+        return {}
+    expected_accounts = {_task_fingerprint(task).account for task in tasks}
+    expected_accounts.discard("")
+    fallback_account = (next(iter(expected_accounts))
+                        if len(expected_accounts) == 1 else "")
+    matches: dict[str, list[dict[str, Any]]] = {}
+    seen_station_records: set[tuple[str, str]] = set()
+    for record in _list_pending_orders(fetch_json, tasks, days_margin=days_margin):
+        identity = _station_record_identity(record)
+        if identity is not None:
+            if identity in seen_station_records:
+                continue
+            seen_station_records.add(identity)
+        created_at = _record_created_timestamp(record)
+        if created_at is not None and created_after is not None \
+                and created_at < created_after:
+            continue
+        fingerprint = _order_record_fingerprint(record, account=fallback_account)
+        candidates = by_person.get(
+            (fingerprint.receive_name, fingerprint.receive_phone))
+        if not candidates:
+            continue
+        for task in candidates:
+            conflict, undecidable = _fingerprint_compatibility(
+                fingerprint, _task_fingerprint(task))
+            if conflict:
+                continue
+            identifier = str(task.get("identifier") or "")
+            matches.setdefault(identifier, []).append({
+                "order_id": str(identity[1]) if identity else "",
+                "delivery_time": str(fingerprint.expected_delivery_time or ""),
+                "undecidable": bool(undecidable),
+            })
+            break
+    return matches
 
 
 def _emit_reconciliation(callback: Callable[[str], Any] | None, label: str,

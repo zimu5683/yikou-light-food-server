@@ -55,6 +55,8 @@ function isPlainSuccess(payload: TaskOutcomeLike): boolean {
   // 仅当服务端明确 ok=true 且 success=true，且没有任何不确定/部分/停止/阻断标记时才叫成功。
   if (payload.ok !== true || payload.success !== true) return false
   if (payload.stopped || payload.partial || payload.uncertain || payload.blocked) return false
+  // needs_review 是「还要人核对」的硬标记：带着它就不能显示成功（Verifier D2）。
+  if (payload.needs_review) return false
   const status = String(payload.status || payload.result_status || '').toLowerCase()
   return status === '' || status === 'success'
 }
@@ -89,7 +91,7 @@ export function taskOutcomeView(payload: TaskOutcomeLike): TaskOutcomeView {
     return {
       level: 'error', toast: 'error',
       title: '任务被阻断 · 待核对',
-      message: withNext(message || '任务被阻断，需先只读核对站内订单与本地记录；未确认前不要重发。'),
+      message: withNext(message || '任务被阻断，需在闪时送结果区「未决记录」面板查看未决记录并只读核对站内订单；未确认前不要重发。'),
       needsReview: true, isSuccess: false, statusKey: 'blocked_uncertain',
     }
   }
