@@ -13,8 +13,14 @@ permissions:
 jobs:
   python:
     strategy:
+      # 产品只在 Android / Termux 上跑，Windows 与 macOS 从来不是交付目标（APK 才是）。
+      # 原来跑三平台矩阵还有个副作用：matrix 默认 fail-fast，Windows 一挂就把
+      # ubuntu / macOS 一起取消 —— 连最接近 Android 的代理环境也拿不到测试信号。
+      # 现在只留 ubuntu（POSIX 语义最接近 Termux），并关掉 fail-fast，让两个
+      # Python 版本都跑完再收结论。
+      fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
         python-version: ["3.11", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:

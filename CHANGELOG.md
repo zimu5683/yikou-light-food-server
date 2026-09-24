@@ -62,8 +62,12 @@
   批2 矩阵在 390px 取样，该状态 33 字的说明本来就放得下，注入 `truncate` 不产生可见裁切。
 - `mutation` job 超时 60 → 120 分钟（13 个场景实测约 46 分钟）。
 - CI 实测：浏览器门禁 **250 PASS / 0 FAIL**；变异门禁 **13/13 场景通过**。
-- 仍未修（历史债，与 3.6.13 记录的是同一批）：Windows runner 上的 python 用例失败
-  （子进程中文编码 + POSIX 语义），见 `design/archive/迭代进展.md`。
+- Windows runner 上 python 用例的 43 个失败（子进程中文编码 + POSIX 语义，与 3.6.13
+  记录的同一批）**不再修**：产品只在 Android / Termux 上跑，Windows 与 macOS 不是交付目标。
+  CI 的 python 矩阵从「Windows + Ubuntu + macOS × 3.11/3.13」收敛为
+  **只跑 Ubuntu × 3.11/3.13**，并关掉 `fail-fast` —— 原来 Windows 一红会把
+  ubuntu/macOS 一起取消，连最接近 Termux 的 Linux 信号都拿不到。
+  历史记录见 `design/archive/迭代进展.md`。
 
 ## 3.6.13
 
