@@ -646,10 +646,8 @@ function createMockServer() {
         else respond()
         return
       }
-      case 'frontend_report':
       case 'check_updates':
       case 'set_split_ratio':
-      case 'echo_test':
         return json(res, { ok: true })
       default:
         return json(res, { ok: true })
@@ -2469,7 +2467,7 @@ async function main() {
 
     // ---------- 5g. FE-1 / R6-8：权威操作状态 uncertain 不得被渲染成「已完成」 ----------
     enterScenario('5g FE-1 uncertain 权威状态')
-    // 缺口来源：docs/OPTIMIZATION-FINAL-ACCEPTANCE-R7.md §5.4（任务 T4）——
+    // 缺口来源：最终验收复核 R7 §5.4（任务 T4）——
     // 把 lib/operationStatus.ts 的 uncertain 分支改成 success/“已完成”后，前端单测会失败，
     // 但浏览器检查仍然 95 PASS。这里用 mock 后端返回**权威** status=uncertain，
     // 断言真实渲染出来的状态胶囊/详情/权威状态卡片与真实交互（点击 + 请求计数），

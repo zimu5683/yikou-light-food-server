@@ -317,7 +317,10 @@ function OrderForm() {
   return (
     <div className="flex min-w-0 min-h-0 flex-1 flex-col">
       <div className="scroll-contain min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-3 sm:px-5">
-        <FlowStrip steps={flow} label="订单处理流程" />
+        {/* 闲置态不渲染流程条：只有真正在跑、或有待核对/失败需要看进度时才占屏幕。 */}
+        {(workerAlive || operationActive || operationView.needsReview || operationView.key === 'error') && (
+          <FlowStrip steps={flow} label="订单处理流程" />
+        )}
 
         {isAdmin && (
           <AdvancedSection
@@ -326,7 +329,7 @@ function OrderForm() {
             summary={advancedMissing ? '首次使用需先补齐，否则无法启动' : '已配置，可展开修改'}
             open={advancedOpen}
             onOpenChange={setAdvancedOpen}
-            notice={advancedMissing ? '缺少网址、账号或排单表路径。首次使用请先完成这些必填配置；系统会按后端最终校验为准。' : undefined}
+            notice={advancedMissing ? '缺少网址、账号或排单表路径，首次使用需先补齐；最终以服务端校验为准。' : undefined}
           >
             <Field label="管理网址" htmlFor="order-url" error={modeError(fields, 'url')} helper="用于登录管理后台">
               <TextInput id="order-url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://example.com/admin" autoComplete="url" />
@@ -353,7 +356,7 @@ function OrderForm() {
         )}
         {!isAdmin && (
           <Callout tone="neutral" title="按管理员预设运行">
-            本账号无需填写管理网址、账号、密码和文件路径；任务会使用管理员预设配置。真正的强制拦截在服务端。
+            本账号使用管理员预设配置（真正的强制拦截在服务端），无需填写管理网址、账号、密码和文件路径。
           </Callout>
         )}
 
@@ -615,7 +618,10 @@ function SssForm() {
   return (
     <div className="flex min-w-0 min-h-0 flex-1 flex-col">
       <div className="scroll-contain min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-3 sm:px-5">
-        <FlowStrip steps={flow} label="闪时送执行流程" />
+        {/* 闲置态不渲染流程条：只有真正在跑、或有待核对/失败需要看进度时才占屏幕。 */}
+        {(workerAlive || operationActive || operationView.needsReview || operationView.key === 'error') && (
+          <FlowStrip steps={flow} label="闪时送执行流程" />
+        )}
 
         {showUncertain && <UncertainPanel password={password} isAdmin={Boolean(isAdmin)} />}
 
@@ -626,7 +632,7 @@ function SssForm() {
             summary={advancedMissing ? '首次使用需先补齐' : '已配置，可展开修改'}
             open={advancedOpen}
             onOpenChange={setAdvancedOpen}
-            notice={advancedMissing ? '缺少网址、账号或本地 Excel 路径。云端名单模式可暂时留空 Excel；本地名单模式必须选择文件。' : undefined}
+            notice={advancedMissing ? '缺少网址、账号或本地 Excel 路径；云端模式可留空 Excel，本地模式必须选文件。' : undefined}
           >
             <Field label="闪时送网址" htmlFor="sss-url" error={modeError(fields, 'url')} helper="闪时送下单平台地址">
               <TextInput id="sss-url" value={url} onChange={(e) => setUrl(e.target.value)} autoComplete="url" />
@@ -686,7 +692,7 @@ function SssForm() {
           <div className="mb-3.5">
             {needsDayPreview ? (
               <Callout tone={dayError ? 'danger' : 'warning'} title={dayError ? '名单预览失败' : '名单预览已失效或尚未读取'}>
-                {dayError || (dayPreview ? '配置或执行方式已变化，请重新读取名单预览。' : '执行前需要先只读读取云端当天名单，生成结构化预览。')}
+                {dayError || (dayPreview ? '配置或执行方式已变化，请重新读取名单预览。' : '执行前需要先只读读取云端当天名单。')}
                 <button type="button" className="mt-1.5 block text-left font-medium text-primary underline" disabled={dayLoading || operationActive} onClick={() => void readDayOrders()}>
                   {dayLoading ? '正在读取…' : '重新读取云端名单'}
                 </button>
@@ -717,7 +723,7 @@ function SssForm() {
         onOpenChange={setConfirmOpen}
         title={`确认${modeLabel}`}
         description={executionMode === 'live'
-          ? '这是真实下单操作。服务端会创建订单，可能扣款或占用余额。请再次核对账号、名单来源与文件。'
+          ? '这是真实下单操作：服务端会创建订单并可能扣款或占用余额，请再次核对账号、名单来源与文件。'
           : executionMode === 'preflight'
             ? '预检会登录平台并检查，但不会创建订单；如发现风险会安全停止。'
             : '模拟执行只组装并预览报文，不会创建真实订单。'}
@@ -899,7 +905,7 @@ function ConfirmStopDialog({
         <DialogHeader>
           <DialogTitle className="font-serif">停止当前任务</DialogTitle>
           <DialogDescription>
-            停止后服务端会等待当前操作安全收尾，并保留未完成状态供核对。请查看日志确认结果。
+            停止后服务端会安全收尾并保留未完成状态供核对，请查看日志确认结果。
           </DialogDescription>
         </DialogHeader>
         <DialogFooter className="gap-2">
@@ -971,7 +977,7 @@ function ToolsMenu({ mode }: { mode: TaskMode }) {
           <DialogHeader>
             <DialogTitle className="font-serif">{passwordLabel}</DialogTitle>
             <DialogDescription>
-              将从系统凭据管理器删除本机保存的{accountHint}密码；服务端确认成功后，当前表单密码框会同步清空。失败或结果未知时会保留草稿。
+              将从系统凭据管理器删除本机保存的{accountHint}密码；服务端确认成功后同步清空表单密码框，失败或结果未知时保留草稿。
             </DialogDescription>
           </DialogHeader>
           {clearError && <p role="alert" className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">{clearError}</p>}

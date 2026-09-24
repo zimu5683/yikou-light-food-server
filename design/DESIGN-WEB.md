@@ -1,7 +1,7 @@
 # 一口轻食 Web 前端设计规范（DESIGN-WEB）
 
 > 状态：**M1 提案版** —— 三个候选方向待用户选定，选定后本文扩展为唯一规范（token 冻结）。
-> 方法论：`.zcode/skills/frontend-design`（anthropics，Apache-2.0）+ 参考 `design/references/{linear,vercel}-DESIGN.md`。
+> 方法论：`.zcode/skills/frontend-design`（anthropics，Apache-2.0）+ 参考 `design/archive/references/{linear,vercel}-DESIGN.md`。
 
 ## 0. 产品设定（brief）
 
@@ -36,7 +36,7 @@
 
 ## 2. 三个候选方向
 
-> 每个方向 = 色板（4–6 命名值）+ 字体角色 + 形状/层次 + **一个记忆点**（boldness 只花在一处）+ 深色映射。高保真 mock 见 `design/mocks/`。
+> 每个方向 = 色板（4–6 命名值）+ 字体角色 + 形状/层次 + **一个记忆点**（boldness 只花在一处）+ 深色映射。高保真 mock 见 `design/archive/mocks/`。
 
 ---
 
@@ -175,4 +175,4 @@
 
 ### 最终 mock
 
-`design/mocks/final-wheat-press.html`（交互版，右上角切深色）
+`design/archive/mocks/final-wheat-press.html`（交互版，右上角切深色）

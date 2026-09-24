@@ -874,10 +874,6 @@ type BridgeEventBase =
   | { event: 'task:done'; payload: TaskEventPayload }
   | { event: 'task:error'; payload: TaskEventPayload }
   | { event: 'update:available'; payload: UpdateAvailable }
-  | {
-      event: 'desktop_update:available'
-      payload: { tag: string; current: string; body: string; html_url?: string }
-    }
   | { event: 'update:latest'; payload: { manual: boolean; current: string } }
   | { event: 'update:progress'; payload: UpdateProgress }
   | { event: 'update:permission_required'; payload: { message: string } }
@@ -1053,9 +1049,7 @@ interface BackendApi {
   cancel_update(): Promise<{ ok: boolean }>
   open_install_settings(): Promise<{ ok: boolean; message?: string }>
   open_external(url: string): Promise<{ ok: boolean }>
-  frontend_report(payload: Record<string, unknown> | string): Promise<{ ok: boolean }>
   drain_events(lastSequence?: number, ackSequence?: number, producerId?: string): Promise<DrainEventsResult>
-  echo_test(message: string, payload?: Record<string, unknown>): Promise<{ echo: string; payload_keys: string[] | null }>
   request_close(): Promise<{ action: string }>
   set_split_ratio(ratio: number): Promise<{ ok: boolean; ratio: number }>
   save_order_config(payload: OrderConfigPayload): Promise<{ ok: boolean; reason?: string; saved?: { order_date: string; order_count: number | null } }>

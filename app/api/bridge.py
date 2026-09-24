@@ -14,7 +14,6 @@ sequence 中间缺口和关键事件超限都会返回 ``events:dropped`` 告警
 - task:error         {message}
 - update:available         {tag, current, body, html_url, can_install, asset_name, size}
                             App 自己的 Release；APK 模式下带安装包信息
-- desktop_update:available {tag, current, body, html_url}   桌面版提示，不改变网页版
 - update:latest            {manual, current}
 - update:progress          {phase, percent, downloaded, total, message}
 - update:permission_required {message}                      需要允许“安装未知应用”
@@ -75,7 +74,6 @@ from app.api.preview import (PREVIEW_TTL_SECONDS, PreviewStore,
                              canonical_plan, fingerprint_payload,
                              plan_fingerprint, sha256_file)
 from app.core.update import (
-    DESKTOP_REPOSITORY,
     ReleaseCheckError,
     UpdateCancelled,
     check_for_update,
@@ -186,7 +184,6 @@ class Bridge:
         self._worker: threading.Thread | None = None
         self._closing = False
         self._status = "ready"
-        self._reports: list[dict[str, Any]] = []
         # 事件使用「保留 + cursor 重放」而不是「取出即删除」；producer_id 用于
         # 前端识别 Python 进程重启后 sequence 归零，避免误推进旧 cursor。
         self._event_log: deque[dict[str, Any]] = deque()
@@ -448,13 +445,6 @@ class Bridge:
     def status(self) -> str:
         """当前任务状态（``ready``/``running``/``stopping``/``success``/``partial``/``stopped``/``error``/``updating``）。"""
         return self._status
-
-    # ------------------------------------------------------------------
-    # js_api：前端握手与初始状态
-    # ------------------------------------------------------------------
-    def echo_test(self, message: str = "", payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        """带参调用诊断：验证 API 层 JSON 参数序列化是否正常。"""
-        return {"echo": message, "payload_keys": sorted(payload.keys()) if isinstance(payload, dict) else None}
 
     #: 非管理员不可见（但任务仍按这些值运行）的配置字段。
     #: 判据是「泄漏后能被用来做什么」：管理网址 + 手机号可用来接管下单目标、
@@ -4817,71 +4807,54 @@ class Bridge:
         self._set_status(previous if previous and previous != "updating" else "ready")
 
     def _check_updates_worker(self, manual: bool) -> None:
-        web_ok = True
+        ok = True
         current_version = self._installed_app_version()
         android_mode = android_runtime.is_android()
         try:
-            try:
-                release = check_for_update(current_version=current_version)
-                if release:
-                    apk = select_android_apk(release) if android_mode else None
-                    if android_mode and apk is None:
-                        self.log(f"发现新版本 {release.tag_name}，"
-                                 "但 Release 缺少 Android APK 资产，暂不可安装", "WARN")
-                        if manual:
-                            self._emit_event("update:error", {
-                                "code": "no_apk",
-                                "message": "发现新版本，但该 Release 没有 Android 安装包",
-                            })
-                    else:
-                        payload: dict[str, Any] = {
-                            "tag": release.tag_name,
-                            "current": current_version,
-                            "body": release.body or "（暂无更新说明）",
-                            "html_url": release.release_url,
-                            "can_install": bool(android_mode and apk is not None),
-                        }
-                        if apk is not None:
-                            payload.update({
-                                "asset_name": apk.name,
-                                "size": int(apk.size or 0),
-                            })
-                        self._emit_event("update:available", payload)
-                elif manual:
-                    self._emit_event("update:latest", {"manual": True, "current": current_version})
+            release = check_for_update(current_version=current_version)
+            if release:
+                apk = select_android_apk(release) if android_mode else None
+                if android_mode and apk is None:
+                    self.log(f"发现新版本 {release.tag_name}，"
+                             "但 Release 缺少 Android APK 资产，暂不可安装", "WARN")
+                    if manual:
+                        self._emit_event("update:error", {
+                            "code": "no_apk",
+                            "message": "发现新版本，但该 Release 没有 Android 安装包",
+                        })
                 else:
-                    self.log("当前已是最新版本")
-            except ReleaseCheckError as exc:
-                web_ok = False
-                self._set_status("error")
-                self._emit_event("update:error", {"code": "check_failed", "message": str(exc)})
-
-            # 桌面版仓库只做提示：不下载、不安装、不改动任何网页端文件。
-            try:
-                desktop = check_for_update(current_version=current_version,
-                                           repository=DESKTOP_REPOSITORY)
-                if desktop:
-                    self._emit_event("desktop_update:available", {
-                        "tag": desktop.tag_name,
+                    payload: dict[str, Any] = {
+                        "tag": release.tag_name,
                         "current": current_version,
-                        "body": desktop.body or "（暂无更新说明）",
-                        "html_url": desktop.release_url,
-                    })
-                    self.log(f"桌面版发布新版本 {desktop.tag_name}；"
-                             "网页版内容不会被自动改动，如需同步功能请手动移植代码")
-            except ReleaseCheckError as exc:
-                self.log(f"桌面版更新检查失败：{exc}", "WARN")
+                        "body": release.body or "（暂无更新说明）",
+                        "html_url": release.release_url,
+                        "can_install": bool(android_mode and apk is not None),
+                    }
+                    if apk is not None:
+                        payload.update({
+                            "asset_name": apk.name,
+                            "size": int(apk.size or 0),
+                        })
+                    self._emit_event("update:available", payload)
+            elif manual:
+                self._emit_event("update:latest", {"manual": True, "current": current_version})
+            else:
+                self.log("当前已是最新版本")
+        except ReleaseCheckError as exc:
+            ok = False
+            self._set_status("error")
+            self._emit_event("update:error", {"code": "check_failed", "message": str(exc)})
         finally:
             operation_id = self._update_check_operation_id
             self._update_check_operation_id = ""
             self._update_checking = False
-            if web_ok:
+            if ok:
                 self._restore_after_update_task()
             self._operations.finish_if_active(
                 operation_id,
-                status="success" if web_ok else "error",
-                reason="" if web_ok else "check_failed",
-                next_action="" if web_ok else "查看日志后重试")
+                status="success" if ok else "error",
+                reason="" if ok else "check_failed",
+                next_action="" if ok else "查看日志后重试")
 
     def _emit_update_progress(self, phase: str, percent: int, *,
                               downloaded: int | None = None,
@@ -5119,26 +5092,6 @@ class Bridge:
                 return {"ok": android_runtime.open_external(url)}
             webbrowser.open(url)
         return {"ok": True}
-
-    # ------------------------------------------------------------------
-    # js_api：前端回传通道（自动化验证与诊断用；JS→Python 方向可靠）
-    # ------------------------------------------------------------------
-    def frontend_report(self, payload: dict[str, Any] | str = "") -> dict[str, Any]:
-        """前端把运行状态快照回传给 Python（例如渲染完成、收到的事件）。
-
-        自动化验收依赖本通道而非 evaluate_js——后者在新版 WebKitGTK 上
-        返回空值不可信。
-        """
-        with self._push_lock:
-            self._reports.append({"ts": time.strftime("%H:%M:%S"), "payload": payload})
-            del self._reports[:-50]
-        return {"ok": True}
-
-    def pop_reports(self) -> list[dict[str, Any]]:
-        """取出并清空前端回传的运行快照（自动化验收用）。"""
-        with self._push_lock:
-            reports, self._reports = self._reports, []
-        return reports
 
     # ------------------------------------------------------------------
     # js_api：窗口动作与关闭保护

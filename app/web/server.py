@@ -80,8 +80,7 @@ _NON_ADMIN_METHODS = frozenset({
     # 任务控制
     "start_order", "start_sss", "stop_task", "worker_alive",
     # 握手与进度
-    "bridge_ready", "drain_events", "echo_test", "frontend_report", "pop_reports",
-    "status", "log",
+    "bridge_ready", "drain_events", "status", "log",
     # 交互回应（任务在等这些输入才能继续）
     "resolve_decision", "resolve_captcha", "resolve_address_input",
     # 云文档同步：预览 + 上传
@@ -804,7 +803,7 @@ class _Handler(BaseHTTPRequestHandler):
             return payload, {}
         if isinstance(payload, dict):
             return [], payload
-        # 标量请求体：当成单个位置参数，便于 echo_test("x") 这类调用。
+        # 标量请求体：当成单个位置参数，便于 set_split_ratio(0.4) 这类调用。
         return [payload], {}
 
 

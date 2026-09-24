@@ -1,6 +1,6 @@
 """R8-S3 专项测试：显式权威位置切换不得绕过未确认订单保护。
 
-场景（与 ``docs/OPTIMIZATION-FINAL-ACCEPTANCE-R8-S3.md`` 的 C1–C5 对应）：
+场景（C1–C5；本文件即这组验收场景的权威副本）：
 
 * C1 显式文件里已有旧尾点 unresolved → 普通 URL：仍阻断；
 * C2 默认权威根有 unresolved → 启用空显式文件：第二轮 POST=0；
@@ -591,8 +591,8 @@ def test_unregistered_legacy_explicit_path_is_not_auto_discovered(
 
     修复后只保护 (a) 默认权威根、(b) 修复后代码使用过并被登记的位置、
     (c) 运维在登记文件里声明的旧位置。本测试固定这一边界：未声明的旧位置不会被
-    扫描，也不会被声称已保护；旧记录本身不被删除/改写。升级流程见
-    ``docs/OPTIMIZATION-R8-S3-FIX.md``。
+    扫描，也不会被声称已保护；旧记录本身不被删除/改写。升级流程即本文件
+    覆盖的边界：只保护已声明或已登记的位置。
     """
     legacy = tmp_path / "legacy-unregistered.json"
     before = write_unresolved_record(legacy, journal_id="legacy-unregistered-1")

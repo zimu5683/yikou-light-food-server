@@ -31,7 +31,7 @@ app/integrations/  外部 HTTP 客户端（requests）
 | `app/core/credentials.py` | 密码读写：桌面/Termux 用 keyring，Android 用 Keystore（双命名空间） |
 | `app/wps/android_runtime.py` | Python ↔ Kotlin `WpsRuntime` 的唯一桥；仅 `YIKOU_APP_MODE=android` 生效 |
 | `app/core/models.py` | `MealInfo` / `OrderInfo` 纯数据模型 |
-| `app/core/update.py` | 双轨道：网页版 Release 才提示更新；桌面版 Release 只做独立提示 |
+| `app/core/update.py` | 版本检查与更新：只查网页版 Release，发现新版本提示更新 |
 | `app/integrations/api_client.py` | 管理后台与闪时送 HTTP 会话、登录、错误映射 |
 | `app/order/parsing.py` | 订单文本解析、Excel 列写入、备份等纯函数 |
 | `app/order/runner.py` | 管理后台订单抓取、合并、退款过滤、写排单表 |

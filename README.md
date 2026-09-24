@@ -4,433 +4,156 @@
 既可以在手机（Termux）上当服务器、其他设备用浏览器访问，也支持打成
 **一个自带最小 kdocs-cli 运行环境的 arm64 APK**，无需安装 Termux。
 
-账号密码不会写入源码；Android 上使用 Android Keystore + AES-GCM 保存，
-Termux/桌面继续使用系统密钥环（`keyring`：Windows Credential Manager /
-macOS Keychain / Linux SecretService），没有可用密钥环时退化为每次运行手动输入。
+- 固定**纯接口模式**：直接调用平台 HTTP 接口完成登录、读单和下单，不启动任何浏览器（桌面原生窗口版与 Playwright 备用模式已全部移除）。
+- 账号密码不会写入源码；Android 上用 Android Keystore + AES-GCM 保存，Termux/桌面用系统
+  密钥环（`keyring`），没有可用密钥环时退化为每次运行手动输入。
+- 自用项目，功能不完善；当前代码结构见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
-> **架构说明**：本项目原先同时提供桌面原生窗口版（pywebview）与浏览器自动化备用模式
-> （Playwright）。两者已**全部移除**，只保留纯接口模式：
-> - 桌面窗口层、PyInstaller 打包、三平台发布流水线、自动更新器 —— 已删；
-> - Playwright 浏览器模式与页面定位器（`locators.json`）—— 已删。
->
-> 现在只有一条路径：**HTTP 调用平台接口**。
-
-此项目是本人自用，代码功能不完善，还有许多需要改进的地方，项目公开，大家也可以以我项目为基础开发出更完整功能的项目。
-
-程序包含三个任务模式：
+## 三个任务模式
 
 - **订单处理**：登录管理后台，读取最新订单并写入排单 Excel；
-- **云文档同步**：把本地排单表的内容增量写入 WPS 云端的排单表（见下文）；
-- **闪时送下单**：从独立的《闪时送.xlsx》读取订单（午餐/晚餐两表），在闪时送平台逐单创建预约单。
+- **云文档同步**：把本地排单表的内容增量写入 WPS 云端的排单表（见
+  [docs/WPS-SYNC-RULES.md](docs/WPS-SYNC-RULES.md)）；
+- **闪时送下单**：从《闪时送.xlsx》或云端当天名单读取订单，在闪时送平台逐单创建预约单。
 
-固定使用**纯接口模式**：直接调用平台 HTTP 接口完成登录、读单和下单，不启动任何浏览器。
+## 快速开始
 
-## 项目结构
-
-```
-app/
-  main.py               CLI 入口
-  core/                 配置、凭据、共享模型、版本检查
-  integrations/         管理后台 / 闪时送 HTTP 客户端
-  order/                管理后台订单处理（解析、抓取、模板、地址）
-  ordering/             闪时送下单与云端名单导入
-  wps/                  WPS 云文档增量同步
-  api/                  前端唯一 API 表面 Bridge
-  web/                  HTTP 服务器、鉴权、登录/管理员页面
-frontend/               React + TypeScript 前端（构建产物在 frontend/dist/）
-android/                Android APK 工程（Chaquopy + WpsRuntime 兼容层）
-tests/                  pytest 与前端契约测试
-scripts/                运维/构建脚本      tools/  一次性诊断探针
-docs/                   当前架构说明、桌面版功能对比（DESKTOP-PARITY.md）
-design/                历史方案与验证资料（见 design/README.md）
-```
-
-依赖方向：`web → api → 领域包（order / ordering / wps）→ core / integrations`，
-由 `tests/test_architecture_boundaries.py` 静态约束。详见
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
-
-## Android APK（arm64 独立安装）
-
-目标是把「Python 后端 + React 前端 + kdocs-cli + Termux」收敛成一个可覆盖安装的
-arm64 APK：WebView 加载现有前端，Chaquopy 在 App 进程内跑现有 `app/` 业务代码，
-Kotlin `WpsRuntime` 负责 `proot + kdocs-cli`、DNS/CA 适配和 Custom Tabs 授权。
-完整方案、接口与验收矩阵见 [`design/APK-PLAN.md`](design/APK-PLAN.md)。
-
-本地构建（需要 JDK 17 / Android SDK 35 / NDK，打 APK 前先构建前端）：
-
-```bash
-python scripts/fetch_kdocs_cli.py --platform linux-arm64
-python scripts/fetch_android_runtime.py          # 下载 proot/依赖 + NDK 编译 xdg shim
-cd frontend && pnpm install --frozen-lockfile && pnpm build
-cd ../android && ./gradlew assembleRelease
-```
-
-CI 工作流：[`.github/workflows/android.yml`](.github/workflows/android.yml)。它使用
-x86_64 runner 下载 **linux-arm64** kdocs-cli、Termux proot 依赖与 Mozilla CA，并用
-patchelf 把 RUNPATH 改成 `$ORIGIN` 后由 Chaquopy/AGP 打包。正式分发必须在 GitHub
-Secrets 配置 `YIKOU_KEYSTORE_FILE` / `YIKOU_KEYSTORE_PASSWORD` / `YIKOU_KEY_ALIAS` /
-`YIKOU_KEY_PASSWORD`；缺失时会退化为 debug 签名，只能做 M0/M1 可行性验证。
-### APK 应用内更新
-
-App 打开后会自动检查 GitHub Release（5 分钟短节流，正常使用每次打开都会检查）。
-发现新版本时点击弹窗里的「下载并安装」，会：
-
-1. 自动选择 Release 里的 arm64 APK 与 `.sha256`；
-2. 下载到 App 缓存目录并显示进度；
-3. 校验文件完整性、SHA-256、包名、签名和 `versionCode`；
-4. 校验通过后直接拉起系统安装器，用户按系统提示完成覆盖安装。
-
-注意：
-
-- 普通 Android App 无法静默安装，系统安装确认弹窗无法绕过；
-- 首次需要允许本应用「安装未知来源应用」；
-- 新旧 APK 必须使用同一把签名证书，否则只能卸载重装（配置会丢失）；
-- 这一功能从 **v3.6.5** 开始存在（v3.6.8 修复了旧版原生更新接口调错 Kotlin 类的问题）：手机上的版本如果早于 v3.6.5，仍需从 Release 手动安装一次；v3.6.5 及以上可以直接应用内更新。
-
-第一次在真机跑 M0 时，建议先验证 `WpsRuntime` 诊断页输出的 `version` / `auth status`，
-再把真机结果填入 [`design/APK-STATUS.md`](design/APK-STATUS.md)。
-
-## 网页版（手机 / 服务器当主机）
-
-不想开原生窗口，或想把跑任务的那台机器当服务器、用**其它设备**（电脑、平板、另一台手机）
-打开网址来操作时，用网页版：
+### 网页版（手机 / 服务器当主机）
 
 ```bash
 python run.py --web                  # 默认监听 0.0.0.0:8756（同一 WiFi 下其它设备可访问）
-python run.py --web --port 9000      # 换端口
-python run.py --web --host 127.0.0.1 # 只允许本机访问
-python run.py --web --new-token      # 轮换访问令牌
+python run.py --web --port 9000      # 换端口；--host 127.0.0.1 只允许本机；--new-token 轮换令牌
 ```
 
-启动后终端会列出可直接点开的网址（含访问令牌），例如：
-
-```
-本机访问：   http://127.0.0.1:8756/?token=XXXX
-其它设备访问：http://10.103.85.74:8756/?token=XXXX  [wlan0]
-```
-
-把「其它设备访问」那条网址在电脑/平板上打开即可。网址里的 `?token=` 只要带一次，
-之后会被浏览器记住；令牌本身保存在用户配置目录的 `web_token`。
-
-### 它是怎么跑的
-
-- 页面由 `app/web/server.py` 提供：静态前端 + `POST /api/<方法名>`，业务逻辑全在
-  `app/api/bridge.py`；事件是「Python 追加 + 前端按 cursor 轮询」，因此不需要 WebSocket；
-- **选择 Excel 文件**用服务器端文件浏览器：任务在主机上跑，Excel 也在主机上，
-  所以浏览并选择的是**主机上的路径**，而不是打开网页那台设备的文件；
-- 没有原生窗口，标题栏不提供最小化/最大化。
+启动后终端会列出可直接点开的网址（含 `?token=`），把「其它设备访问」那条在电脑/平板上
+打开即可。页面由 `app/web/server.py` 提供（静态前端 + `POST /api/<方法名>`），业务逻辑全在
+`app/api/bridge.py`；事件是「Python 追加 + 前端按 cursor 轮询」，不需要 WebSocket。
+「选择 Excel 文件」用的是**主机上**的文件浏览器（任务与 Excel 都在主机上）。
 
 ### 账号与访问审批
 
-网页版等于把这台机器的完整操作权限交给「能进得来的人」——它能读取管理后台密码、
-使用 WPS 云文档授权、并真实下单。因此除了令牌，还有一套**账号体系**：整站
-（包括首页和全部静态资源）都要求登录，未登录一律跳 `/login`。
+网页版等于把这台机器的完整操作权限交给「能进得来的人」，因此除了令牌还有一套账号体系：
+整站（含首页与静态资源）都要求登录，未登录一律跳 `/login`。
 
 - **注册申请**：访客在登录页填账号密码提交申请，进入待审批队列；
-- **管理员审批**：`approved` 之前**密码正确也登不进来**；管理员在 `/admin` 点同意/拒绝；
-- **邀请码**：管理员可生成邀请码，凭码注册直接通过，省一轮人工审批；
-- **会话**：登录成功发 `HttpOnly` 会话 Cookie（30 天）；访问 `/api/*` 靠会话，
-  失效/被拒/改密后旧会话立即失效。
-
-管理员账号用命令行维护（密码不会写进源码，磁盘上只存 PBKDF2 哈希）：
+- **管理员审批**：`approved` 之前**密码正确也登不进来**；管理员在 `/admin` 点同意/拒绝，
+  也可生成邀请码让凭码注册直接通过，省一轮人工审批；
+- **会话**：登录成功发 `HttpOnly` 会话 Cookie（30 天）；失效/被拒/改密后旧会话立即失效。
 
 ```bash
-python run.py --web --create-admin            # 交互式创建第一个管理员
-python run.py --web --create-admin --username you@example.com   # 指定账号名
-python run.py --web --reset-admin-password    # 忘记密码时重置
-python run.py --web --list-users              # 列出账号与审批状态
+python run.py --web --create-admin          # 交互式创建第一个管理员（--username 指定账号名）
+python run.py --web --reset-admin-password  # 忘记密码时重置；--list-users 列出账号与审批状态
 ```
 
 账号数据落在用户配置目录的 `users.json`（手机上是 `~/.config/yikou-light-food/`）。
 
-### 安全须知（重要）
+### Android APK（arm64 独立安装）
 
-- **令牌只对本地/局域网直连有效**：`?token=` 是忘记管理员密码时的自救入口，一旦请求
-  经网关（带 `CF-Connecting-IP` / `X-Forwarded-*`）进来就**一律失效**，不能绕过审批；
-- 默认只监听局域网；要对外发布请走下面的 Cloudflare Tunnel，**不要做端口映射**
-  （手机在运营商 CGNAT 后面，本来也映射不通）；
-- 服务自身只提供 HTTP（无 TLS）。公网入口的 HTTPS 由 Cloudflare 边缘终结，
-  所以隧道部署下浏览器地址栏是有效证书；纯局域网 HTTP 理论上可被嗅探；
-- 管理页（`/admin`）建议再叠一层 Cloudflare Access：设好 `YIKOU_ACCESS_TEAM_DOMAIN`
-  与 `YIKOU_ACCESS_AUD` 后，该页会校验 `Cf-Access-Jwt-Assertion` 的签名（只看明文
-  请求头是可以伪造的，所以必须验签）。
-
-### 部署到公网（Android / Termux + Cloudflare Tunnel）
-
-> ⚠️ **已知阻断（2026-09-16 实测）**：当前使用的域名 `zimu5683.kdns.fr`
-> **在中国大陆被 SNI 阻断** —— 服务端与隧道完全正常，但国内直连打不开，
-> 必须走代理才能访问。已逐一排除所有免费域名方案（noip / ddns.net / duckdns /
-> eu.org / afraid 等同类后缀均在过滤名单内）。
-> **换一个未被阻断的域名即可解决，服务端无需改动。**
-> 完整证据链、已排除方案与换域名步骤见
-> [`design/公网访问现状与域名阻断.md`](design/公网访问现状与域名阻断.md)。
-
-手机在 CGNAT 后面没有公网 IP，用 Cloudflare Tunnel 由手机主动向 Cloudflare 建出站
-连接，公网请求沿该连接回源，因此不需要公网 IP、不需要端口映射、也不需要 DDNS。
-
-服务用 runit 托管（崩溃自动拉起，开机自动启动）：
+WebView 加载现有前端，Chaquopy 在 App 进程内跑现有 `app/` 业务代码，Kotlin `WpsRuntime`
+负责 `proot + kdocs-cli`、DNS/CA 适配与 Custom Tabs 授权。完整方案、接口与验收矩阵见
+[design/APK-PLAN.md](design/APK-PLAN.md) 与 [design/APK-STATUS.md](design/APK-STATUS.md)。
 
 ```bash
-termux-wake-lock                     # 防止息屏后被挂起
-sv status yikou-light-food           # 查看状态
-sv restart yikou-light-food           # 重启
-tail -f $LOGDIR/sv/yikou-light-food/current   # 实时日志
+python scripts/fetch_kdocs_cli.py --platform linux-arm64
+python scripts/fetch_android_runtime.py    # 下载 proot/依赖 + NDK 编译 xdg shim
+cd frontend && pnpm install --frozen-lockfile && pnpm build && cd ../android && ./gradlew assembleRelease
 ```
 
-开机自启依赖 **Termux:Boot**（F-Droid 安装，必须**手动打开一次**才会生效），
-脚本在 `~/.termux/boot/start-services`。厂商省电策略、电池优化、自启动白名单都要
-手动放开，否则撑不过一天。
+CI 工作流 [.github/workflows/android.yml](.github/workflows/android.yml) 用 x86_64 runner 下载
+linux-arm64 kdocs-cli、Termux proot 依赖与 Mozilla CA，patchelf 改 RUNPATH 后打包。正式分发必须在
+GitHub Secrets 配置 `YIKOU_KEYSTORE_FILE` / `YIKOU_KEYSTORE_PASSWORD` / `YIKOU_KEY_ALIAS` /
+`YIKOU_KEY_PASSWORD`；缺失时退化为 debug 签名，只能做 M0/M1 验证。
 
-#### 手机上开着 VPN / 代理时：必须用 http2
+**应用内更新**：App 打开后自动检查 GitHub Release，点「下载并安装」后会选择 arm64 APK 与
+`.sha256`，校验完整性、SHA-256、包名、签名和 `versionCode`，通过后拉起系统安装器。
+普通 Android App 无法静默安装；新旧 APK 必须使用同一把签名证书。该功能从 **v3.6.5** 起存在。
 
-这是实测踩到并解决的坑。`cloudflared` 默认用 **QUIC（UDP 7844）** 连 Cloudflare
-边缘，而手机上的 VPN/代理（Clash、Surge 一类，特征是 tun0 网卡 + `198.18.0.0/15`
-fake-ip）会破坏 UDP，症状是：
+## 云同步与闪时送要点
+
+**云文档同步**把本地《排单.xlsx》**增量写入** WPS 云端排单表，不整表覆盖，因此云端的公式、
+自定义排序、字体和列宽都不会被破坏。要点：
+
+- 先核对批次日期：整张表的日期标记与目标日期不符 → **拒绝写入整张表**（唯一的重复加餐防线）；
+- 旧客户**总餐次 = 云端现有 + 本次增量**；目标日期格已有协作者写的值（如 `0`）**只读不写**；
+- 新客户统一插到第 3/4 行之间，再按列B 地址顺序重排整张表；
+- 幂等靠本地账本 `wps_sync_state.json`；上传前先「预览」，同一批重复上传不会翻倍；
+- **测试模式**（默认开启）把正式表替换为「测试-」副本，绝不会碰正式排单表。
+
+完整规则（地址排序表、目标日期口径、首次使用、安全边界、Termux 上的 kdocs-cli 依赖）见
+[docs/WPS-SYNC-RULES.md](docs/WPS-SYNC-RULES.md)；总体方案与实施史见
+[design/WPS-CLOUD-SYNC-PLAN.md](design/WPS-CLOUD-SYNC-PLAN.md)。
+
+**闪时送下单**默认每次「开始下单」（含干跑/预检）前从云端取当天名单（20:00 之后识别次日），
+地址是「大西」「小」的人不下单；名单会留档进《闪时送.xlsx》；云端读不到或要下单的人数据
+不完整 → **拒绝下单**并点名是哪个单元格。日期口径、地址过滤与拒绝语义见
+[design/SSS-云端名单导入.md](design/SSS-云端名单导入.md)；被阻断「存在未解决的不确定记录」时
+**不要重跑或补发**，现场核对与管理员解除入口见
+[docs/SSS-不确定记录处置.md](docs/SSS-不确定记录处置.md)。只读自检：
+`python -m app.main --sss-import-check`。闪时送登录有图形验证码，必须人工输入一次。
+
+## 项目结构
 
 ```
-UDP Connectivity  region1.v2.argotunnel.com  FAIL   QUIC connection failed
-TCP Connectivity  region1.v2.argotunnel.com  FAIL   HTTP/2 connection is blocked or unreachable
-ERROR: Allow outbound QUIC traffic on port 7844 or use HTTP2.
+app/          Python 后端：main.py CLI 入口；core/ 配置与凭据；integrations/ 平台 HTTP 客户端；
+              order/ 订单处理；ordering/ 闪时送下单与云端名单；wps/ 云同步；api/ Bridge；web/ HTTP 服务
+frontend/     React + TypeScript 前端（构建产物在 frontend/dist/）
+android/      Android APK 工程（Chaquopy + WpsRuntime 兼容层）
+tests/        pytest 与前端契约测试      scripts/ 运维/构建脚本
+docs/         架构说明、契约与处置手册    design/ 历史方案与验证资料（见 design/README.md）
+CHANGELOG.md  已发布版本的更新记录
 ```
 
-隧道会一直 `inactive`，公网访问得到 **Cloudflare 1033**。注意那些 precheck 的
-**TCP / API 项是假警报**（`api.cloudflare.com` 明明能用，隧道 API 也建成功了），
-真正的问题只在 QUIC。
+依赖方向：`web → api → 领域包（order / ordering / wps）→ core / integrations`，
+由 `tests/test_architecture_boundaries.py` 静态约束。
 
-解决办法：**在服务的 run 脚本里给 cloudflared 加 `--protocol http2`**。
-
-```sh
-# /data/data/com.termux/files/usr/var/service/cloudflared/run
-exec cloudflared tunnel run --protocol http2 --token-file "$HOME/.cloudflared/token"
-```
-
-> ⚠️ 注意：`--protocol` 是 **cloudflared 的隐藏参数** —— 2026.9.1 的 `--help`
-> 里已经看不到它，但传进去依然生效（启动日志会出现
-> `Settings: map[p:http2 protocol:http2 ...]`）。**不要在清理参数时把它删掉**。
-
-改完 `sv restart cloudflared`，日志里会出现
-`Registered tunnel connection ... protocol=http2`，隧道变 `healthy`。
-
-⚠️ **两个容易踩的坑**（都实际踩过）：
-
-1. **不要指望 `~/.cloudflared/config.yml`**。包自带的 run 脚本不传 `--config`，
-   写在那里的 `protocol` 不会被读取。参数要直接写在命令行上。
-2. **YAML 里冒号后面必须有空格**。写成 `protocol:http2` 是不合法的，cloudflared
-   会直接报 `Invalid config` 起不来。
-
-另外，`pkg upgrade` 可能覆盖包自带的 run 脚本、把 `--protocol http2` 冲掉
-（症状：服务显示在跑，但公网 1033）。用 `~/fix-http2.sh` 可一键重新应用。
-
-日志里 `ip=198.18.0.x` 是 VPN 代理的转发地址，属**正常现象**，不要去"修"它。
-
-### 手机（Termux）上长期当服务器的建议
+## 开发与测试
 
 ```bash
-pkg install termux-api        # 可选
-termux-wake-lock              # 防止息屏后 Termux 被系统挂起（服务会跟着断）
-termux-setup-storage          # 首次需要读取手机存储里的 Excel 时执行，并在弹窗里允许
-```
-
-不执行 `termux-setup-storage` 时文件浏览器打不开 `/sdcard`，会直接提示这条命令。
-
-## 开发
-
-```bash
-python -m venv .venv
-python -m pip install -r requirements.txt
-cd frontend && pnpm install && pnpm build && cd ..   # 生成 frontend/dist/index.html
+python -m venv .venv && python -m pip install -r requirements.txt
+cd frontend && pnpm install && pnpm build && cd ..   # 构建产物在 frontend/dist/
 python run.py                                        # 无参数即启动网页服务
+.venv/bin/python -m pytest -q                        # 后端全量测试
+cd frontend && pnpm test && pnpm lint && pnpm build  # 前端测试/lint/构建
 ```
 
-前端改动后必须重新 `pnpm build`，否则服务仍在提供旧的 `frontend/dist/index.html`。
-
-### 在 Termux（Android）上开发
-
-不需要 GTK/WebKitGTK，也不需要任何浏览器，因此在手机上是完整可跑的：
+前端改动后必须重新 `pnpm build`，否则服务仍在提供旧的构建产物。前端细节（浏览器交互检查、
+变异检查、目录说明）见 [frontend/README.md](frontend/README.md)。Termux（Android）上开发不需要
+GTK/WebKitGTK，也不需要任何浏览器：
 
 ```bash
-pkg install python nodejs-lts git proot
-python -m venv --system-site-packages .venv
-.venv/bin/pip install openpyxl keyring requests
-pkg install python-cryptography                             # cryptography 没有 Android 轮子，用 Termux 包
-cd frontend && pnpm install && pnpm build && cd ..           # 前端产物 frontend/dist/index.html
-.venv/bin/python run.py                                      # 启动网页服务
+pkg install python nodejs-lts git proot python-cryptography
+python -m venv --system-site-packages .venv && .venv/bin/pip install openpyxl keyring requests
+cd frontend && pnpm install && pnpm build
+.venv/bin/python run.py
 ```
 
-已知限制：`ruff==0.15.22` 在 Android 上没有可安装的包，可用 `pkg install ruff` 代替，
-但版本不同、默认规则集比 CI 更严，以 CI 结果为准。
+## 部署与公网访问
 
-### Termux 上的 kdocs-cli（云文档同步 / 闪时送云端名单）
+手机在 CGNAT 后面没有公网 IP，用 Cloudflare Tunnel 由手机主动向 Cloudflare 建出站连接，
+公网请求沿该连接回源，因此不需要公网 IP、端口映射或 DDNS（**不要做端口映射**）。
+服务用 runit 托管（崩溃自动拉起、开机自动启动），开机自启依赖 **Termux:Boot**；`/admin`
+建议再叠一层 Cloudflare Access：设好 `YIKOU_ACCESS_TEAM_DOMAIN` 与 `YIKOU_ACCESS_AUD`
+后该页会校验 `Cf-Access-Jwt-Assertion` 的签名。
 
-kdocs-cli 的 `linux-arm64` 版本是**静态链接**的 aarch64 二进制，能在 Android 上直接运行
-（`scripts/fetch_kdocs_cli.py` 或手动下载官方包放到 `vendor/kdocs-cli/kdocs-cli`）：
+- 手机开着 VPN/代理时 `cloudflared` 必须加 `--protocol http2`（默认 QUIC 会被 fake-ip
+  代理破坏，症状是隧道 inactive、公网 1033）；它是隐藏参数，清理参数时不要删。`pkg upgrade`
+  可能覆盖包自带的 run 脚本、冲掉该参数，用 `~/fix-http2.sh` 一键重放。
 
-```bash
-curl -L -o k.tar.gz https://wpsai.wpscdn.cn/skillhub/pro/v2.5.29/releases/kdocs-cli-2.5.29-linux-arm64.tar.gz
-sha256sum -c vendor/kdocs-cli/checksums.txt      # 校验
-tar xzf k.tar.gz -C vendor/kdocs-cli && chmod +x vendor/kdocs-cli/kdocs-cli
-```
+> ⚠️ **域名阻断（2026-09-16 实测）**：`zimu5683.kdns.fr` 在中国大陆被 SNI 阻断，服务端与隧道正常，**换一个未被阻断的域名即可**；证据链与换域名步骤见 [design/公网访问现状与域名阻断.md](design/公网访问现状与域名阻断.md)。
 
-但**静态链接**意味着它不经过 Termux 对绝对路径的重写，在 Android 上必然踩两个坑，
-程序已自动处理（见 `app/wps/sync.py` 的 `termux_cli_runtime()`）：
+## 已知限制
 
-| 症状 | 原因 | 处理 |
-|---|---|---|
-| `lookup ... on [::1]:53: connection refused` | 读不到 `/etc/resolv.conf`（Android 的 `/etc` 只读且没有它） | 用 `proot -b $PREFIX/etc/resolv.conf:/etc/resolv.conf` 包一层 |
-| `x509: certificate signed by unknown authority` | 读不到 `/etc/ssl/certs/ca-certificates.crt` | `SSL_CERT_FILE=$PREFIX/etc/tls/cert.pem` |
-| `SIGSYS: bad system call`（`auth login`） | Android seccomp 拦截 `faccessat2` | 同样靠 proot 接管系统调用 |
-
-因此 Termux 上 **`pkg install proot` 是云文档功能的硬依赖**。
-
-授权：界面上的「去授权」会跑 `kdocs-cli auth login`，把授权链接打进日志，在手机浏览器里
-打开确认即可。Android 没有系统密钥链，CLI 会自动退化为加密文件
-（`~/.config/kdocs-cli/token.enc`）。若已在电脑上授权过，也可以用
-`kdocs-cli auth set-token <token>` 直接导入 Token。
-
-## 云文档同步（WPS 云端排单表）
-
-「云文档同步」页签把本地《排单.xlsx》的内容**增量写入**协作者维护的 WPS 云端排单表，
-不需要整表覆盖，因此云端的公式、自定义排序、字体和列宽都不会被破坏。
-
-### 它做什么
-
-对本地排单表的每个子表（东湖/衣锦/医学院 × 中餐/晚餐）：
-
-1. **先核对批次日期**：本地排单表每一行都标着「这批要送的那天是周几」
-   （「订单处理」写的是运行日 +1 的周几：实测 2026-09-18 那批全是「周六」，
-   目标日期 9.19 正是周六）。若整张表的标记与目标日期不符，程序**拒绝写入这张表**
-   （一个格子都不动，连通讯记号也不写）并提示重跑「订单处理」——
-   拿错本地表会把同一批餐重复加到云端，这一步是唯一的防线；
-2. 在云端表里按内容定位**目标日期列**（只比对「月.日」，忽略星期文字）；
-   **只在「电话列 ~ 类型列」之间的日期区里找** —— 备注右侧协作者写的
-   「9.14 周一」是标记，不会被当成日期列，也不会被写进任何数字；
-3. 按【名字 + 电话】找到客户所在行；
-4. 旧客户：
-   - **总餐次 = 云端现有的 + 本次增量**（累加，不是绝对值）。
-     增量 = 本地这一行「餐次」 − 本地账本里"本批这一行已同步的餐次"（账本没有记录 = 首次）；
-     例：云端 5 餐 + 本地新下 6 餐 → 写成 **11** 餐
-     （旧写法覆盖成 6，顾客已经付过钱的 5 餐会凭空消失）；
-   - **同一天下了两单**（含"一单两份"被写成两行）→ 本地两行、**云端也两行**，各标当天 `1`，
-     这天就送两餐（「闪时送下单」按"日期格 == 1"逐行出单，每单 1 份）；
-     云端第 i 行对应本地第 i 行，账本也按行记，重复上传不会多加行；
-   - 目标日期格：空着就写 `1`；**协作者已经写了别的值（例如 `0` = 当天不送）
-     就一个字节都不改**，只在预览与日志里提示；
-   - 增量为 0（同一批重复上传）→ 一个格子都不写；比上次少（退单）→ 只提示、不自动回退；
-5. 新客户：
-   1. 把这一批新客户**统一插到第 3 行与第 4 行之间**（插入的行会自动继承上方格式）；
-   2. 填名字/地址/电话/类型/餐种，并按模板行刷底色（经济餐照抄模板、豪华餐整行金黄）；
-   3. 按**列B 的地址顺序重排整张表**（见下），新客户落在自己地址组里；
-   4. 再写目标日期格 = 1、总餐次、`已出餐 = SUM(日期列)`、`剩余餐 = 总餐次 − 已出餐`；
-6. 可选：在备注列右侧第 3 列写协作者的**通讯记号**（周日 1、周一 2 … 周六 7）。
-   备注+2 那格是协作者自己的日期标记，程序只读不写。
-
-**幂等靠本地账本**：用户配置目录的 `wps_sync_state.json` 按人按行（"槽位"）记着
-"本批（目标日期 + 表）这一行已经同步了多少餐次"，所以同一批重复上传不会翻倍，
-本地表里后来又加了餐也只补差额。账本丢了（卸载重装、清应用数据）才可能把同一批
-再加一次 —— 上传前先点「预览」，核对每行的「本次 +N」即可发现。
-
-### 地址顺序（列B 的排列规则）
-
-新增客户时程序会把整张表按列B 重排。顺序在「云文档同步」页签的**地址排序**里配置：
-一行一个地址，从上到下就是顺序；**留空 = 按地址升序排列**（医学院用这种，
-`医2号` 会排在 `医10号` 前面）。
-
-| 子表 | 默认顺序 |
-|---|---|
-| 东湖中餐 / 东湖晚餐 | 小、大西、A1~A6、b1~b12、C1~C12、D1~D12 |
-| 衣锦中餐 / 衣锦晚餐 | 外卖柜、校门口 |
-| 医学院中餐 / 医学院晚餐 | （留空）按地址升序 |
-
-- 清单里没有的地址（例如「学三」「碳汇楼」）**统一排到表格最后面**，并在预览里列出来；
-- 匹配地址时忽略大小写和空格（本地写「B5」会按清单落成「b5」）；
-- 同一个地址组里，**原有客户在前、本次新增的在后**；
-- 排序只覆盖「第 3 行 ~ 最后一个有姓名的行」，表尾的合计/说明不会被移动；
-- 排序用的是**云端原地排序**（保留格式与公式）+ 一列临时排序键，排完即删；
-- 排序完成后程序会**回读列A~C 重新定位每个人的新行号**再写数据，绝不按预测行号硬写。
-
-
-### 目标日期怎么算
-
-网站 21:00 截止、程序通常在晚上运行，因此：
-
-| 运行时刻 | 写入云端哪一列 |
-|---|---|
-| 20:00 ~ 次日 10:00 | **运行日 + 1 天** |
-| 其它时刻 | 运行日 |
-
-窗口起止小时可在配置里调整（`wps_target_hour_start` / `wps_target_hour_end`）。
-
-### 首次使用
-
-1. 「云文档同步」页签 → **去授权**，在浏览器里用你的 WPS 账号确认一次；
-   token 由 CLI 存进系统密钥链，约一年内无需重复授权；
-2. 保持**测试模式**（默认开启），点「预览」确认要改的内容；
-3. 确认无误后点「确认上传」，去云端核对结果；
-4. 核对通过后关闭测试模式，正式启用。
-
-**测试模式**下每张正式表都会被替换为对应的测试副本（`vendor` 之外，云端名称以「测试-」开头），
-所以测试期间绝不会碰正式排单表；测试模式也不写协作者通讯记号。
-
-### 安全边界
-
-- 上传前必须先「预览」，确认按钮在预览成功前不可点；
-- 找不到目标日期列 → 不写、不建列，只提示（通常是协作者还没加当天的列）；
-- **本地表的批次日期（周一~周日 标记）与目标日期不符 → 拒绝写入整张表**，
-  一个格子都不动（含通讯记号），并提示重跑「订单处理」；
-- **协作者写在日期格里的 `0`（当天不送）只读不写**：程序绝不覆盖它，
-  新增的餐只加在「总餐次」上，由协作者决定哪天送；
-- 写入后逐格回读校验（含"这个行号上确实是这个人"），校验不通过则报告并不更新本地账本；
-- 排序失败 → 把插进去的新行整块删掉，云端恢复原状；
-  **排序成功之后**的一步失败则不再删行（新行已散落到各地址组，删行会删错人），
-  只报告并提示重新上传——重复执行是安全的；
-- 本地账本在用户配置目录的 `wps_sync_state.json`，**它是"本次该加几餐"的幂等锚点**
-  （不只是留痕）：记录每个人在本批已同步的本地餐次；账本写盘失败会记 ERROR 日志，
-  并提示"下次上传可能重复加餐，请先预览核对"；
-- 任何失败都只写日志，**不会影响本地排单任务**。
-
-### 组件来源
-
-云文档读写依赖金山官方 CLI `kdocs-cli`（无 PyPI 包，只能随包分发）。
-构建脚本会调用 `scripts/fetch_kdocs_cli.py` 按平台下载并用官方 `checksums.txt`
-校验 sha256；运行时按「打包内置 → 仓库 vendor → 程序同目录 → PATH」顺序查找，
-也可以在页签里手动指定路径。详情见 `vendor/kdocs-cli/README.md`。
+- **令牌只对本地/局域网直连有效**：请求经网关（带 `CF-Connecting-IP` / `X-Forwarded-*`）
+  进来时 `?token=` 一律失效，不能绕过审批；服务自身只提供 HTTP，公网 HTTPS 由 Cloudflare
+  边缘终结，纯局域网 HTTP 理论上可被嗅探；
+- Termux 上云文档同步/闪时送云端名单**硬依赖 `pkg install proot`**：静态链接的 kdocs-cli
+  读不到 `/etc/resolv.conf` 与 CA，Android seccomp 还会拦 `faccessat2`；
+- `ruff==0.15.22` 在 Android 上没有可安装的包，可用 `pkg install ruff` 代替，
+  但版本不同、默认规则集比 CI 更严，以 CI 结果为准；
+- 闪时送登录有图形验证码，必须人工输入一次；被阻断的不确定记录不能靠重跑解决。
 
 ## 数据与安全
 
-配置、定位器配置与失败快照保存在用户配置目录（Windows：`%APPDATA%\yikou-light-food`），Excel 文件只在用户选择的位置读写。运行前会创建 `backups/` 时间戳备份。请不要将真实 Excel、日志、密码或浏览器缓存提交到 Git。
-
-旧版脚本保存在 `legacy_一口轻食.py`，仅作参考，不是新程序的运行入口。
-
-## 闪时送下单
-
-切到「闪时送下单」页签后填写：闪时送网址、账号、密码、订单 Excel 文件（云端模式下是**留档文件**，可留空），以及下单时的「商品名称」与「常用地址」默认值。
-
-### 名单来源
-
-- **云端当天名单（默认）**：每次「开始下单」（含干跑/预检）之前，程序从 WPS 云端的
-  《东湖午餐9月.xlsx》（内部名「东湖中餐」）与《东湖晚餐9月.xlsx》（「东湖晚餐」）里，
-  取出**当天那一列**标了 `1` 的人，姓名/地址/电话直接进内存用于下单（不再从 Excel 读单）。
-  - 「当天」的口径：**运行时刻 20:00 之后 → 识别次日**；其余时刻（含次日 00:00~10:00 的清晨）
-    → 识别运行日。例：9.15 20:00 ~ 9.16 10:00 之间运行，识别的都是 `9.16`，下 9.16 的中午/晚上的单。
-  - **地址是「大西」或「小」的人不下单**（含「小西」「带空格」等写法，忽略空格与大小写），其余地址照常下单。
-  - 某张表**没有当天日期列**（例如周末不做晚餐）→ 那一餐不下单、另一餐照常，日志写明原因。
-  - **下单前核对日期**：识别到的日期必须等于本次实际使用的送达日期（午餐 11:00 / 晚餐 17:00，
-    当天 16 点后顺延次日）；不一致（例如 16:00~20:00 之间运行）→ **拒绝下单**，不登录、不提交。
-  - 名单会**留档**写进《闪时送.xlsx》的 `午餐`/`晚餐` 两表（先清空 A:C 第 3 行起，电话按文本写入），
-    并在 **E1** 写云端该日期列的表头原文（形如 `9.16 周三`）。留档失败只告警，不影响下单。
-  - 云端读不到（未授权 / 缺 `kdocs-cli` / 当日额度用尽 / 表头异常）或要下单的人数据不完整
-    （缺姓名、地址，或电话不是 11 位）→ **拒绝下单**并说明原因，提示改用「本地 Excel」人工下单。
-    报错会**点名是哪个单元格、现在是什么值**（如「东湖中餐 第 106 行 刘卓雅：C106 现在是「0」，
-    不是 11 位手机号」），照着去云端改即可；改完仍报错时先确认改的是云文档本身、且已保存同步
-    （共享文档只有查看权限时改动不会生效）。
-  - 每次下单固定 **4 次只读调用**（每张表 2 次），与云同步共用金山接口的每日额度（约 150~200 次，次日 08:00 恢复）。
-  - 页签上的「读取云端当天名单」按钮可以只读取 + 留档（不下单），用于下单前先核对人数与日期。
-- **本地 Excel**：旧行为，直接读《闪时送.xlsx》的名单（人工准备名单时的兜底），不做云端读取。
-  - Excel 格式：`午餐`、`晚餐`两个工作表，第 1 行表头、第 2 行占位，从第 3 行开始为 A=姓名、B=门牌号、C=电话、D=送达时间（D 列暂不使用，送达时间由程序按规则计算；云端模式留档时 E1 = 当天日期）。
-- 只读自检（不写云端、不写本地文件）：`python -m app.main --sss-import-check` 会打印
-  `kdocs-cli` 路径/授权状态、生效目标表、当天日期、两张表当天列标 1 的人数与地址过滤后的人数。
-- **登录需手动完成**：闪时送登录有图形验证码。程序会在页面内弹出验证码小窗，输入后自动完成登录并逐单下单。
-- 下单默认采用 **at-least-once + 对账确认**：平台抓包报文未发现客户端幂等字段，因此不会向未知 schema 强塞字段。程序在下单前后查询站内订单、校验完整订单指纹和批次时间窗口，网络异常或超时不会自动重发 POST；如果平台后续确认支持幂等字段，可在配置中设置 `sss_idempotency_field` 启用稳定 `client_request_id`。
-- **被阻断「存在未解决的不确定记录」时**：不要重跑或补发；现场核对步骤、只读核对/管理员解除入口与禁止事项见
-  [`docs/SSS-不确定记录处置.md`](docs/SSS-不确定记录处置.md)。
-- 闪时送密码使用独立凭据名 `yikou-light-food-sss`，与管理后台账号密码互不覆盖。
+配置、失败快照保存在用户配置目录（Windows：`%APPDATA%\yikou-light-food`），Excel 只在用户
+选择的位置读写，运行前会创建 `backups/` 时间戳备份。请不要把真实 Excel、日志、密码或浏览器
+缓存提交到 Git。

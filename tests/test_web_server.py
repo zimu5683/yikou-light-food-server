@@ -146,15 +146,17 @@ def test_bridge_ready_round_trip(server):
 
 
 def test_positional_arguments(server):
-    status, body = _request(server, "POST", "/api/echo_test", ["hi", {"a": 1, "b": 2}])
+    status, body = _request(server, "POST", "/api/operation_status", ["op-123"])
     assert status == 200
-    assert body == {"echo": "hi", "payload_keys": ["a", "b"]}
+    assert body["operation_id"] == "op-123"
+    assert body["ok"] is False and body["status"] == "not_found"
 
 
 def test_keyword_arguments(server):
-    status, body = _request(server, "POST", "/api/echo_test", {"message": "kw"})
+    status, body = _request(server, "POST", "/api/operation_status",
+                            {"operation_id": "kw-op"})
     assert status == 200
-    assert body["echo"] == "kw"
+    assert body["operation_id"] == "kw-op"
 
 
 def test_empty_body_means_no_arguments(server):
@@ -164,14 +166,15 @@ def test_empty_body_means_no_arguments(server):
 
 
 def test_mismatched_arguments_return_400(server):
-    status, body = _request(server, "POST", "/api/echo_test", ["a", "b", "c", "d"])
+    status, body = _request(server, "POST", "/api/operation_status",
+                            ["a", "b", "c", "d"])
     assert status == 400
     assert body["code"] == "bad_arguments"
 
 
 def test_invalid_json_returns_400(server):
     port = server.server_address[1]
-    request = urllib.request.Request(f"http://127.0.0.1:{port}/api/echo_test",
+    request = urllib.request.Request(f"http://127.0.0.1:{port}/api/operation_status",
                                      data=b"{not json", method="POST")
     request.add_header("X-Yikou-Token", "secret")
     with pytest.raises(urllib.error.HTTPError) as excinfo:
@@ -181,6 +184,14 @@ def test_invalid_json_returns_400(server):
 
 def test_unknown_method_returns_404(server):
     status, body = _request(server, "POST", "/api/no_such_method", [])
+    assert status == 404
+    assert body["code"] == "unknown_method"
+
+
+@pytest.mark.parametrize("name", ["echo_test", "frontend_report", "pop_reports"])
+def test_removed_bridge_channels_are_gone(server, name):
+    """无消费者的诊断/回传通道已删除：HTTP 面必须是 404，不能只靠白名单挡住。"""
+    status, body = _request(server, "POST", f"/api/{name}", [])
     assert status == 404
     assert body["code"] == "unknown_method"
 

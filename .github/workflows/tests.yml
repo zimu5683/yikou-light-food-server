@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # 手动触发：Actions 页可直接跑「变异门禁」这类耗时较长的作业。
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -50,6 +52,43 @@ jobs:
       - name: Test frontend bridge cursor/dedupe
         working-directory: frontend
         run: pnpm test
+      - name: Mutation anchors stay unique
+        working-directory: frontend
+        run: pnpm check:anchors
+      # 浏览器门禁：真实 headless Chrome + CDP，跑 202 条界面断言。
+      # 之前只在本机手动跑（本机无 Chrome 就永远跑不到），这里接进流水线。
+      # runner 自带 google-chrome，脚本按 $CHROME → google-chrome → chromium 顺序查找。
+      - name: Browser interaction gate (headless Chrome)
+        working-directory: frontend
+        run: node scripts/browser-interaction-check.mjs
+
+  # 变异门禁：证明上面那 202 条浏览器断言不是空转 —— 往隔离副本注入已知缺陷，
+  # 要求指定断言必须变成 FAIL、同时控制组仍 PASS。
+  # 每个场景都要重建一次 dist 并完整跑一遍浏览器门禁，耗时明显更长，
+  # 所以只在 PR 与手动触发（Actions 页 → Run workflow）时跑，不占用每次 push 的时长。
+  mutation:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+      - name: Build baseline dist
+        working-directory: frontend
+        run: pnpm build
+      - name: Mutation check (all scenarios)
+        working-directory: frontend
+        run: node scripts/mutation-check.mjs
 
   hygiene:
     runs-on: ubuntu-latest

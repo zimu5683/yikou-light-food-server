@@ -250,7 +250,7 @@ function PendingInteractionRecoveryBanner() {
           <div className="min-w-0 flex-1">
             <p className="text-xs font-medium text-foreground">有 {redactedPendingCount} 个待处理交互属于其他账号</p>
             <p className="mt-0.5 break-words text-[11px] text-muted-foreground">
-              当前账号只能查看元数据，不能打开验证码/地址/决策输入，也不会自动提交。请让发起账号处理，或等待任务结束。
+              当前账号只能查看元数据，不能打开验证码/地址/决策输入，也不会自动提交；请让发起账号处理或等待任务结束。
             </p>
           </div>
         </div>

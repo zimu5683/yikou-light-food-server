@@ -11,6 +11,7 @@ pnpm dev        # Vite 本地开发；无后端时会退化为 mock 数据
 pnpm build      # 产物写入 frontend/dist/index.html
 pnpm test       # Node 内置 test runner，覆盖 lib/ 纯函数与 bridge 事件去重
 pnpm lint       # oxlint
+pnpm check:anchors   # 变异锚点自检：mutation-check.mjs 每个 find 在目标文件里恰好命中一次
 ```
 
 注意：Python 服务读取的是 `frontend/dist/index.html`，改完前端后必须重新
@@ -25,6 +26,18 @@ pnpm lint       # oxlint
 - `src/App.tsx` — 手机/平板/桌面三种响应式布局
 
 ## 浏览器交互检查与变异检查
+
+这两项**已接进 CI**（`.github/workflows/tests.yml`），不需要有 Chrome 的本地设备也能拿到结论：
+
+- `browser-interaction-check.mjs`：frontend job 里每次 push / PR 都跑；
+- `mutation-check.mjs`：单独一个 `mutation` job，只在 **PR** 与 **手动触发**（Actions 页 → Run workflow）
+  时跑 —— 每个场景都要重建一次 dist 并完整跑一遍浏览器门禁，耗时明显更长。
+
+CI 的 ubuntu runner 自带 `google-chrome`，脚本按 `$CHROME` → `google-chrome` → `chromium`
+→ `chromium-browser` 顺序查找；换别的 Chromium 内核浏览器（Edge/Brave/Vivaldi）时用
+`CHROME=/path/to/binary` 指过去即可（Firefox/Safari 不走 CDP，跑不了）。
+
+本地手动跑：
 
 ```bash
 pnpm build
@@ -44,15 +57,16 @@ node scripts/mutation-check.mjs                 # 全部变异场景
   搜索/工具入口与底栏主动作、窄屏+搜索展开与运行中长状态的最坏情况、横屏、刘海安全区、
   模态弹窗仍拦住背后的按钮、桌面提示条仍在右下角。
   加 `CAPTURE_MOBILE_TASK=1` 会额外产出手机任务页三页签截图与同屏重复计数
-  （批 2 清单取证，见 `design/review/batch2-mobile-task/`），正常跑检查时不进入该段。
+  （批 2 清单取证，产物是截图目录里的 mobile-task-matrix JSON），正常跑检查时不进入该段。
 - `scripts/mutation-check.mjs`：把 `frontend/` 复制到临时目录（`node_modules` 走符号链接），在副本里
   注入变异并重新构建，要求「指定断言必须变成 FAIL、控制组必须仍然 PASS」，用来证明断言不是空转。
   日志相关变异：`SCENARIO=log-fab-not-wired`（按钮不再开合）、`SCENARIO=log-close-stuck-closing`
   （关闭收尾不落终态）、`SCENARIO=log-duplicate-expand`（可展开退回按长度判断 / 展开追加全文 /
   搜索不揭示隐藏命中 —— 三条都必须让 7f 的对应断言变成 FAIL）、`SCENARIO=toast-covers-log-fab`
   （提示条退回贴顶，必须让第 8 节的真实点击断言变成 FAIL）。
-- FE-1（R6-8：uncertain 不得被渲染成“已完成”）的缺口、断言清单与三段式证据：
-  `docs/OPTIMIZATION-R6-8-FE1-BROWSER-GATE.md`。
+- FE-1（R6-8：uncertain 不得被渲染成“已完成”）的缺口、断言清单与三段式证据，见
+  `scripts/browser-interaction-check.mjs` 的「5g FE-1 uncertain 权威状态」场景，以及
+  `scripts/mutation-check.mjs` 的 `uncertain-operation-as-success` 变异。
 
 ## 手机端日志：右上角悬浮按钮 + 水波扩散
 
@@ -102,15 +116,21 @@ node scripts/mutation-check.mjs                 # 全部变异场景
 复制用 `lib/clipboard.ts`：优先 Clipboard API，非安全上下文／权限被拒时退回
 `textarea + execCommand`，两条都不通时给出「长按手动选择」的下一步 —— 真机 WebView 上不会静默失效。
 
-## 任务页：权威运行状态只留一处（批 2）
+## 任务页：权威状态一处 + 闲置态去冗余
 
 - **权威运行状态只在「任务工作台」头部**（状态胶囊 + 说明）。标题栏只留品牌／版本／当前任务类型／
   安全模式／主题入口；订单、闪时送、云文档三个页签内那份重复的 `operationView` Callout 已删除。
 - 头部说明行由单行 `truncate` 改为**允许折行**（并保留 `title` 与 danger 时的 `alert` 语义）：
   页签内那份完整 Callout 删掉后，长失败原因必须仍然看得全。
+- `FlowStrip` 改为**条件渲染**：只有真正在跑（`workerAlive` / `operationActive`）、待核对
+  （`operationView.needsReview`）或失败（`operationView.key === 'error'`）时才出现 ——
+  闲置态不再常驻一条流程条；流程条只保留「结果」这一步的状态，不重复头部说明。
+- 云文档页删掉与头部／折叠区重复的 chrome：原始预览全文 `details`、「当前写入」状态项、
+  「尚无预览」中性 Callout、底栏「预览编号 …」调试片段，以及高级设置上重复的 `notice`
+  （顶部「先完成云同步准备」Callout 已经承载同一句话）。
+- 长 Callout／确认弹窗 description 一律压到一句话；细则下沉到 `details`、摘要区或删除。
 - 闪时送「本次执行方式」重复说明块已删除；模式选项自身的 description、主按钮文字、
   真实下单确认弹窗（含「可能扣款或占用余额」）与标题栏安全模式继续承载同一语义。
-- `FlowStrip` 保留，只去掉「结果」步骤里与头部重复的 `detail`（步骤与状态是独有信息）。
 - 订单页「保存到系统凭据管理器」开关移入高级设置（与闪时送页一致）；默认值、保存语义、
   清除凭据行为均未改动。
 - 恢复入口一律保留：`PendingInteractionRecoveryBanner`、WPS 恢复卡片与退场弹窗、
@@ -120,7 +140,14 @@ node scripts/mutation-check.mjs                 # 全部变异场景
 就绪／运行／成功／失败／待核对，断言权威状态只在头部一处、页签内无重复块、说明不被截断）
 与「批2 草稿与高级设置」；变异场景 `batch2-duplicate-status-restored`、
 `batch2-header-detail-truncated`、`batch2-remember-default-flipped` 证明这些断言不是空转。
+`batch2-duplicate-status-restored` 的订单页锚点就锁在新的 `FlowStrip` 条件渲染上：
+锚点失效时 `pnpm check:anchors` 会先失败。
 `CAPTURE_MOBILE_TASK=1 CAPTURE_LABEL=before|after` 可产出前后对照截图矩阵。
+
+`pnpm check:anchors`（`scripts/check-mutation-anchors.mjs`）解析 `scripts/mutation-check.mjs` 里
+每个 `find:` 锚点（字符串字面量或常量名，模板字面量按 JS 语义解码转义），断言它在同一条目
+`file:` 指向的目标文件里**恰好出现一次**：锚点拼错、重复或目标文件改名都会先在这里失败，
+不用等浏览器门禁跑完。
 
 接口字段与 Python 返回值的契约由仓库根目录 `tests/test_frontend_contract.py`
 反向校验，改字段名时两边要一起改。

@@ -280,12 +280,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setConnection(nextMocked ? 'disconnected' : 'connected')
       if (!nextMocked) {
         void restorePendingInteractions(state.operation?.operation_id || '')
-        api()
-          .frontend_report({ kind: 'ready', version: state.version, status: state.status })
-          .catch((error) => appendLog({
-            ts: timeText(), level: 'WARN',
-            msg: `前端就绪上报失败：${classifyRequestError(error).detail}`,
-          }))
       }
       if (!nextMocked) {
         let shouldCheck = true
@@ -442,22 +436,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
           setUpdateError(event.payload.message)
           toast.error(`更新失败：${event.payload.message}`, { duration: 8000 })
           break
-        case 'desktop_update:available': {
-          const payload = event.payload
-          const url = payload.html_url
-            || `https://github.com/zimu5683/yikou-light-food-desktop/releases/tag/${payload.tag}`
-          toast.info(`桌面版发布新版本 ${payload.tag}`, {
-            description: '网页版不会自动更新；如需同步功能，请手动调整代码。',
-            duration: 12000,
-            action: {
-              label: '查看桌面版发布页',
-              onClick: () => { api().open_external(url).catch((error) => {
-                toast.error(`打开发布页失败：${classifyRequestError(error).detail}`)
-              }) },
-            },
-          })
-          break
-        }
         case 'decision':
           setDecision(event.payload)
           recordPendingInteraction('decision', event.payload.id)

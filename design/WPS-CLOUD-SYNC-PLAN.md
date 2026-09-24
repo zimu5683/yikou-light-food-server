@@ -417,13 +417,13 @@ wps_marker_enabled: bool = True        # 是否写通讯记号
 
 - 6 张副本已重新对齐到正式表（东湖中餐 122 人、衣锦中餐 26、医学院中餐 14、
   东湖晚餐 30、衣锦晚餐 7、医学院晚餐 3）；
-- 基准快照写入 `design/WPS基准快照.json`：记录 6 张正式表与 6 张副本的
+- 基准快照写入 `design/archive/WPS基准快照.json`：记录 6 张正式表与 6 张副本的
   file_id / 版本 / 大小 / 修改时间 / sha1，作为回滚参照；
 - 当前对齐结果：**6 张正式表与副本内容一致**（大小逐项相同）。
 
 ### 回滚流程（需要时）
 
-1. 看 `design/WPS基准快照.json` 找到基准版本；
+1. 看 `design/archive/WPS基准快照.json` 找到基准版本；
 2. 从正式表重新复制一份副本（内容即基准），把 `DEFAULT_WPS_TABLES` 里的
    file_id 换成新副本；
 3. 用「检查副本一致性」按钮确认已对齐，再继续调试。
@@ -459,7 +459,7 @@ wps_marker_enabled: bool = True        # 是否写通讯记号
 
 ### 落盘
 
-- 基线快照：`design/WPS基准快照.json`（字段 `field` = 试验田回滚点，`target` = 验收标准）；
+- 基线快照：`design/archive/WPS基准快照.json`（字段 `field` = 试验田回滚点，`target` = 验收标准）；
 - 试验田 file_id 已写入 `app/config.py` 的 `DEFAULT_WPS_TABLES`；
 - 已重新打包并部署到 `/home/zimu/下载/yikou-light-food-linux-x64(1)/`，
   `--wps-check` 确认目标表 ID 正确。
@@ -467,7 +467,7 @@ wps_marker_enabled: bool = True        # 是否写通讯记号
 ### 回滚操作
 
 试验田被写乱时：
-1. 打开 `design/WPS基准快照.json`，取 `field.<子表>.file_id`；
+1. 打开 `design/archive/WPS基准快照.json`，取 `field.<子表>.file_id`；
 2. 从该基线副本重新复制一份（或直接改回该 file_id，前提是它没被写过）；
 3. 更新 `DEFAULT_WPS_TABLES` 后重新打包。
 
@@ -492,7 +492,7 @@ wps_marker_enabled: bool = True        # 是否写通讯记号
 | 衣锦晚餐 | 基准-衣锦晚餐.xlsx | ✅（13985） |
 | 医学院晚餐 | 基准-医学院晚餐.xlsx | ✅（12507） |
 
-存档 file_id 记录在 `design/WPS基线存档.json`，并已并入 `design/WPS基准快照.json`
+存档 file_id 记录在 `design/archive/WPS基线存档.json`，并已并入 `design/archive/WPS基准快照.json`
 的 `archive` 字段（与 `field` 起点做了一致性校验）。
 
 ### 重置脚本
@@ -538,7 +538,7 @@ code 429002  频繁触发调用限制，将于 2026-09-12 08:00:00 恢复
 
 - **当天无法再做任何云端操作**，包括程序的预览与上传；
 - 用户搜不到第 6 个「基准-衣锦中餐.xlsx」，正是搜索接口被限流所致
-  （该文件创建时 rename 返回 `code=0`，记录在 `design/WPS基线存档.json`）；
+  （该文件创建时 rename 返回 `code=0`，记录在 `design/archive/WPS基线存档.json`）；
 - 本地排单任务**完全不受影响**。
 
 ### 已做的改进
@@ -757,6 +757,6 @@ code 429002  频繁触发调用限制，将于 2026-09-12 08:00:00 恢复
 
 ### 待明天（09-13 08:00 额度恢复后）真机验证
 
-见 `design/WPS真机验证清单-20260913.md`。核心未知数只有一个：
+见 `design/archive/WPS真机验证清单-20260913.md`。核心未知数只有一个：
 **insert-rows-cols 对在线表格的真实行为**（下方公式/底色是否随行下移、
 新行样式继承什么）—— 此接口此前从未真机调用过。

@@ -1,4 +1,4 @@
-"""``Bridge`` 的 js_api 面回归锁（改动前这 9 个方法一次都没被测过）。
+"""``Bridge`` 的 js_api 面回归锁（改动前这 5 个方法一次都没被测过）。
 
 `Bridge` 的公开方法就是**前端能调用的全部接口**（pywebview 把它们暴露成 JS
 Promise）。改动前 `tests/` 只碰过其中 11 个，剩下 26 个没有任何直接测试，本文件
@@ -9,10 +9,8 @@ Promise）。改动前 `tests/` 只碰过其中 11 个，剩下 26 个没有任�
 * ``wps_status`` —— 云同步状态。里面那个 ``writing_test_copies`` 是**安全指示灯**：
   它判断「当前实际写入的是测试副本还是正式表」，判错会让用户以为在安全测试、
   实际却在改协作者的正式表。
-* ``frontend_report`` / ``pop_reports`` —— 前端回传运行快照的通道（自动化验收依赖
-  它而非 ``evaluate_js``），带 50 条上限与「取出即清空」语义。
-* ``echo_test`` / ``worker_alive`` / ``set_split_ratio`` /
-  ``restore_wps_production_tables`` —— 其余状态与配置动作。
+* ``worker_alive`` / ``set_split_ratio`` / ``restore_wps_production_tables``
+  —— 其余状态与配置动作。
 """
 from __future__ import annotations
 
@@ -32,6 +30,13 @@ def _bridge(tmp_path) -> Bridge:
     return Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
 
 
+def test_removed_channels_are_not_on_the_bridge(tmp_path):
+    """echo_test / frontend_report / pop_reports 已删：不再出现在 js_api 面上。"""
+    bridge = _bridge(tmp_path)
+    for name in ("echo_test", "frontend_report", "pop_reports"):
+        assert not hasattr(bridge, name), name
+
+
 class _FakeCli:
     def __init__(self, path: str = "/fake/kdocs-cli", authed: bool = True) -> None:
         self.path = path
@@ -39,23 +44,6 @@ class _FakeCli:
 
     def authenticated(self) -> bool:
         return self._authed
-
-
-# ----------------------------------------------------------------------
-# echo_test：参数序列化自检
-# ----------------------------------------------------------------------
-def test_echo_test_round_trips_message_and_payload_keys(tmp_path):
-    bridge = _bridge(tmp_path)
-    got = bridge.echo_test("你好", {"b": 1, "a": 2})
-    assert got == {"echo": "你好", "payload_keys": ["a", "b"]}
-
-
-def test_echo_test_defaults_and_non_dict_payload(tmp_path):
-    bridge = _bridge(tmp_path)
-    assert bridge.echo_test() == {"echo": "", "payload_keys": None}
-    assert bridge.echo_test("x", None) == {"echo": "x", "payload_keys": None}
-    # 非 dict 的 payload 不能崩，只能报 None
-    assert bridge.echo_test("x", ["a"])["payload_keys"] is None  # type: ignore[arg-type]
 
 
 # ----------------------------------------------------------------------
@@ -318,39 +306,6 @@ def test_wps_status_without_ledger_entry_reports_never_synced(tmp_path, monkeypa
     entry = bridge.wps_status()["tables"][0]
 
     assert entry["last_sync"] == "" and entry["last_people"] == 0
-
-
-# ----------------------------------------------------------------------
-# frontend_report / pop_reports
-# ----------------------------------------------------------------------
-def test_frontend_report_accepts_dict_and_string_and_returns_ok(tmp_path):
-    bridge = _bridge(tmp_path)
-    assert bridge.frontend_report({"rendered": True}) == {"ok": True}
-    assert bridge.frontend_report("plain") == {"ok": True}
-
-
-def test_pop_reports_drains_and_clears(tmp_path):
-    bridge = _bridge(tmp_path)
-    bridge.frontend_report({"n": 1})
-    bridge.frontend_report({"n": 2})
-
-    first = bridge.pop_reports()
-    assert [r["payload"] for r in first] == [{"n": 1}, {"n": 2}]
-    assert all("ts" in r for r in first)
-    # 取出即清空
-    assert bridge.pop_reports() == []
-
-
-def test_frontend_report_keeps_only_the_newest_50(tmp_path):
-    """上限 50 条：防止前端长期不取把内存撑爆。"""
-    bridge = _bridge(tmp_path)
-    for index in range(60):
-        bridge.frontend_report({"n": index})
-
-    reports = bridge.pop_reports()
-    assert len(reports) == 50
-    assert reports[0]["payload"] == {"n": 10}
-    assert reports[-1]["payload"] == {"n": 59}
 
 
 # ----------------------------------------------------------------------

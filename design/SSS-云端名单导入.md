@@ -2,7 +2,7 @@
 
 > 2026-09-15 实施 · 口径来自用户口述（见第 1 节）· 代码：`app/sss_import.py`（新模块）
 >
-> 相关文档：`design/交接文档-WPS云同步.md`（云同步侧）、`README.md`「闪时送下单」小节。
+> 相关文档：`design/WPS-CLOUD-SYNC-PLAN.md`（云同步方案）、`docs/WPS-SYNC-RULES.md`（云同步运维规则）、`README.md`「闪时送下单」小节。
 
 ---
 

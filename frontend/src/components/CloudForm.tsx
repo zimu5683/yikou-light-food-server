@@ -1,7 +1,7 @@
 /**
  * 云文档同步工作台：准备 → 校验/预览 → 确认 → 执行 → 结果。
  *
- * 严格按 docs/OPTIMIZATION-PROGRESS.md 接入：
+ * 接入约束：
  * - wps_preview() 返回 preview_id / created_at / expires_at / tables / stats / blocked / warnings /
  *   target_date / test_mode / target_tables；
  * - wps_upload(preview_id) 必须传令牌，前端在无有效 token、未授权、预览缺失/过期/本地变化时禁用上传；
@@ -97,6 +97,23 @@ type Tone = 'info' | 'success' | 'warning' | 'danger' | 'neutral'
 interface Message {
   tone: Tone
   text: string
+}
+
+type FlowSteps = Parameters<typeof FlowStrip>[0]['steps']
+
+/**
+ * 云同步流程条：闲置态不渲染（与订单/闪时送页签一致），只在真正在跑、
+ * 或有待核对/失败需要看进度时才占屏幕。
+ *
+ * workerAlive / operationView 在这个子组件里取，而不是加进 CloudForm 的解构：
+ * 上面那行解构被变异锚点（batch2-duplicate-status-restored）逐字锁定，
+ * 在父组件里再声明一次 operationView 会让该变异注入变成重复声明。
+ */
+function CloudFlowStrip({ steps }: { steps: FlowSteps }) {
+  const { workerAlive, operationActive, operationView } = useApp()
+  const visible = workerAlive || operationActive || operationView.needsReview || operationView.key === 'error'
+  if (!visible) return null
+  return <FlowStrip steps={steps} label="云同步流程" />
 }
 
 export function CloudForm() {
@@ -560,7 +577,7 @@ export function CloudForm() {
   return (
     <div className="flex min-w-0 min-h-0 flex-1 flex-col">
       <div className="scroll-contain min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-3 sm:px-5">
-        <FlowStrip
+        <CloudFlowStrip
           steps={[
             { key: 'prepare', label: '准备', state: 'done' },
             { key: 'preview', label: '预览', state: preview ? 'done' : 'active' },
@@ -572,12 +589,11 @@ export function CloudForm() {
               state: uploadResultStep(uploadResult),
             },
           ]}
-          label="云同步流程"
         />
 
         {!hasValidToken && (
           <Callout tone="danger" title="登录令牌无效，云上传已禁用">
-            {authError || '请用带有效 ?token= 的完整网址重新打开页面；无有效令牌时前端与后端都不会允许上传。'}
+            {authError || '请用带有效 ?token= 的完整网址重新打开页面，否则前端与后端都会拒绝上传。'}
           </Callout>
         )}
 
@@ -632,7 +648,6 @@ export function CloudForm() {
         <div className="mb-3.5 flex flex-wrap items-center gap-2 text-[11px]">
           <StatusPill label={!status ? '状态未知' : !status.cli_found ? '未找到组件' : status.authenticated ? '已授权' : '未授权'} tone={status?.authenticated ? 'success' : 'warning'} />
           <span className="text-muted-foreground">目标日期：<b className="tabular text-foreground">{status?.target_date || '—'}</b></span>
-          <span className="text-muted-foreground">当前写入：<b className="text-foreground">{status?.writing_test_copies ? '测试副本' : '正式/未确认'}</b></span>
         </div>
 
         <AdvancedSection
@@ -641,7 +656,6 @@ export function CloudForm() {
           summary={needSetupNotice || `组件：${status?.cli_path || '自动查找'}；子表：${status?.tables.length ?? 0} 张`}
           open={advancedOpen}
           onOpenChange={setAdvancedOverride}
-          notice={needSetupNotice || undefined}
         >
           <Field label="云同步组件路径" htmlFor="wps-cli-path" helper="留空则自动查找内置组件">
             <TextInput id="wps-cli-path" value={cliPath} onChange={(e) => setCliPath(e.target.value)} placeholder="自动查找" />
@@ -767,7 +781,7 @@ export function CloudForm() {
           onResolve={openResolve}
         />
 
-        {preview ? (
+        {preview && (
           <StructuredPreview
             preview={preview}
             freshness={freshness}
@@ -777,10 +791,6 @@ export function CloudForm() {
             detailOpen={detailOpen}
             onToggleDetail={() => setDetailOpen((v) => !v)}
           />
-        ) : (
-          <Callout tone="neutral" title="尚无预览">
-            先点底部「生成只读预览」。预览成功后会拿到 preview_id，并显示目标日期、测试/正式目标、统计、阻断与警告；预览过期或任一配置变化后上传会立即禁用。
-          </Callout>
         )}
 
         {uploadResult && (
@@ -793,12 +803,6 @@ export function CloudForm() {
 
         {copyCheck && <CopyCheckCard check={copyCheck} />}
 
-        {preview?.text && (
-          <details className="mt-3 rounded-lg border bg-muted/40 p-2.5">
-            <summary className="cursor-pointer text-[11px] font-medium text-muted-foreground">查看后端预览全文（兼容字段，默认折叠）</summary>
-            <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed">{preview.text}</pre>
-          </details>
-        )}
       </div>
 
       <div
@@ -807,7 +811,6 @@ export function CloudForm() {
       >
         <div className="mb-2 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">
           <SaveIndicator state={saveState} onRetry={retry} onSaveNow={() => void submitSave()} />
-          <span className="text-muted-foreground">{preview ? `预览编号 ${preview.preview_id.slice(0, 14)}…` : '尚无 preview_id'}</span>
           {networkUnknown && <span className="font-medium text-warning">上传结果未知，请先查询权威状态</span>}
         </div>
         <div className="flex gap-2">

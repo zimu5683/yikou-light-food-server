@@ -1,7 +1,7 @@
 /**
  * B1 发布门禁：无后端 mock 初始状态不得携带任何真实手机号/账号或开发机绝对路径。
  *
- * 背景（`docs/OPTIMIZATION-DESKTOP-TEST-RELEASE-READINESS.md` §5.1）：
+ * 背景（发布就绪度复核记录 §5.1）：
  * `mockState()` 的值会随 `frontend/dist/index.html` 内联进 APK 分发，
  * 之前这里是真实样式的手机号与 `/home/<user>/...` 开发机路径。
  *

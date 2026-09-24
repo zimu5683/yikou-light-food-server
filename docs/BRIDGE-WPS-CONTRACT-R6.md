@@ -4,8 +4,7 @@
 - 适用对象：`frontend/` 的所有调用方（`CloudForm.tsx`、`TaskPanel.tsx`、
   `lib/bridge.ts`、`lib/taskOutcome.ts`、`lib/operationStatus.ts`）。
 - 只描述**已实现且已验证**的行为；证据命令见文末第 10 节。
-- 权威实现：`app/api/bridge.py`、`app/web/server.py`；底层契约见
-  `docs/OPTIMIZATION-WPS.md`（B 会话）。
+- 权威实现：`app/api/bridge.py`、`app/web/server.py`（R6 之前的优化记录未随仓库保留）。
 
 ---
 

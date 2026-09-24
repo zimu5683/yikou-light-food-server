@@ -394,8 +394,8 @@ const SCENARIOS = [
       {
         file: TASK_PANEL,
         name: '订单页流程条下方重新加回重复的 operationView Callout',
-        find: `        <FlowStrip steps={flow} label="订单处理流程" />\n`,
-        replace: `        <FlowStrip steps={flow} label="订单处理流程" />\n\n        <Callout tone="neutral" title={operationView.label}>\n          {operationView.detail}\n        </Callout>\n`,
+        find: `        {(workerAlive || operationActive || operationView.needsReview || operationView.key === 'error') && (\n          <FlowStrip steps={flow} label="订单处理流程" />\n        )}\n`,
+        replace: `        <Callout tone="neutral" title={operationView.label}>\n          {operationView.detail}\n        </Callout>\n\n        {(workerAlive || operationActive || operationView.needsReview || operationView.key === 'error') && (\n          <FlowStrip steps={flow} label="订单处理流程" />\n        )}\n`,
       },
       {
         file: CLOUD_FORM,
