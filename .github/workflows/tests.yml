@@ -66,10 +66,11 @@ jobs:
   # 要求指定断言必须变成 FAIL、同时控制组仍 PASS。
   # 每个场景都要重建一次 dist 并完整跑一遍浏览器门禁，耗时明显更长，
   # 所以只在 PR 与手动触发（Actions 页 → Run workflow）时跑，不占用每次 push 的时长。
+  # 12 个场景 × （重建 + 一次完整门禁 ≈ 3.5 分钟）≈ 50 分钟，超时给到 120 分钟留余量。
   mutation:
     if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
