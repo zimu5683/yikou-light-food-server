@@ -51,6 +51,20 @@
 - 说明：浏览器门禁与变异门禁在本版**第一次接入 CI**，此前只在本机手动跑；
   本机无 Chrome/Chromium，故这两项的实跑结论以 CI 为准。
 
+### 发布后修正（CI 首次接入暴露；只动测试与 CI，不影响 APK 内容）
+
+- 文档门禁曾把 `frontend/dist` 判成坏引用 —— 它是 gitignore 的构建产物，全新 checkout
+  里本就不存在，而 APK 流水线的 pytest 跑在 `pnpm build` 之前，直接挡住了出包。
+  改为用 `git check-ignore` 判定：被 ignore 的路径不算仓库内容。
+- 浏览器门禁：W3 恢复弹窗断言不再要求「内容必须溢出」（CI 上内容刚好放得下是更好的结果，
+  却被判失败）；CDP 连接等待 15s → 90s，Chrome 进程退出时立刻报退出码。
+- 变异门禁：`batch2-header-detail-truncated` 的 uncertain 两格改为控制组 ——
+  批2 矩阵在 390px 取样，该状态 33 字的说明本来就放得下，注入 `truncate` 不产生可见裁切。
+- `mutation` job 超时 60 → 120 分钟（13 个场景实测约 46 分钟）。
+- CI 实测：浏览器门禁 **250 PASS / 0 FAIL**；变异门禁 **13/13 场景通过**。
+- 仍未修（历史债，与 3.6.13 记录的是同一批）：Windows runner 上的 python 用例失败
+  （子进程中文编码 + POSIX 语义），见 `design/archive/迭代进展.md`。
+
 ## 3.6.13
 
 此前版本的记录见 `design/archive/迭代进展.md`（2026-09-23 条目起）。
