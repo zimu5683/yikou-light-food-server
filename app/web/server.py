@@ -152,14 +152,16 @@ def _interface_addresses() -> list[tuple[str, str]]:
     """枚举各网卡的 IPv4 地址。
 
     Android 上 ``ifconfig`` 读不到 ``/proc/net/dev``（Permission denied），
-    因此用 ioctl ``SIOCGIFADDR`` 直接问内核要地址；Windows 没有 ``fcntl``，
-    退化为 ``gethostbyname_ex``，保证网页版在 Windows 也不会启动时报错。
+    因此用 ioctl ``SIOCGIFADDR`` 直接问内核要地址。
+
+    本项目只跑 Android / Termux / Linux，``fcntl`` 必然可用；万一不可用就返回空列表
+    （启动不报错，只是不打印局域网网址）——不再保留 Windows 的 gethostbyname_ex 兜底。
     """
     try:
         import fcntl
         import struct
-    except ImportError:
-        return _interface_addresses_portable()
+    except ImportError:  # pragma: no cover - 非 POSIX 平台不支持
+        return []
 
     siocgifaddr = 0x8915
     found: list[tuple[str, str]] = []
@@ -180,16 +182,6 @@ def _interface_addresses() -> list[tuple[str, str]]:
     finally:
         sock.close()
     return found
-
-
-def _interface_addresses_portable() -> list[tuple[str, str]]:
-    """无 ``fcntl`` 平台的兜底枚举（Windows / 部分 Python 构建）。"""
-    try:
-        _hostname, _aliases, addresses = socket.gethostbyname_ex(socket.gethostname())
-    except OSError:
-        return []
-    return [(f"if{i}", ip) for i, ip in enumerate(addresses)
-            if ip and not ip.startswith("127.")]
 
 
 def lan_addresses() -> list[tuple[str, str]]:

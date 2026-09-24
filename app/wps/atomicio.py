@@ -3,8 +3,8 @@
 设计取舍：
 
 * 写临时文件 → `fsync` 文件 → `os.replace` → 尽力 `fsync` 父目录；
-* POSIX 用 ``fcntl.lockf``（进程级记录锁），Windows 用 ``msvcrt``；
-  没有可用跨进程锁原语时明确抛错，不做“假装上锁”的降级；
+* 用 ``fcntl.lockf``（进程级记录锁）：本项目只跑 Android / Termux / Linux，
+  这些平台都提供 fcntl。没有可用跨进程锁原语时明确抛错，不做“假装上锁”的降级；
 * 锁文件与数据文件分离，数据锁路径由 :func:`lock_path_for` 统一计算，
   journal 与 ledger 对同一账本映射到同一个锁文件。
 """
@@ -17,15 +17,10 @@ import threading
 import time
 from pathlib import Path
 
-try:  # POSIX
+try:  # POSIX：Android / Termux / Linux 都提供
     import fcntl
-except ImportError:  # pragma: no cover - Windows
+except ImportError:  # pragma: no cover - 不支持的非 POSIX 平台
     fcntl = None  # type: ignore[assignment]
-
-try:  # Windows
-    import msvcrt
-except ImportError:  # pragma: no cover - POSIX
-    msvcrt = None  # type: ignore[assignment]
 
 
 class LockTimeout(TimeoutError):
@@ -110,8 +105,8 @@ def atomic_write_text(path: str | os.PathLike[str], text: str, *,
 class FileLock:
     """轻量跨进程锁。
 
-    同一进程内嵌套获取同一路径时按重入计数直接返回（``lockf`` 本身也允许
-    进程重入，但 Windows 分支需要显式处理），跨进程则通过 OS 文件锁互斥。
+    同一进程内嵌套获取同一路径时按重入计数直接返回（``lockf`` 本身允许进程
+    重入，但按次数配对释放更稳），跨进程则通过 OS 文件锁互斥。
     """
 
     def __init__(self, path: str | os.PathLike[str], *,
@@ -130,42 +125,24 @@ class FileLock:
         return os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o600)
 
     def _try_lock(self, fd: int) -> bool:
-        if fcntl is not None:
-            flags = fcntl.LOCK_SH if self.shared else fcntl.LOCK_EX
-            try:
-                fcntl.lockf(fd, flags | fcntl.LOCK_NB)
-            except OSError as exc:
-                if exc.errno in (errno.EACCES, errno.EAGAIN):
-                    return False
-                raise
-            return True
-        if msvcrt is not None:  # pragma: no cover - Windows
-            if os.fstat(fd).st_size == 0:
-                os.write(fd, b"\0")
-            os.lseek(fd, 0, os.SEEK_SET)
-            flags = msvcrt.LK_NBRLCK if self.shared else msvcrt.LK_NBLCK
-            try:
-                msvcrt.locking(fd, flags, 1)
-            except OSError as exc:
-                if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
-                    return False
-                raise
-            return True
-        raise RuntimeError("当前平台没有可用的跨进程文件锁原语")
+        if fcntl is None:  # pragma: no cover - 只跑 Android/Termux/Linux，fcntl 必然可用
+            raise RuntimeError("当前平台没有可用的跨进程文件锁原语")
+        flags = fcntl.LOCK_SH if self.shared else fcntl.LOCK_EX
+        try:
+            fcntl.lockf(fd, flags | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                return False
+            raise
+        return True
 
     def _unlock(self, fd: int) -> None:
-        if fcntl is not None:
-            try:
-                fcntl.lockf(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
+        if fcntl is None:  # pragma: no cover - 见 _try_lock
             return
-        if msvcrt is not None:  # pragma: no cover - Windows
-            try:
-                os.lseek(fd, 0, os.SEEK_SET)
-                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-            except OSError:
-                pass
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
 
     def acquire(self) -> "FileLock":
         key = (os.getpid(), str(self.path), threading.get_ident())

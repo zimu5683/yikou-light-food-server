@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - Windows
+except ImportError:  # pragma: no cover - 非 POSIX 平台不受支持
     fcntl = None
 
 

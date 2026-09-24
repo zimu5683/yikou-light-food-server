@@ -236,7 +236,7 @@ def test_default_workers_stay_conservative_for_rate_limit(tmp_path, monkeypatch)
 
 
 # 说明：这里**刻意不做墙钟断言**。
-# 第 13 轮 CI 实测发现 macOS runner 上 time.sleep(0.03) 实际要花 60~130ms，
+# 第 13 轮 CI 实测发现慢速 runner 上 time.sleep(0.03) 实际要花 60~130ms，
 # 于是「并发耗时 < N × delay × 0.9」这种看似稳妥的**下界**断言也会假失败
 # （实测 10 次读 / 4 并发跑了 0.579s，而下界只有 0.300s）。
 # 结论：**CI 上任何依赖墙钟的断言都不可靠**；并发的证据改用确定性的

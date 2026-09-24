@@ -28,7 +28,7 @@ app/integrations/  外部 HTTP 客户端（requests）
 |---|---|
 | `app/main.py` | CLI 入口：`--web` / `--self-check` / `--wps-check` / `--sss-import-check` |
 | `app/core/config.py` | `AppConfig` 原子持久化、WPS 映射与地址排序默认值 |
-| `app/core/credentials.py` | 密码读写：桌面/Termux 用 keyring，Android 用 Keystore（双命名空间） |
+| `app/core/credentials.py` | 密码读写：Termux/Linux 用 keyring，Android 用 Keystore（双命名空间） |
 | `app/wps/android_runtime.py` | Python ↔ Kotlin `WpsRuntime` 的唯一桥；仅 `YIKOU_APP_MODE=android` 生效 |
 | `app/core/models.py` | `MealInfo` / `OrderInfo` 纯数据模型 |
 | `app/core/update.py` | 版本检查与更新：只查网页版 Release，发现新版本提示更新 |

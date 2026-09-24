@@ -27,8 +27,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-# Windows 控制台默认 cp1252；构建脚本会输出中文进度，先统一改成 UTF-8，
-# 避免 UnicodeEncodeError 让构建在真正开始前就失败。
+# 输出中文进度前先把管道/终端统一成 UTF-8，避免在 ASCII locale 下
+# UnicodeEncodeError 让构建在真正开始前就失败（CI 与 Termux 都可能命中）。
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")
@@ -41,11 +41,9 @@ VERSION = "2.5.29"
 CDN_BASE = f"https://wpsai.wpscdn.cn/skillhub/pro/v{VERSION}/releases"
 
 # (sys.platform, platform.machine()) -> (包内平台名, 压缩格式, 解包后可执行文件名)
+# 只保留 Linux：本项目只跑 Android / Termux / Linux，Windows 与 macOS 的条目
+# 已随桌面端支持删除（桌面三平台由另一个项目负责）。
 PLATFORMS: dict[tuple[str, str], tuple[str, str, str]] = {
-    ("win32", "AMD64"): ("windows-amd64", "zip", "kdocs-cli.exe"),
-    ("win32", "ARM64"): ("windows-arm64", "zip", "kdocs-cli.exe"),
-    ("darwin", "x86_64"): ("darwin-amd64", "tar.gz", "kdocs-cli"),
-    ("darwin", "arm64"): ("darwin-arm64", "tar.gz", "kdocs-cli"),
     ("linux", "x86_64"): ("linux-amd64", "tar.gz", "kdocs-cli"),
     ("linux", "aarch64"): ("linux-arm64", "tar.gz", "kdocs-cli"),
     ("linux", "arm64"): ("linux-arm64", "tar.gz", "kdocs-cli"),
@@ -181,14 +179,13 @@ def main() -> int:
     dest = extract(archive, fmt, exe_name, VENDOR)
     print(f"✅ 组件就绪：{dest}（{dest.stat().st_size} 字节）")
 
-    # 在类 Unix 系统上顺手确认可执行
-    if sys.platform != "win32":
-        try:
-            out = subprocess.run([str(dest), "version"], capture_output=True,
-                                 text=True, timeout=30).stdout.strip()
-            print(f"   版本自检：{out}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"   ⚠ 版本自检失败（不影响打包）：{exc}")
+    # 顺手确认可执行（本项目只在 Linux 系平台运行）
+    try:
+        out = subprocess.run([str(dest), "version"], capture_output=True,
+                             text=True, timeout=30).stdout.strip()
+        print(f"   版本自检：{out}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"   ⚠ 版本自检失败（不影响打包）：{exc}")
     return 0
 
 

@@ -68,6 +68,12 @@
   **只跑 Ubuntu × 3.11/3.13**，并关掉 `fail-fast` —— 原来 Windows 一红会把
   ubuntu/macOS 一起取消，连最接近 Termux 的 Linux 信号都拿不到。
   历史记录见 `design/archive/迭代进展.md`。
+- **删除 Windows / macOS 支持代码**（桌面三平台由另一个项目负责）：`app/core/config.py`
+  的 `%APPDATA%` / `Application Support` 数据目录与目录 fsync 跳过、`app/wps/atomicio.py`
+  与 `app/ordering/uncertain.py` 的 `msvcrt` 锁分支与 `LOCALAPPDATA` / `darwin` 状态目录、
+  `app/wps/cli.py` 的 `kdocs-cli.exe` 查找、`app/web/server.py` 的 `gethostbyname_ex` 兜底、
+  `scripts/fetch_kdocs_cli.py` 的 windows/darwin 平台条目。Android / Termux / Linux
+  行为逐字未变；全量测试 `1516 passed / 0 failed`。
 
 ## 3.6.13
 

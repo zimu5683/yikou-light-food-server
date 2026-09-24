@@ -44,13 +44,13 @@ def _hide_system_resolv(monkeypatch, exists: bool):
 
 
 def _resolv_bind(termux) -> str:
-    """Termux proot 的 resolv.conf bind 参数；Windows 上必须沿用 Path 的渲染格式。"""
+    """Termux proot 的 resolv.conf bind 参数（沿用 Path 的渲染格式）。"""
     return f"{termux / 'etc' / 'resolv.conf'}:/etc/resolv.conf"
 
 
 def test_non_termux_environment_is_untouched(monkeypatch):
     monkeypatch.delenv("PREFIX", raising=False)
-    # 桌面端必须完全不变：没有前缀、没有额外环境变量。
+    # 非 Termux 环境必须完全不变：没有前缀、没有额外环境变量。
     assert termux_cli_runtime() == ([], {})
 
 

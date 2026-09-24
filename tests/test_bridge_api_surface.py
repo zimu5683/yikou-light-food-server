@@ -113,9 +113,8 @@ def test_bridge_ready_loads_each_password_into_its_own_slot(tmp_path, monkeypatc
 def test_bridge_ready_stringifies_excel_paths(tmp_path):
     """路径要以字符串交给前端（路径对象会被序列化成 null / 报错）。
 
-    ⚠️ 用 ``tmp_path`` 而不是硬编码 ``/tmp/...``：Windows 上 ``str(Path("/tmp/x"))``
-    是 ``"\\tmp\\x"``，写死 POSIX 字面量会让这条测试只在 Linux/macOS 通过
-    （CI 的 windows 作业正是这样抓到的）。
+    ⚠️ 用 ``tmp_path`` 而不是硬编码 ``/tmp/...``：写死绝对路径会依赖运行环境的
+    目录布局；交给 pytest 的临时目录，测试才与部署位置无关。
     """
     from pathlib import Path
 

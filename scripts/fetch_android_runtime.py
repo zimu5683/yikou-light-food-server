@@ -243,7 +243,7 @@ def _run_patchelf(*args: str) -> None:
     if executable is None:
         raise SystemExit(
             "缺少 patchelf。请安装后重试：apt-get install patchelf "
-            "（macOS: brew install patchelf；Termux 上请用 proot/Ubuntu 环境执行构建）")
+            "（Termux 上请用 proot/Ubuntu 环境执行构建）")
     subprocess.run([executable, *args], check=True)
 
 

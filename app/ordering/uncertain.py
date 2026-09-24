@@ -13,7 +13,6 @@ import hashlib
 import json
 import os
 import re
-import sys
 import tempfile
 import time
 import unicodedata
@@ -23,15 +22,10 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Iterator
 
-try:  # POSIX 跨进程建议锁；Android/Termux 也提供 fcntl。
+try:  # POSIX 跨进程建议锁；Android/Termux/Linux 都提供 fcntl。
     import fcntl
-except ImportError:  # pragma: no cover - Windows
+except ImportError:  # pragma: no cover - 不支持的非 POSIX 平台
     fcntl = None  # type: ignore[assignment]
-
-try:  # Windows 跨进程建议锁。
-    import msvcrt
-except ImportError:  # pragma: no cover - POSIX
-    msvcrt = None  # type: ignore[assignment]
 
 from app.order.common import _emit
 from app.integrations.sss_url import SssUrlConfigError, canonical_sss_origin
@@ -71,10 +65,10 @@ def _journal_lock(path: Path) -> Lock:
 
 
 class _AdvisoryLock:
-    """基于 fcntl/msvcrt 的跨进程建议锁，可显式 acquire/release。
+    """基于 ``fcntl.flock`` 的跨进程建议锁，可显式 acquire/release。
 
     锁文件保持存在；不 unlink，避免两个进程各自持不同 inode 的锁。进程崩溃
-    时内核自动释放建议锁，因此无需清理陈旧锁；如果平台没有任何可用锁，
+    时内核自动释放建议锁，因此无需清理陈旧锁；如果平台没有可用锁原语，
     直接抛 ``UncertainJournalError``，由调用方阻止提交。
     """
 
@@ -87,7 +81,7 @@ class _AdvisoryLock:
     def acquire(self) -> None:
         if self._acquired:
             return
-        if fcntl is None and msvcrt is None:  # pragma: no cover - 未知平台
+        if fcntl is None:  # pragma: no cover - 只跑 Android/Termux/Linux
             raise UncertainJournalError(
                 "当前平台不支持跨进程文件锁，拒绝写入不确定记录以避免并发覆盖")
         try:
@@ -104,14 +98,10 @@ class _AdvisoryLock:
         try:
             while True:
                 try:
-                    if fcntl is not None:
-                        fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    else:
-                        if os.fstat(self._fd).st_size < 1:
-                            os.write(self._fd, b"\0")
-                            os.fsync(self._fd)
-                        os.lseek(self._fd, 0, os.SEEK_SET)
-                        msvcrt.locking(self._fd, msvcrt.LK_NBLCK, 1)
+                    if fcntl is None:  # pragma: no cover - 只跑 Android/Termux/Linux
+                        raise UncertainJournalError(
+                            f"当前平台没有可用的跨进程锁原语：{self.lock_path}")
+                    fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     self._acquired = True
                     return
                 except OSError as exc:
@@ -131,9 +121,6 @@ class _AdvisoryLock:
             try:
                 if fcntl is not None:
                     fcntl.flock(self._fd, fcntl.LOCK_UN)
-                elif msvcrt is not None:
-                    os.lseek(self._fd, 0, os.SEEK_SET)
-                    msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
             except OSError:
                 pass
         try:
@@ -275,14 +262,10 @@ def _authoritative_root() -> Path:
         return Path(override).expanduser()
     if os.environ.get("YIKOU_APP_MODE", "").strip().lower() == "android":
         return _deployment_root() / "sss-authoritative"
-    if os.name == "nt":
-        base = Path(os.environ.get("LOCALAPPDATA")
-                    or (Path.home() / "AppData" / "Local"))
-    elif sys.platform == "darwin":
-        base = Path.home() / "Library" / "Application Support"
-    else:
-        base = Path(os.environ.get("XDG_STATE_HOME")
-                    or (Path.home() / ".local" / "state"))
+    # 只跑 Android / Termux / Linux：Windows(LOCALAPPDATA) 与 macOS(Application Support)
+    # 分支已随桌面端支持删除。
+    base = Path(os.environ.get("XDG_STATE_HOME")
+                or (Path.home() / ".local" / "state"))
     return base / "yikou-light-food" / "sss-authoritative"
 
 
@@ -376,14 +359,9 @@ def _machine_lock_root() -> Path:
         return Path(override).expanduser()
     if os.environ.get("YIKOU_APP_MODE", "").strip().lower() == "android":
         return _deployment_root() / "sss-locks"
-    if os.name == "nt":
-        base = Path(os.environ.get("LOCALAPPDATA")
-                    or (Path.home() / "AppData" / "Local"))
-    elif sys.platform == "darwin":
-        base = Path.home() / "Library" / "Application Support"
-    else:
-        base = Path(os.environ.get("XDG_STATE_HOME")
-                    or (Path.home() / ".local" / "state"))
+    # 同 _authoritative_root：只保留 Linux/Termux/Android 的状态目录。
+    base = Path(os.environ.get("XDG_STATE_HOME")
+                or (Path.home() / ".local" / "state"))
     return base / "yikou-light-food" / "sss-locks"
 
 
@@ -1078,11 +1056,9 @@ def _journal_id(entry: dict[str, Any]) -> str:
 def _fsync_parent_dir(path: Path) -> None:
     """fsync 目标文件父目录，确保 ``os.replace`` 目录项在断电后仍可见。
 
-    支持范围：POSIX/Linux/macOS/Android 可对目录 fsync；Windows 不提供等价
-    的目录 fsync 接口，只能退化为文件 fsync + os.replace，属于未真机验证范围。
+    支持范围：Android / Termux / Linux 都能把目录当文件打开并 fsync，因此这里
+    始终做目录 fsync；失败时由调用方按写入失败处理。
     """
-    if os.name == "nt":  # pragma: no cover - Windows 无目录 fsync
-        return
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     fd = os.open(str(path.parent), flags)
     try:

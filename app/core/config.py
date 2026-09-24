@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import sys
 import tempfile
 import threading
 from dataclasses import asdict, dataclass, field, fields
@@ -164,7 +163,8 @@ def user_data_dir() -> Path:
     """Return a per-user writable directory, independent of the repository.
 
     Android APK 通过 ``YIKOU_DATA_DIR`` 指向 ``context.filesDir`` 内的目录；
-    未显式给出时退到 ``XDG_CONFIG_HOME`` / 平台惯例，桌面与 Termux 完全不变。
+    未显式给出时退到 ``XDG_CONFIG_HOME``。本项目只跑 Android / Termux（Linux），
+    Windows 与 macOS 的数据目录分支已随桌面端支持一起删除。
     """
     override = os.environ.get("YIKOU_DATA_DIR", "").strip()
     if override:
@@ -176,12 +176,7 @@ def user_data_dir() -> Path:
         root = Path(os.environ.get("XDG_CONFIG_HOME")
                     or (Path.home() / ".config"))
         return root / APP_NAME
-    if os.name == "nt":
-        root = os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")
-    elif sys.platform == "darwin":
-        root = Path.home() / "Library" / "Application Support"
-    else:
-        root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     return Path(root) / APP_NAME
 
 
@@ -441,12 +436,9 @@ class AppConfig:
     def _fsync_directory(directory: Path) -> None:
         """Best-effort fsync of the parent directory after os.replace.
 
-        Windows does not allow opening a directory as a file; failures are
-        intentionally ignored because the data file itself has already been
-        flushed and atomically replaced.
+        失败一律忽略：数据文件本身已经 flush 并原子替换完成，目录 fsync 只是
+        尽力而为。Android / Termux / Linux 都允许把目录当文件打开。
         """
-        if os.name == "nt":
-            return
         try:
             fd = os.open(str(directory), os.O_RDONLY)
         except OSError:

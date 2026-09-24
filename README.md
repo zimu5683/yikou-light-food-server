@@ -5,8 +5,8 @@
 **一个自带最小 kdocs-cli 运行环境的 arm64 APK**，无需安装 Termux。
 
 - 固定**纯接口模式**：直接调用平台 HTTP 接口完成登录、读单和下单，不启动任何浏览器（桌面原生窗口版与 Playwright 备用模式已全部移除）。
-- 账号密码不会写入源码；Android 上用 Android Keystore + AES-GCM 保存，Termux/桌面用系统
-  密钥环（`keyring`），没有可用密钥环时退化为每次运行手动输入。
+- 账号密码不会写入源码；Android 上用 Android Keystore + AES-GCM 保存，Termux/Linux 用系统
+  密钥环（`keyring` → SecretService），没有可用密钥环时退化为每次运行手动输入。
 - 自用项目，功能不完善；当前代码结构见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ## 三个任务模式
@@ -154,6 +154,6 @@ cd frontend && pnpm install && pnpm build
 
 ## 数据与安全
 
-配置、失败快照保存在用户配置目录（Windows：`%APPDATA%\yikou-light-food`），Excel 只在用户
-选择的位置读写，运行前会创建 `backups/` 时间戳备份。请不要把真实 Excel、日志、密码或浏览器
+配置、失败快照保存在用户配置目录（Android：App 私有目录；Termux/Linux：`$XDG_CONFIG_HOME`
+下的 `yikou-light-food`），Excel 只在用户选择的位置读写，运行前会创建 `backups/` 时间戳备份。请不要把真实 Excel、日志、密码或浏览器
 缓存提交到 Git。

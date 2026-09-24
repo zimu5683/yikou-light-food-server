@@ -79,13 +79,13 @@ fail-closed：查不到 → 阻断，把判断权交给人工核对，再由管�
   - **Android**：`YIKOU_DATA_DIR` = `filesDir/config`
     （`android/app/src/main/python/android_bootstrap.py:56-69`，第 61 行）→
     `/data/data/com.yikou.lightfood/files/config/sss-authoritative/<sha256(origin|account)[:24]>.json`
-  - Termux / 桌面：`$XDG_STATE_HOME/yikou-light-food/sss-authoritative/<digest>.json`
+  - Termux / Linux：`$XDG_STATE_HOME/yikou-light-food/sss-authoritative/<digest>.json`
     （默认 `~/.local/state/...`）
   - 显式覆盖：配置 `sss_authoritative_uncertain_path` 或环境变量 `YIKOU_SSS_AUTHORITATIVE_PATH`
 - 批次锁：`app/ordering/uncertain.py:160-176`，落在 `sss-locks/<sha256(batch_key)[:32]>.lock`；
   拿不到锁时本批直接 `blocked_concurrent` 且**零 POST**（`app/ordering/runner.py:288-305`）。
 - Android 的 journal 位于 App 私有目录，**Termux 无权限读取**，因此现场必须使用 App/网页内的入口；
-  桌面版可以直接查看该文件（只读）。
+  在 Termux/Linux 上部署时可以直接查看该文件（只读）。
 
 ---
 

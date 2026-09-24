@@ -121,7 +121,6 @@ from app.wps.executor import (
 )
 from app.wps.cli import (
     CLI_NAME,
-    CLI_NAME_WIN,
     KdocsCli,
     effective_tables,
     find_cli,
@@ -289,7 +288,6 @@ __all__ = [
     "ADDRESS_ALIASES",
     "CELL_MARK",
     "CLI_NAME",
-    "CLI_NAME_WIN",
     "Change",
     "CloudOrder",
     "DATE_RE",

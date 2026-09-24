@@ -27,35 +27,32 @@ from app.wps import android_runtime
 
 CLI_NAME = "kdocs-cli"
 
-CLI_NAME_WIN = "kdocs-cli.exe"
 
 def find_cli(explicit: str | os.PathLike[str] | None = None) -> str:
     """按优先级查找 kdocs-cli：显式配置 → 打包内置 → 仓库 vendor → 程序同目录 → PATH。
 
     APK 内置模式下没有真实可执行文件路径，返回 :data:`android_runtime.RUNTIME_MARKER`；
     真正的 ``proot + kdocs-cli`` 由 Kotlin ``WpsRuntime`` 托管。
+
+    只查 ``kdocs-cli``：Windows 的 ``kdocs-cli.exe`` 分支已随桌面端支持删除，
+    本项目只跑 Android / Termux（Linux）。
     """
     if android_runtime.is_android():
         return android_runtime.RUNTIME_MARKER
     candidates: list[Path] = []
     if explicit:
         candidates.append(Path(explicit).expanduser())
-    names = [CLI_NAME_WIN, CLI_NAME] if os.name == "nt" else [CLI_NAME]
     bundle = getattr(sys, "_MEIPASS", None)
     if bundle:
-        for name in names:
-            candidates.append(Path(bundle) / name)
+        candidates.append(Path(bundle) / CLI_NAME)
     # 源码运行：仓库内的 vendor/kdocs-cli/
     repo_vendor = Path(__file__).resolve().parents[2] / "vendor" / "kdocs-cli"
-    for name in names:
-        candidates.append(repo_vendor / name)
+    candidates.append(repo_vendor / CLI_NAME)
     exe_dir = Path(sys.executable).parent
-    for name in names:
-        candidates.append(exe_dir / name)
-    for name in names:
-        found = shutil.which(name)
-        if found:
-            candidates.append(Path(found))
+    candidates.append(exe_dir / CLI_NAME)
+    found = shutil.which(CLI_NAME)
+    if found:
+        candidates.append(Path(found))
     for cand in candidates:
         if cand.is_file():
             return str(cand)
