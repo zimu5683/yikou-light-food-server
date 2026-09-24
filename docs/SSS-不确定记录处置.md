@@ -1,6 +1,6 @@
 # 闪时送「未解决的不确定记录」阻断处置手册
 
-- 适用版本：`v3.6.13`（[../app/__init__.py](../app/__init__.py)，`__version__` 在第 3 行）。
+- 适用版本：`v3.6.14`（[../app/__init__.py](../app/__init__.py)，`__version__` 在第 3 行）。
 - 适用对象：现场值守人员与管理员（三个处置入口**仅管理员**可用）。
 - 本文只描述**已实现且已验证**的行为；行号引用以本仓库当前工作区为准，验证命令见第 6 节。
 - 一句话：**看到阻断就停手** —— 不要重跑、不要补发、不要清数据；先在闪时送 App 只读核对，
@@ -256,7 +256,7 @@ python -m pytest tests/test_sss_uncertain_review.py tests/test_web_roles.py -q
 python3 tests/independent_final_counterexample_probe.py --only m6-post-timeout,journal-paths,m4-json-corrupt
 ```
 
-- 版本：`v3.6.13`；`app/__init__.py` 的 `__version__` 与 `android/version.properties` 的
-  `versionName=3.6.13` / `versionCode=3061300` 同步。
+- 版本：`v3.6.14`；`app/__init__.py` 的 `__version__` 与 `android/version.properties` 的
+  `versionName=3.6.14` / `versionCode=3061400` 同步。
 - 本手册对应的实现基线：`app/ordering/runner.py`、`app/ordering/uncertain.py`、
   `app/api/bridge.py`、`app/ordering/constants.py`、`app/ordering/submission.py`。
