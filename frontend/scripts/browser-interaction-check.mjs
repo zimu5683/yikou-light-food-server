@@ -683,8 +683,21 @@ class Cdp {
   /** R8：CDP 的 Runtime/Log 域已启用（异常采集生效）之前不允许开始导航。 */
   pageErrorsSubscribed = false
 
-  static async connect(port, baseUrl) {
-    for (let i = 0; i < 60; i += 1) {
+  /**
+   * 等 Chrome 起来并连上 CDP。
+   *
+   * 等待上限 90s（原为 15s）：CI 上浏览器门禁可能与 APK 构建并发跑，Chrome 冷启动
+   * 超过 15s 时旧实现直接抛「Chrome DevTools target not found」——3.6.14 出包后的
+   * Tests 跑就是这么挂的（同一脚本上一轮还能跑完 250 条断言）。
+   * 另外 Chrome 进程若已退出，立刻报退出码，不要白等满 90s。
+   */
+  static async connect(port, baseUrl, chromeProc) {
+    const deadline = Date.now() + 90_000
+    let lastError = ''
+    while (Date.now() < deadline) {
+      if (chromeProc && chromeProc.exitCode !== null) {
+        throw new Error(`Chrome 进程已退出（exitCode=${chromeProc.exitCode}），无法建立 CDP 连接`)
+      }
       try {
         const targets = await fetch(`http://127.0.0.1:${port}/json/list`).then((r) => r.json())
         const page = targets.find((t) => t.type === 'page' && t.url.startsWith(baseUrl))
@@ -716,10 +729,12 @@ class Cdp {
           cdp.pageErrorsSubscribed = true
           return cdp
         }
-      } catch { /* Chrome not ready yet */ }
+      } catch (error) {
+        lastError = String(error && error.message ? error.message : error)
+      }
       await new Promise((r) => setTimeout(r, 250))
     }
-    throw new Error('Chrome DevTools target not found')
+    throw new Error(`Chrome DevTools target not found（等待 90s；最后错误：${lastError || '无'}）`)
   }
   send(method, params = {}) {
     return new Promise((resolve, reject) => {
@@ -1646,7 +1661,7 @@ async function main() {
   ], { stdio: 'ignore' })
   let cdp
   try {
-    cdp = await Cdp.connect(debugPort, baseUrl)
+    cdp = await Cdp.connect(debugPort, baseUrl, chromeProc)
     assert.ok(cdp.pageErrorsSubscribed, 'CDP 异常采集未订阅成功，不能开始浏览器检查')
     await cdp.viewport(390, 844)
     // R8：异常采集必须覆盖「页面导航 + 业务脚本执行」本身。
