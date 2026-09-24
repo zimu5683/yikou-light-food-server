@@ -3189,10 +3189,13 @@ async function main() {
             inner: window.innerHeight,
           }
         })()`)
+        // wasBelowFold 只作为**证据**保留，不能进通过条件：它证明「滚到底」这一步在内容
+        // 确实超出时是必要的；但内容刚好放得下（按钮本来就可见）是更好的结果，按字体度量
+        // 差几像素就会误判。3.6.14 第一次把本门禁接进 CI 时就是它报的 249 PASS / 1 FAIL。
         record(
-          `W3 恢复弹窗 ${label} 无横向溢出且操作区可达（滚到底后按钮完整可见）`,
+          `W3 恢复弹窗 ${label} 无横向溢出且操作区可达（必要时滚到底后按钮完整可见）`,
           dialogLayout.overflow && dialogLayout.dialogOverflow && dialogLayout.found
-            && dialogLayout.reachable && dialogLayout.wasBelowFold,
+            && dialogLayout.reachable,
           JSON.stringify(dialogLayout),
         )
         if (label.includes('landscape')) await captureScreenshot(cdp, 'fe-w3-resolve-landscape-800x450.png')

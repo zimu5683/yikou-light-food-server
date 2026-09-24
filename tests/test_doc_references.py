@@ -16,6 +16,11 @@
     app/wps_cloud.py 之类，强制这些历史文本里的路径存在等于篡改历史。
   - 白名单只有两类：外部 URL（`http(s)://` / `mailto:` / 锚点 / 绝对路径，抽取阶段即跳过），
     以及 `design/references/**` 引用的上游设计文档路径（EXTERNAL_REFERENCE_WHITELIST）。
+  - **被 .gitignore 覆盖的路径不检查**：`frontend/dist` 这类构建产物、运行时文件本就不入库，
+    在全新 checkout 里必然不存在 —— 它们不是坏引用。判据交给 git 自己
+    （`git check-ignore`），改了 .gitignore 判据跟着变，**不是白名单**。
+    这条是 3.6.14 出包时踩出来的：APK 流水线的「Python test baseline」跑在
+    「Build frontend」之前，当时把 `frontend/dist` 判成了坏引用，直接挡住了出包。
 
 离线、只依赖 git 与标准库，运行 <2s。失败信息形如 `文件:行号 引用`，照着改即可。
 """
@@ -114,6 +119,29 @@ def _whitelisted(target: str) -> bool:
     return any(target == entry or target.startswith(entry) for entry in EXTERNAL_REFERENCE_WHITELIST)
 
 
+_IGNORED_CACHE: dict[str, bool] = {}
+
+
+def _is_git_ignored(target: str) -> bool:
+    """``target`` 是否被 .gitignore 覆盖（构建产物 / 运行时文件）。
+
+    判据由 git 自己给（`git check-ignore -q`），不在这里维护任何路径清单：
+    `frontend/dist`、`backups/` 之类在全新 checkout 里必然不存在，但它们
+    **不是坏引用**，而是刻意不入库的产物。
+    """
+    if target in _IGNORED_CACHE:
+        return _IGNORED_CACHE[target]
+    result = subprocess.run(
+        ["git", "-c", "core.quotePath=false", "check-ignore", "-q", "--", target],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        check=False,
+    )
+    ignored = result.returncode == 0
+    _IGNORED_CACHE[target] = ignored
+    return ignored
+
+
 def _checks_backticks(source: str) -> bool:
     if not source.startswith(BACKTICK_EXEMPT_PREFIXES):
         return True
@@ -131,7 +159,7 @@ def find_broken_references() -> list[str]:
                 target = raw.split("#", 1)[0].strip().rstrip(_TRAILING)
                 if _is_external(target) or any(char in target for char in _SKIP_CHARS):
                     continue
-                if _whitelisted(target):
+                if _whitelisted(target) or _is_git_ignored(target):
                     continue
                 if not _resolves(target, name):
                     line = text[: match.start()].count("\n") + 1
@@ -145,7 +173,10 @@ def find_broken_references() -> list[str]:
                 continue
             if _whitelisted(target):
                 continue
-            if not any(_resolves(expanded, name) for expanded in _expand_braces(target)):
+            expanded_targets = _expand_braces(target)
+            if all(_is_git_ignored(item) for item in expanded_targets):
+                continue
+            if not any(_resolves(expanded, name) for expanded in expanded_targets):
                 line = text[: match.start()].count("\n") + 1
                 broken.append(f"{name}:{line} {raw}")
     return broken
@@ -159,6 +190,17 @@ def test_scan_set_is_not_empty() -> None:
 def test_doc_references_resolve() -> None:
     broken = find_broken_references()
     assert not broken, "发现指向不存在文件的引用：\n" + "\n".join(broken)
+
+
+def test_gitignored_build_outputs_are_out_of_scope() -> None:
+    """构建产物（frontend/dist）在全新 checkout 里不存在，但不算坏引用。
+
+    3.6.14 出包时这里判错过：APK 流水线的 pytest 跑在 pnpm build 之前，
+    把 `frontend/dist` 判成坏引用直接挡住了出包。
+    """
+    assert _is_git_ignored("frontend/dist")
+    assert _is_git_ignored("frontend/dist/index.html")
+    assert not _is_git_ignored("frontend/src/App.tsx")
 
 
 def test_removed_docs_stay_removed() -> None:
