@@ -22,6 +22,14 @@ def _isolated_authoritative_state(tmp_path, monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_window_check_cache():
+    """时间窗自检的结论缓存在模块级：测试之间必须互不影响（否则会串味）。"""
+    sss_reconcile._WINDOW_CHECK_CACHE.update({"verdict": "", "at": 0.0})
+    yield
+    sss_reconcile._WINDOW_CHECK_CACHE.update({"verdict": "", "at": 0.0})
+
+
 def test_compute_delivery_time_lunch_before_16():
     now = dt.datetime(2026, 8, 14, 9, 30)
     assert sss.compute_delivery_time(False, now) == "2026-08-14 11:00:00"
@@ -313,6 +321,51 @@ def test_submit_tasks_concurrent_auth_expired_aborts():
     result = sss._submit_tasks_concurrent(tasks, submit, Stop(), None, max_workers=1)
     assert result.auth_error == "401"
     assert result.succeeded == set()
+
+
+def test_submit_tasks_concurrent_reports_a_round_summary():
+    """每轮提交后必须有一行实测汇总：并发到底有没有用，只能靠它判断。"""
+    import time
+
+    tasks = [{"identifier": f"t{i}", "payload": {"i": i}} for i in range(3)]
+
+    def submit(payload):
+        time.sleep(0.01)
+        return {"success": True}
+
+    class Stop:
+        def is_set(self):
+            return False
+
+    logs = []
+    result = sss._submit_tasks_concurrent(tasks, submit, Stop(), logs.append,
+                                          max_workers=2, read_timeout_s=30.0)
+    assert len(result.succeeded) == 3
+    summary = [msg for msg in logs if "本轮提交" in msg]
+    assert len(summary) == 1
+    assert "本轮提交 3 单" in summary[0]
+    assert "每单平均" in summary[0] and "吞吐" in summary[0]
+    assert "读取超时" not in summary[0]  # 没超阈值就不要吓唬人
+
+
+def test_round_summary_advises_when_the_latency_approaches_the_read_timeout():
+    import time
+
+    logs = []
+    sss_submission._emit_round_summary(logs.append, [20.0],
+                                       time.perf_counter() - 25.0, 30.0)
+    assert len(logs) == 1
+    assert "每单平均 20.0 秒" in logs[0]
+    assert "读取超时 30 秒" in logs[0]
+
+    logs.clear()
+    sss_submission._emit_round_summary(logs.append, [5.0],
+                                       time.perf_counter() - 25.0, 30.0)
+    assert "读取超时" not in logs[0]
+
+    logs.clear()
+    sss_submission._emit_round_summary(logs.append, [], time.perf_counter(), 30.0)
+    assert logs == []
 
 
 def test_cached_store_id_hit_and_miss():
@@ -749,24 +802,27 @@ def test_reconcile_tasks_forwards_prefilter():
     assert "startTime=1" in seen[0] and "endTime=2" in seen[0]
 
 
-def test_safe_reconcile_falls_back_to_full_scan_when_prefilter_misses(monkeypatch):
-    """预筛窗口漏单时必须用全量扫描复核，绝不能据此误判缺失。"""
+def test_safe_reconcile_uses_window_result_without_a_full_scan(monkeypatch):
+    """窗口内查不到就按窗口结论走：不再做无过滤全量扫描（69 秒/次的来源）。
+
+    3.6.15 起唯一的兜底是只读的时间窗自检（由 matched_count==0 触发）。
+    """
     monkeypatch.setattr(sss_reconcile, "_SSS_SERVER_PREFILTER", True)
+    monkeypatch.setattr(sss_reconcile, "_verify_list_window", lambda *a, **k: "ok")
     task = _task()
     calls = []
 
     def fetch(path):
-        calls.append("window" if "startTime=" in path else "full")
-        if "startTime=" in path:
-            return {"success": True, "result": {"records": [], "total": 0}}
-        return {"success": True, "result": {"records": [_station_record(task)], "total": 1}}
+        assert "startTime=" in path, "不允许再出现无过滤全量扫描"
+        calls.append(path)
+        return {"success": True, "result": {"records": [], "total": 0}}
 
     logs = []
     result = sss._safe_reconcile([task], fetch, logs.append, "测试对账", zero_retry_delay=0)
-    assert result is not None and result.confirmed == {"t1"} and not result.missing
-    # 预筛空 → 立即重查一次（区分“刚写入不可见”）→ 仍空 → 全量复核
-    assert calls == ["window", "window", "full"]
-    assert "全量复核确认为 1/1 单" in "\n".join(logs)
+    assert result is not None and result.missing and not result.confirmed
+    # 预筛空 → 立即重查一次（区分「刚写入不可见」）→ 仍空 → 时间窗自检
+    assert len(calls) == 2
+    assert "站内匹配 0/1 单" in "\n".join(logs)
 
 
 def test_safe_reconcile_zero_window_retry_recovers_without_full_scan(monkeypatch):
@@ -805,21 +861,22 @@ def test_safe_reconcile_skips_full_scan_when_prefilter_matches(monkeypatch):
     assert "startTime=" in calls[0]
 
 
-def test_safe_reconcile_uses_full_scan_when_prefilter_request_fails(monkeypatch):
-    """预筛请求报错时仍然降级全量扫描，而不是直接判对账失败。"""
+def test_safe_reconcile_fails_closed_when_the_window_query_keeps_failing(monkeypatch):
+    """窗口查询报错时不再退回全量扫描：重试用尽即判对账失败（fail-closed，不提交）。"""
     monkeypatch.setattr(sss_reconcile, "_SSS_SERVER_PREFILTER", True)
     task = _task()
     calls = []
 
     def fetch(path):
+        assert "startTime=" in path, "不允许再出现无过滤全量扫描"
         calls.append(path)
-        if "startTime=" in path:
-            raise RuntimeError("预筛参数被拒绝")
-        return {"success": True, "result": {"records": [_station_record(task)], "total": 1}}
+        raise RuntimeError("预筛参数被拒绝")
 
-    result = sss._safe_reconcile([task], fetch, None, "测试对账")
-    assert result is not None and result.confirmed == {"t1"}
-    assert len(calls) == 2
+    logs = []
+    result = sss._safe_reconcile([task], fetch, logs.append, "测试对账")
+    assert result is None
+    assert len(calls) == 1
+    assert any("失败" in msg for msg in logs)
 
 
 def test_safe_reconcile_without_prefilter_never_scans_twice(monkeypatch):
@@ -834,6 +891,186 @@ def test_safe_reconcile_without_prefilter_never_scans_twice(monkeypatch):
     result = sss._safe_reconcile([task], fetch, None, "测试对账")
     assert result is not None and result.missing
     assert all("startTime" not in path for path in calls)
+
+
+# ----------------------------------------------------------------------
+# 时间窗自检（3.6.15）：替代「无过滤全量扫描复核」的只读安全网
+# ----------------------------------------------------------------------
+def _reset_window_check_cache():
+    sss_reconcile._WINDOW_CHECK_CACHE.update({"verdict": "", "at": 0.0})
+
+
+def _station_order(order_id: int, order_time: str):
+    return {"id": order_id, "orderTime": order_time,
+            "expectedDeliveryTime": "2026-09-27 11:00:00",
+            "receiveName": "张三", "receivePhone": "13800000001"}
+
+
+def test_verify_list_window_ok_when_the_newest_order_is_inside_a_window():
+    """账号有订单，用最新订单创建时间 ±1 天的窗口能查到 → 时间窗被接受。"""
+    _reset_window_check_cache()
+    seen = []
+
+    def fetch(path):
+        seen.append(path)
+        return {"success": True,
+                "result": {"records": [_station_order(1, "2026-09-26 23:10:00")],
+                           "total": 2395 if "startTime=" not in path else 1}}
+
+    logs = []
+    assert sss._verify_list_window(fetch, logs.append) == "ok"
+    assert len(seen) == 2
+    assert all("pageSize=1" in path for path in seen)
+    assert "时间窗自检：服务端接受 startTime/endTime" in "\n".join(logs)
+
+
+def test_verify_list_window_ok_when_the_account_has_no_orders():
+    _reset_window_check_cache()
+    calls = []
+
+    def fetch(path):
+        calls.append(path)
+        return {"success": True,
+                "result": {"total": 0, "size": 1, "current": 1, "pages": 0}}
+
+    assert sss._verify_list_window(fetch, None) == "ok"
+    assert len(calls) == 1
+
+
+def test_verify_list_window_reports_unsupported_when_the_window_hides_the_newest_order():
+    """账号有订单，而必然包含它的窗口查不到 → 服务端没接受时间窗。"""
+    _reset_window_check_cache()
+
+    def fetch(path):
+        if "startTime=" in path:
+            return {"success": True,
+                    "result": {"total": 0, "size": 1, "current": 1, "pages": 0}}
+        return {"success": True,
+                "result": {"records": [_station_order(1, "2026-09-26 23:10:00")],
+                           "total": 2395}}
+
+    logs = []
+    assert sss._verify_list_window(fetch, logs.append) == "unsupported"
+    assert "不再接受 startTime/endTime" in "\n".join(logs)
+
+
+def test_verify_list_window_is_inconclusive_when_a_probe_fails():
+    """探针读不到 ≠ 站内没有：inconclusive 绝不新增停机条件。"""
+    _reset_window_check_cache()
+
+    def fetch(path):
+        raise RuntimeError("网络抖动")
+
+    logs = []
+    assert sss._verify_list_window(fetch, logs.append) == "inconclusive"
+    assert "未能完成" in "\n".join(logs)
+
+
+def test_verify_list_window_is_inconclusive_without_a_parseable_create_time():
+    _reset_window_check_cache()
+
+    def fetch(path):
+        return {"success": True, "result": {"records": [{"id": 1}], "total": 1}}
+
+    assert sss._verify_list_window(fetch, None) == "inconclusive"
+
+
+def test_verify_list_window_caches_the_verdict(monkeypatch):
+    _reset_window_check_cache()
+    calls = []
+
+    def fetch(path):
+        calls.append(path)
+        return {"success": True,
+                "result": {"total": 0, "size": 1, "current": 1, "pages": 0}}
+
+    assert sss._verify_list_window(fetch, None) == "ok"
+    assert sss._verify_list_window(fetch, None) == "ok"
+    assert len(calls) == 1
+    # 缓存过期后必须重新探测，绝不拿旧结论去提交。
+    monkeypatch.setattr(sss_reconcile, "_WINDOW_CHECK_TTL_S", 0.0)
+    assert sss._verify_list_window(fetch, None) == "ok"
+    assert len(calls) == 2
+
+
+def test_safe_reconcile_fails_closed_when_the_self_check_says_unsupported(monkeypatch):
+    """自检判定服务端没接受时间窗时停止对账：否则会把「读不到」当成「站内没有」。"""
+    monkeypatch.setattr(sss_reconcile, "_SSS_SERVER_PREFILTER", True)
+    monkeypatch.setattr(sss_reconcile, "_verify_list_window", lambda *a, **k: "unsupported")
+    task = _task()
+    calls = []
+
+    def fetch(path):
+        assert "startTime=" in path
+        calls.append(path)
+        return {"success": True,
+                "result": {"total": 0, "size": 10, "current": 1, "pages": 0}}
+
+    logs = []
+    assert sss._safe_reconcile([task], fetch, logs.append, "测试对账") is None
+    assert any("时间窗自检" in msg for msg in logs)
+    assert calls and all("startTime=" in path for path in calls)
+
+
+def test_safe_reconcile_never_queries_without_a_time_window(monkeypatch):
+    """整条对账链路上不允许出现无过滤查询（69 秒/次的来源）。"""
+    monkeypatch.setattr(sss_reconcile, "_SSS_SERVER_PREFILTER", True)
+    monkeypatch.setattr(sss_reconcile, "_verify_list_window", lambda *a, **k: "ok")
+    task = _task()
+    calls = []
+
+    def fetch(path):
+        calls.append(path)
+        return {"success": True, "result": {"records": [], "total": 0}}
+
+    assert sss._safe_reconcile([task], fetch, None, "测试对账") is not None
+    assert calls and all("startTime=" in path and "endTime=" in path for path in calls)
+
+
+def test_list_pending_orders_uses_the_bigger_page_only_with_a_prefilter():
+    """窗口内通常只有 100-140 条：带预筛时一页取完；无过滤路径保持原页大小。"""
+    task = _task()
+    sizes = []
+
+    def fetch(path):
+        sizes.append(int(re.search(r"[?&]pageSize=(\d+)", path).group(1)))
+        return {"success": True,
+                "result": {"records": [_station_record(task)], "total": 1}}
+
+    sss._list_pending_orders(fetch, [task], prefilter=sss._build_list_prefilter([task]))
+    sss._list_pending_orders(fetch, [task])
+    assert sizes == [sss._WINDOW_PAGE_SIZE, sss._LIST_PAGE_SIZE]
+
+
+def test_build_list_prefilter_margin_override():
+    """宽窗复核按 days_margin 传更宽的服务端窗口（±1 天是默认值）。"""
+    task = _task(delivery="2026-09-11 11:00:00")
+    narrow = sss._build_list_prefilter([task])
+    wide = sss._build_list_prefilter([task], margin=3)
+    assert wide["startTime"] < narrow["startTime"]
+    assert wide["endTime"] > narrow["endTime"]
+    start = dt.datetime.fromtimestamp(wide["startTime"] / 1000)
+    end = dt.datetime.fromtimestamp(wide["endTime"] / 1000)
+    assert start.strftime("%Y-%m-%d %H:%M:%S") == "2026-09-08 00:00:00"
+    assert end.strftime("%Y-%m-%d %H:%M:%S") == "2026-09-14 23:59:59"
+
+
+def test_reconcile_person_matches_uses_a_window_instead_of_a_full_scan():
+    """管理员宽窗复核同样走服务端时间窗；本地 ±days_margin 天的判定不变。"""
+    task = _task(delivery="2026-09-11 11:00:00")
+    far = _task("far", delivery="2026-09-20 11:00:00")  # 同名同电话，送达日超出 ±3 天
+    calls = []
+
+    def fetch(path):
+        assert "startTime=" in path and "endTime=" in path
+        calls.append(path)
+        return {"success": True,
+                "result": {"records": [_station_record(task), _station_record(far)],
+                           "total": 2}}
+
+    matches = sss_reconcile._reconcile_person_matches([task], fetch, days_margin=3)
+    assert set(matches) == {"t1"}
+    assert calls and all("startTime=" in path for path in calls)
 
 
 def test_reconcile_fails_closed_when_list_record_cannot_build_fingerprint():
@@ -1591,8 +1828,10 @@ def test_preflight_stops_when_order_list_is_unreadable(monkeypatch, tmp_path):
                 return {"success": True,
                         "result": {"totalAmount": 500.0, "freezeAmount": 0.0}}
             if "one-touch-send/list" in path:
+                # 缺 total 的空壳 = 结构不可读（total=0 的空壳是「窗口内确实没有
+                # 订单」，见 test_list_records_treats_empty_shell_as_empty_page）。
                 return {"success": True, "code": 200,
-                        "result": {"total": 0, "size": 10, "current": 1, "pages": 0}}
+                        "result": {"size": 10, "current": 1}}
             raise AssertionError(f"未预期的 GET：{path}")
 
         def post_json(self, path, body=None):
@@ -1628,6 +1867,111 @@ def test_preflight_stops_when_order_list_is_unreadable(monkeypatch, tmp_path):
     assert result["uncertain"] is True
     assert posts == []
     assert any("缺少 records/list" in msg for msg in logs)
+
+
+def test_preflight_runs_the_window_self_check_without_a_full_scan(monkeypatch, tmp_path):
+    """预检必须走「时间窗查询 + 只读自检」，绝不出现无过滤全量扫描。
+
+    这正是 2026-09-26 生产里那 69 秒的验收口径：空窗（空壳）不再被当成查询失败，
+    也不会退回全量历史；唯一的额外请求是 pageSize=1 的自检探针。
+    """
+    import datetime as _dt
+    from openpyxl import Workbook
+    from types import SimpleNamespace
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "午餐"
+    ws.append(["午餐", None, None, None])
+    ws.append(["姓名", "门牌号", "电话", "送达时间"])
+    ws.append(["张三", "B1", "13800000001", "11:00"])
+    path = tmp_path / "闪时送.xlsx"
+    wb.save(path)
+    wb.close()
+
+    # 账号最新的订单：创建于 6 小时前（必然落在「它自己 ±1 天」的窗口里）
+    newest = {"id": 3000,
+              "orderTime": (_dt.datetime.now() - _dt.timedelta(hours=6)
+                            ).strftime("%Y-%m-%d %H:%M:%S"),
+              "expectedDeliveryTime": "2026-01-01 11:00:00",
+              "receiveName": "别人", "receivePhone": "13900000009"}
+    paths: list[str] = []
+    posts: list = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def fetch_captcha(self):
+            return b"\x89PNG fake"
+
+        def login(self, code):
+            pass
+
+        def get_json(self, path):
+            paths.append(path)
+            if "queryStoreAddresses" in path:
+                return {"success": True,
+                        "result": {"records": [{"id": 211053, "name": "一口轻食"}],
+                                   "total": 1}}
+            if "get-login-user-account" in path:
+                return {"success": True,
+                        "result": {"totalAmount": 500.0, "freezeAmount": 0.0}}
+            if "one-touch-send/list" in path:
+                if "startTime=" not in path:
+                    # 自检探针 A：无过滤，返回账号最新订单
+                    return {"success": True,
+                            "result": {"records": [newest], "total": 3000}}
+                if "pageSize=1" in path:
+                    # 自检探针 B：窗口按构造包含最新订单
+                    return {"success": True, "result": {"records": [newest], "total": 1}}
+                # 主查询窗口：本批还没落单 → 服务端的空壳
+                return {"success": True, "code": 200,
+                        "result": {"total": 0, "size": 10, "current": 1, "pages": 0}}
+            raise AssertionError(f"未预期的 GET：{path}")
+
+        def post_json(self, path, body=None):
+            posts.append((path, body))
+            raise AssertionError("预检模式绝不能发送下单 POST")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sss_runner, "SssApiClient", FakeClient)
+
+    cfg = SimpleNamespace(
+        sss_excel_path=str(path), sss_order_source="excel", sss_account="18758187837",
+        sss_dry_run=False, sss_preflight=True, sss_store_name="一口轻食",
+        sss_common_address="嗯哼", sss_use_fixed_address=True,
+        sss_fixed_lnt=1.0, sss_fixed_lat=2.0, sss_fixed_area_code="330110",
+        sss_fixed_address_detail="X", sss_product_name="轻食", sss_url="https://example.invalid",
+        sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
+        sss_unit_price=1.9, sss_read_timeout_s=20.0, sss_idempotency_field="",
+    )
+
+    class Stop:
+        def is_set(self):
+            return False
+
+    logs = []
+    result = sss.run_sss_job(cfg, Stop(), logs.append, password="x",
+                             captcha_callback=lambda img: "1234")
+
+    assert result["status"] == "preflight_ok"
+    assert result["submitted"] == 0
+    assert posts == []
+    text = "\n".join(logs)
+    assert "时间窗自检：服务端接受 startTime/endTime" in text
+    assert "全量扫描" not in text
+
+    list_paths = [path for path in paths if "one-touch-send/list" in path]
+    assert list_paths, "预检必须查一次订单列表"
+    sizes = [int(re.search(r"pageSize=(\d+)", path).group(1)) for path in list_paths]
+    for size, path in zip(sizes, list_paths):
+        # 允许的只有两种：自检探针（pageSize=1）与带时间窗的主查询。
+        assert size == 1 or "startTime=" in path, f"出现了无过滤全量扫描：{path}"
+    assert sizes.count(1) == 2, "自检只该有两次 pageSize=1 探针"
+    assert max(sizes) == sss._WINDOW_PAGE_SIZE, "主查询必须用窗口页大小"
 
 
 def test_balance_guard_stops_before_any_submit(monkeypatch, tmp_path):
@@ -1702,14 +2046,26 @@ def test_balance_guard_stops_before_any_submit(monkeypatch, tmp_path):
     assert any("余额不足" in msg for msg in logs)
 
 
-def test_list_records_rejects_shell_without_records():
-    """服务端对不支持的过滤参数返回无 records 空壳，必须 fail-closed 且报错点名结构。"""
-    import pytest
+def test_list_records_treats_empty_shell_as_empty_page():
+    """服务端对「窗口内真的没有订单」返回 total=0 且无 records 的空壳。
 
-    shell = {"success": True, "code": 200,
+    2026-09-26 生产实测：把它当结构异常会让每次「空窗口」都退回一次无过滤全量
+    扫描（69 秒/次，而提交前必然发生）。total 明确为 0 时按空页处理。
+    """
+    shell = {"success": True, "code": 200, "message": "操作成功！",
              "result": {"total": 0, "size": 10, "current": 1, "pages": 0}}
+    assert sss._list_records(shell) == ([], 0)
+
+
+@pytest.mark.parametrize("result", [
+    {"size": 10, "current": 1, "pages": 0},               # 缺 total
+    {"total": 3, "size": 10, "current": 1, "pages": 1},   # total>0 却没有 records
+    {"total": "abc", "size": 10, "current": 1},           # total 读不出来
+])
+def test_list_records_rejects_shell_without_records(result):
+    """其余缺 records 的形态必须 fail-closed，且报错点名结构。"""
     with pytest.raises(LookupError, match="缺少 records/list"):
-        sss._list_records(shell)
+        sss._list_records({"success": True, "code": 200, "result": result})
 
 
 def test_local_filter_keeps_only_wanted_delivery_day():

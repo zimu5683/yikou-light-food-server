@@ -229,15 +229,12 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
         "remark": col_or(HEADER_REMARK, 0),
     }
     # 日期列区间：电话右侧 ~ 第一个结构列左侧。
-    # 区间外（备注右侧）的日期样式格子是协作者的标记，只提示、不参与统计。
+    # 区间外（备注右侧）的日期样式格子是协作者的标记：**不参与统计，也不再单独
+    # 报成风险**（2026-09-26 用户确认它不是风险）。这里仍然算一次，只因为
+    # 「云端表里没有当天列」时必须能提示「那些格子是协作者的标记列」。
     date_lo, date_hi = date_region(plan.columns)
     stray_dates = [(int(col) + 1, str(text)) for col, text in header.items()
                    if int(col) + 1 > date_hi and parse_date_header(text)]
-    if stray_dates:
-        shown = "、".join(f"{column_name(c)}{HEADER_ROW}「{t}」"
-                         for c, t in stray_dates[:2])
-        plan.warnings.append(
-            f"已忽略日期区间外的日期样式格 {shown}（判定为协作者的标记列，不参与统计）")
     found = find_target_column(header, target, col_from=date_lo, col_to=date_hi)
     if not found:
         note = ("（注意：备注右侧那些『9.14 周一』样式的格子是协作者的标记列，"
@@ -446,11 +443,10 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
     unknown = sorted({addr for addr in
                       [*address_of.values(), *(a for _o, a, _s, _k in written)]
                       if _address_key(addr) and _address_key(addr) not in ranks})
+    # 清单外地址按设计排到表尾：**不再逐条报成风险**（2026-09-26 用户确认它不是
+    # 风险——每一行实际落到第几行在 changes 里已经能看到）。这里保留前 5 个作为
+    # 结构化数据（payload 的 sort.unknown_addresses），只供排查用。
     plan.unknown_addresses = unknown[:5]
-    for addr in unknown[:5]:
-        plan.warnings.append(f"地址「{addr}」不在排序清单里，将排到表格最后面")
-    if len(unknown) > 5:
-        plan.warnings.append(f"…另有 {len(unknown) - 5} 个清单外地址，同样排到表尾")
 
     new_count = len(written)
     # 有老数据时插到第 4 行之前（第 3 行是第一行数据，不动它）；

@@ -31,15 +31,28 @@ _PROGRESS_EVERY_N = 10
 
 _DRY_RUN_PREVIEW_N = 3
 
-_RECONCILE_POLL_ATTEMPTS = 3
+#: 提交后对账的只读复查次数/间隔。3.6.15 重估：单次对账从「无过滤全量扫描」
+#: （实测 69 秒）降为「时间窗查询 1-2 页」（约 2 秒），复查变便宜；而提交并发提高后
+#: 收尾对账离 POST 更近，站内「刚写入还没被列表读到」的短延迟更容易撞上，所以把
+#: 复查窗口从约 1.5 秒放宽到约 6 秒（只读，不重发 POST）。
+_RECONCILE_POLL_ATTEMPTS = 4
 
-_RECONCILE_POLL_INTERVAL_S = 0.5
+_RECONCILE_POLL_INTERVAL_S = 2.0
 
 _PREFILTER_ZERO_RETRY_DELAY_S = 2.0
 
 _BATCH_CLOCK_SKEW_S = 120.0
 
 _LIST_PAGE_SIZE = 100
+
+#: 带时间窗（预筛）查询的页大小。窗口内通常 100-140 条（2026-09-13 生产实测 116 条），
+#: 300 可以一页取完（1 页 ≈ 1.9 秒，比 2 页 ≈ 2.8 秒省一次往返）。
+#: 无过滤路径仍用 _LIST_PAGE_SIZE：pageSize=1000 实测 17.9 秒 / 1.9MB，盲目放大会更慢。
+_WINDOW_PAGE_SIZE = 300
+
+#: 时间窗自检结论的进程内缓存有效期（秒）。自检见 reconcile._verify_list_window：
+#: 结论只与「服务端是否接受 startTime/endTime」有关，短时间重复探测没有意义。
+_WINDOW_CHECK_TTL_S = 600.0
 
 _SERVER_PREFILTER_MARGIN_DAYS = 1
 

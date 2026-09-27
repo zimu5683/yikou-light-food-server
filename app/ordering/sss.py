@@ -34,6 +34,8 @@ from app.ordering.constants import (
     _SSS_RUN_LOCK,
     _SSS_SERVER_PREFILTER,
     _STORE_LIST_PATH,
+    _WINDOW_CHECK_TTL_S,
+    _WINDOW_PAGE_SIZE,
 )
 from app.ordering.common import (
     _SSS_TRACE_ENABLED,
@@ -107,6 +109,7 @@ from app.ordering.reconcile import (
     _record_active_for_days,
     _record_created_timestamp,
     _safe_reconcile,
+    _verify_list_window,
 )
 from app.ordering.submission import (
     _balance_precheck,
@@ -192,6 +195,8 @@ __all__ = [
     "_SSS_SERVER_PREFILTER",
     "_SSS_TRACE_ENABLED",
     "_STORE_LIST_PATH",
+    "_WINDOW_CHECK_TTL_S",
+    "_WINDOW_PAGE_SIZE",
     "_SubmissionUncertain",
     "_SubmitResult",
     "_address_combo",
@@ -252,6 +257,7 @@ __all__ = [
     "_trace",
     "_unwrap_scalar",
     "_validate_sss_orders",
+    "_verify_list_window",
     "_with_auth_relogin",
     "UncertainJournalError",
     "authoritative_uncertain_path",

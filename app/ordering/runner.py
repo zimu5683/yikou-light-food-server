@@ -175,10 +175,12 @@ def run_sss_job(config: Any, stop_event: Any,
     common_address = str(getattr(config, "sss_common_address", "") or "")
     use_fixed_address = bool(getattr(config, "sss_use_fixed_address", False))
     goods_name = str(getattr(config, "sss_product_name", "") or "轻食")
+    # 出厂并发 8（3.6.15 起）；旧配置的 4 由 AppConfig 的一次性迁移搬过来，
+    # 这里的 getattr 兜底只对「手工拼出来的 config」生效。
     try:
-        max_workers = int(getattr(config, "sss_max_workers", 4))
+        max_workers = int(getattr(config, "sss_max_workers", 8))
     except (TypeError, ValueError):
-        max_workers = 4
+        max_workers = 8
     max_workers = max(1, min(20, max_workers))
     batch_id = uuid.uuid4().hex[:12]
     idempotency_field = str(getattr(config, "sss_idempotency_field", "") or _CLIENT_IDEMPOTENCY_FIELD).strip()
@@ -540,6 +542,7 @@ def run_sss_job(config: Any, stop_event: Any,
             decision_callback,
             max_workers,
             relogin=relogin,
+            read_timeout_s=read_timeout_s,
             uncertain_sink=_journal_sink,
             uncertain_clear=_journal_clear,
             uncertain_discard=_journal_discard,
@@ -559,7 +562,9 @@ def run_sss_job(config: Any, stop_event: Any,
             try:
                 end_total, end_frozen = query_balance(client.get_json)
             except _AuthExpired as exc:
-                _emit(progress_callback, f"重新登录后余额查询仍失败：{exc}", "WARN")
+                # 进度回调只接收一个参数（Bridge 传的是 lambda msg: self.log(msg)），
+                # 旧代码多传了一个 "WARN"，会在这里抛 TypeError 把整批任务打成 error。
+                _emit(progress_callback, f"重新登录后余额查询仍失败：{exc}")
                 end_total, end_frozen = None, None
         _emit(progress_callback, "结束" + _format_balance(end_total, end_frozen))
 

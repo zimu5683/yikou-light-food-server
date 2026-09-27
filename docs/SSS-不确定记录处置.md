@@ -15,11 +15,11 @@
 闪时送下单 POST **不是幂等操作**，平台报文里也没有客户端幂等字段。正式运行会在日志里明确写：
 
 > 平台接口未探测到客户端幂等字段：采用“至少一次提交 + 对账确认”语义，不承诺 exactly-once
-> —— `app/ordering/runner.py:266-269`
+> —— `app/ordering/runner.py:268-271`
 
 因此当 POST 结果未知时（传输层超时/断线、2xx 但响应语义不明），程序**不会**把它当成“失败可以重发”，
 而是把它记成一条**活跃的“已发送未知”记录**写进本地 journal
-（`app/ordering/runner.py:519-522` → `app/ordering/uncertain.py:1212` `append_uncertain_records`）。
+（`app/ordering/runner.py:521-524` → `app/ordering/uncertain.py:1212` `append_uncertain_records`）。
 
 典型现场：上一轮批量提交（例如 62 单）过程中网络异常或读超时，**POST 是否落库未知**，
 journal 里就留下了一批活跃未决记录；此后每一轮都会被闸门挡下。
@@ -35,12 +35,12 @@ journal 里就留下了一批活跃未决记录；此后每一轮都会被闸门
 ### 1.2 闸门：任何 POST 之前先只读对账
 
 下一轮运行在**提交任何 POST 之前**会先做一次严格只读对账
-（`app/ordering/runner.py:423-424` → `app/ordering/uncertain.py:1475` `resolve_pending_records`）：
+（`app/ordering/runner.py:425-426` → `app/ordering/uncertain.py:1475` `resolve_pending_records`）：
 
 - 站内同一天**查得到**且订单指纹匹配 → 自动标记 `resolved`、清理记录、解除阻断
-  （`app/ordering/uncertain.py:1502-1511`；日志「跨运行不确定记录：只读对账已确认并清理 N 条」）；
+  （`app/ordering/uncertain.py:1478-1487`；日志「跨运行不确定记录：只读对账已确认并清理 N 条」）；
 - 站内**查不到** → **保持阻断**，本批不提交任何 POST
-  （`app/ordering/runner.py:443-457`：`semantics="uncertain-journal-guard"`、
+  （`app/ordering/runner.py:445-459`：`semantics="uncertain-journal-guard"`、
   `status="blocked_uncertain"`、`next_action="先只读核对站内订单与本地不确定记录；未确认前不要重跑或补发"`）。
 
 用户手机/页面上看到的文案来自 `app/api/bridge.py:1610-1612`：
@@ -64,9 +64,9 @@ fail-closed：查不到 → 阻断，把判断权交给人工核对，再由管�
 
 | 闸门 | 触发条件 | 结果 `semantics` | 位置 |
 |---|---|---|---|
-| 跨作用域闸门 | 本机同一账号存在**无法安全归属**的活跃记录（旧网址写法、归属字段缺失） | `cross-scope-authority-guard` | `app/ordering/runner.py:314-354` |
-| 权威位置切换闸门 | 另一个已登记/默认权威位置仍有本账号的活跃记录 | `authority-location-guard` | `app/ordering/runner.py:362-412` |
-| **未决记录闸门（本手册主场景）** | 当前批次键下仍有活跃未决记录 | `uncertain-journal-guard` | `app/ordering/runner.py:443-457` |
+| 跨作用域闸门 | 本机同一账号存在**无法安全归属**的活跃记录（旧网址写法、归属字段缺失） | `cross-scope-authority-guard` | `app/ordering/runner.py:316-356` |
+| 权威位置切换闸门 | 另一个已登记/默认权威位置仍有本账号的活跃记录 | `authority-location-guard` | `app/ordering/runner.py:364-414` |
+| **未决记录闸门（本手册主场景）** | 当前批次键下仍有活跃未决记录 | `uncertain-journal-guard` | `app/ordering/runner.py:445-459` |
 
 前两类的记录**不在当前批次键下**，所以「未决记录」面板可能显示 0 条记录却仍在阻断 —— 此时不要反复点
 解除；按日志提示人工整理对应位置的记录（见第 4 节），必要时先把闪时送网址改回正式写法。
@@ -83,7 +83,7 @@ fail-closed：查不到 → 阻断，把判断权交给人工核对，再由管�
     （默认 `~/.local/state/...`）
   - 显式覆盖：配置 `sss_authoritative_uncertain_path` 或环境变量 `YIKOU_SSS_AUTHORITATIVE_PATH`
 - 批次锁：`app/ordering/uncertain.py:160-176`，落在 `sss-locks/<sha256(batch_key)[:32]>.lock`；
-  拿不到锁时本批直接 `blocked_concurrent` 且**零 POST**（`app/ordering/runner.py:288-305`）。
+  拿不到锁时本批直接 `blocked_concurrent` 且**零 POST**（`app/ordering/runner.py:290-307`）。
 - Android 的 journal 位于 App 私有目录，**Termux 无权限读取**，因此现场必须使用 App/网页内的入口；
   在 Termux/Linux 上部署时可以直接查看该文件（只读）。
 
@@ -107,8 +107,8 @@ fail-closed：查不到 → 阻断，把判断权交给人工核对，再由管�
 
 - **A. 直接手工补单**（推荐，最省事）：在闪时送 App 里把缺的单补上。
   下一轮运行时，闸门的只读对账会查到它们、自动 `resolved` 并解除阻断
-  （`app/ordering/uncertain.py:1502-1511`）；随后提交前的“下单前站内对账”会确认它们已存在，
-  **不会重复提交**（`app/ordering/submission.py:534-548`，日志「Excel 订单均已在站内确认，本次不发送任何下单请求」）。
+  （`app/ordering/uncertain.py:1478-1487`）；随后提交前的“下单前站内对账”会确认它们已存在，
+  **不会重复提交**（`app/ordering/submission.py:571-585`，日志「Excel 订单均已在站内确认，本次不发送任何下单请求」）。
   补单时姓名/电话/送达时间要尽量与名单一致，否则对账可能认不出来。
 - **B. 用新入口解除**：页面「未决记录与只读核对」面板 → 点「只读核对站内订单」
   （需要闪时送登录密码，**零 POST**）→ 核对结果里这些记录都被判成「站内缺失」→
@@ -129,7 +129,7 @@ fail-closed：查不到 → 阻断，把判断权交给人工核对，再由管�
 面板/列表显示当前批次 `active=0` 后，再正常重跑本批。重跑时提交前仍会再做一次只读对账。
 
 > 若只读核对返回 `review_failed`（登录/查询失败）或出现 `scan_failed`，**不能**据此解除阻断 ——
-> 那表示“读不到”，不是“站内没有”（`app/ordering/runner.py:842-858`、`:860-864`）。
+> 那表示“读不到”，不是“站内没有”（`app/ordering/runner.py:847-863`、`:865-869`）。
 
 ---
 
@@ -168,14 +168,14 @@ fail-closed：查不到 → 阻断，把判断权交给人工核对，再由管�
 
 - 仅管理员；需要已保存闪时送**网址 + 账号**，密码必填；`remember` 被忽略（只读动作不写凭据）
   （`app/api/bridge.py:933-947`）；
-- 复用正式运行的登录/对账代码（`app/ordering/runner.py:642-888`）：先严格只读对账
+- 复用正式运行的登录/对账代码（`app/ordering/runner.py:647-893`）：先严格只读对账
   （站内查到的自动 `resolved`），再对剩余记录做 **±3 天宽窗复核**
-  （`_REVIEW_WIDE_WINDOW_DAYS = 3`，`app/ordering/constants.py:49`），把每条分类成
+  （`_REVIEW_WIDE_WINDOW_DAYS = 3`，`app/ordering/constants.py:62`），把每条分类成
   `station_missing` / `station_found_other_day` / `scan_failed`；
 - 返回 `status`：`review_ok`（已全部确认并解除）/ `review_blocked`（仍有记录）/
   `review_failed`（读不到）；`review.counts` 与 `review.journal_fingerprint` 是后续解除的证据；
 - 失败语义：登录/查询失败一律 `review_failed`，**绝不当成“站内没有”**
-  （`app/ordering/runner.py:661-662`、`:879-884`）；
+  （`app/ordering/runner.py:666-667`、`:884-889`）；
 - worker 结束后页面会自动刷新一次未决记录，不需要轮询。
 
 ### 3.3 `sss_uncertain_resolve` —— 管理员带审计处置（永不发 POST、永不联网）
@@ -201,7 +201,7 @@ fail-closed：查不到 → 阻断，把判断权交给人工核对，再由管�
 - `record_ids` 必须显式列出（`invalid_record_ids`）；不在当前批次的 id → `unknown_record_ids`；
 - `station_absent` 额外要求（全部满足才允许解除，因为解除后下一轮会真的重发）：
   - 有一次只读核对快照，且距现在 **≤ 600 秒**（`_SSS_REVIEW_TTL_S = 600.0`，
-    `app/ordering/constants.py:51-53`）→ 否则 `review_stale`；
+    `app/ordering/constants.py:64-66`）→ 否则 `review_stale`；
   - journal 指纹与核对时一致（`app/ordering/uncertain.py:1422-1432`）→ 否则 `journal_changed`；
   - 所选记录**全部**被分类为 `station_missing`，且宽窗内没有命中
     （`station_found_other_day`）→ 否则 `review_required` / `station_state_changed`；
@@ -236,10 +236,10 @@ fail-closed：查不到 → 阻断，把判断权交给人工核对，再由管�
 
 | 证据 | 含义 | 位置 |
 |---|---|---|
-| `review.counts.station_confirmed` | 只读对账已确认并清理的记录数 | `app/ordering/runner.py:778-786` |
-| `review.counts.station_missing` | 宽窗内也查不到（解除 `station_absent` 的必要条件） | `app/ordering/runner.py:816-821` |
+| `review.counts.station_confirmed` | 只读对账已确认并清理的记录数 | `app/ordering/runner.py:783-791` |
+| `review.counts.station_missing` | 宽窗内也查不到（解除 `station_absent` 的必要条件） | `app/ordering/runner.py:821-826` |
 | `review.counts.station_found_other_day` | 宽窗内命中（送达日不同）→ 不能按“站内没有”解除 | `app/api/bridge.py:1489-1497` |
-| `review.counts.scan_failed` | 读不到；>0 时不产生解除证据 | `app/ordering/runner.py:842-858` |
+| `review.counts.scan_failed` | 读不到；>0 时不产生解除证据 | `app/ordering/runner.py:847-863` |
 | `review.journal_fingerprint` | 核对时的 journal 指纹（CAS 锚点） | `app/ordering/uncertain.py:1422-1432` |
 | `review.stale` / `review.age_s` | 核对快照是否超过 600 秒 | `app/api/bridge.py:1197-1206` |
 | `audit.actor/note/at` | 处置人、说明、时间（journal 审计） | `app/api/bridge.py:1456-1462`、`:1517-1525` |

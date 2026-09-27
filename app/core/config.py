@@ -16,6 +16,23 @@ MIN_SPLIT_RATIO = 0.30
 MAX_SPLIT_RATIO = 0.55
 _CONFIG_SAVE_LOCK = threading.RLock()
 
+#: 出厂默认值的迁移版本号。`sss_max_workers` / `sss_read_timeout_s` 在界面上从来
+#: 没有入口，旧配置里保存的只可能是**当时的出厂默认**；直接改默认值对已有安装无效
+#: （`load()` 会把磁盘上的 4 / 20.0 原样读回来）。因此用这个版本号做**一次性**迁移：
+#: 只把仍等于旧出厂默认的取值搬到新默认，用户显式改过的其它取值（1 = 串行回退、
+#: 2、6、12、20…）一律保留。旧配置缺这个键 → 视为 0（迁移前）。
+DEFAULTS_REVISION = 1
+
+#: v0 → v1：下单并发 4 → 8、读取超时 20 → 30 秒。
+#: 并发依据：生产实测 4 路吞吐 0.44-0.48 单/秒 ≈ 4 ÷ 每单 8.4-9.2 秒——吞吐随并发
+#: 线性，说明平台没有按账号串行建单；4/8/16/32 路压测无排队、无限流、无 429。
+#: 超时依据：并发翻倍后单请求耗时会上升，而超时会被归类「已发送未知」并要求人工
+#: 只读核对，所以留出余量（仍远低于 120 秒上限）。
+_LEGACY_DEFAULT_SSS_MAX_WORKERS = 4
+_LEGACY_DEFAULT_SSS_READ_TIMEOUT_S = 20.0
+_DEFAULT_SSS_MAX_WORKERS = 8
+_DEFAULT_SSS_READ_TIMEOUT_S = 30.0
+
 # 本地排单子表 -> 云端排单表（WPS 云文档 file_id）。
 # 表名映射来自用户确认：本地「衣锦」= 云端「校门口」（云端表标题写的是「衣锦汇总」）。
 # 允许修改：协作者重建当月表后 file_id 会变，可在界面上更新。
@@ -213,10 +230,10 @@ class AppConfig:
     # 门店 id 缓存：按门店名命中后跳过门店列表查询（门店几乎不变）。
     sss_store_id: int | None = None
     sss_store_name_cached: str = ""
-    # 批量下单并发 worker 数（1 = 串行，用于服务端限流时回退）。
-    sss_max_workers: int = 4
-    # 闪时送 API 读取超时（秒）；慢响应不会被误判成失败。
-    sss_read_timeout_s: float = 20.0
+    # 批量下单并发 worker 数（1 = 串行，用于服务端限流时回退）。3.6.15 起出厂 8。
+    sss_max_workers: int = _DEFAULT_SSS_MAX_WORKERS
+    # 闪时送 API 读取超时（秒）；慢响应不会被误判成失败。3.6.15 起出厂 30。
+    sss_read_timeout_s: float = _DEFAULT_SSS_READ_TIMEOUT_S
     # 闪时送单均价（元）：>0 时只提示预计送完结算费用，不拦截下单。
     sss_unit_price: float = 1.9
     # 可选：平台若支持客户端幂等字段，填字段名（如 clientRequestId）后启用稳定 UUID。
@@ -245,6 +262,8 @@ class AppConfig:
     wps_sort_enabled: bool = True
     # {子表名: [地址, ...]}；空列表 = 该表按地址自然升序。
     wps_address_order: Dict[str, Any] = field(default_factory=default_wps_address_order)
+    # 出厂默认值迁移版本号（见模块顶部 DEFAULTS_REVISION）；旧配置缺键 = 0。
+    defaults_revision: int = DEFAULTS_REVISION
     config_path: Optional[str] = None
 
     def __init__(self, target_url: str = "https://m.icall.me/admin/#/login", phone_number: str = "",
@@ -268,8 +287,8 @@ class AppConfig:
                  sss_preflight: bool = False,
                  sss_store_id: int | None = None,
                  sss_store_name_cached: str = "",
-                 sss_max_workers: int = 4,
-                 sss_read_timeout_s: float = 20.0,
+                 sss_max_workers: int = _DEFAULT_SSS_MAX_WORKERS,
+                 sss_read_timeout_s: float = _DEFAULT_SSS_READ_TIMEOUT_S,
                  sss_unit_price: float = 1.9,
                  sss_idempotency_field: str = "",
                  wps_enabled: bool = False,
@@ -286,6 +305,7 @@ class AppConfig:
                  wps_marker_enabled: bool = True,
                  wps_sort_enabled: bool = True,
                  wps_address_order: Optional[Dict[str, Any]] = None,
+                 defaults_revision: int = DEFAULTS_REVISION,
                  config_path: Optional[str] = None,
                  *, url: Optional[str] = None, phone: Optional[str] = None) -> None:
         # url/phone 是旧界面层用过的字段别名；两个字段都要**去首尾空格**：
@@ -323,13 +343,24 @@ class AppConfig:
         try:
             workers = int(sss_max_workers)
         except (TypeError, ValueError):
-            workers = 4
+            workers = _DEFAULT_SSS_MAX_WORKERS
         self.sss_max_workers = max(1, min(20, workers))
         try:
             read_timeout = float(sss_read_timeout_s)
         except (TypeError, ValueError):
-            read_timeout = 20.0
+            read_timeout = _DEFAULT_SSS_READ_TIMEOUT_S
         self.sss_read_timeout_s = max(1.0, min(120.0, read_timeout))
+        try:
+            revision = int(defaults_revision)
+        except (TypeError, ValueError):
+            revision = DEFAULTS_REVISION
+        if revision < DEFAULTS_REVISION:
+            # 一次性迁移：只搬「仍等于旧出厂默认」的取值，用户改过的其它值不动。
+            if self.sss_max_workers == _LEGACY_DEFAULT_SSS_MAX_WORKERS:
+                self.sss_max_workers = _DEFAULT_SSS_MAX_WORKERS
+            if self.sss_read_timeout_s == _LEGACY_DEFAULT_SSS_READ_TIMEOUT_S:
+                self.sss_read_timeout_s = _DEFAULT_SSS_READ_TIMEOUT_S
+        self.defaults_revision = DEFAULTS_REVISION
         try:
             self.sss_unit_price = max(0.0, float(sss_unit_price))
         except (TypeError, ValueError):
@@ -402,6 +433,8 @@ class AppConfig:
             payload = json.loads(target.read_text(encoding="utf-8"))
             valid = {f.name for f in fields(cls)}
             values = {k: v for k, v in payload.items() if k in valid and k != "config_path"}
+            # 旧配置没有这个键 = 出厂默认迁移之前，让 __init__ 走一次性迁移。
+            values.setdefault("defaults_revision", 0)
             config = cls(**values, config_path=str(target))
             config._last_seen_disk = dict(payload)
             return config

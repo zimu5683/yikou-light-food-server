@@ -906,7 +906,9 @@ def test_sort_reorders_whole_table_by_address_order():
                  address_order=order)[0]
     rows = {c.name: c.row for c in plan.changes}
     assert rows == {"新人": 5}
-    assert any("学三" in w and "最后面" in w for w in plan.warnings)
+    # 清单外地址按设计排到表尾，不再报成风险（2026-09-26 用户确认）；只保留结构化数据。
+    assert plan.unknown_addresses == ["学三"]
+    assert not [w for w in plan.warnings if "最后面" in w]
     assert plan.sort_range and plan.sort_key_col
 
     apply_plan(cli, [plan], ledger=None, marker_enabled=False)
@@ -942,18 +944,20 @@ def test_address_alias_and_case_insensitive_match():
     plan = _plan(cli, orders, address_order={"东湖中餐": ["小", "b2"]})[0]
     addrs = {c.name: c.address for c in plan.changes}
     assert addrs == {"黄": "小", "陈章依": "b2"}
-    assert not [w for w in plan.warnings if "不在排序清单" in w]
+    assert plan.unknown_addresses == [], "别名/大小写都能命中清单，不该有清单外地址"
     apply_plan(cli, [plan], ledger=None, marker_enabled=False)
     names = [cli.grid.get((r, 0)) for r in range(2, 6)]
     assert names == ["张", "黄", "李", "陈章依"], f"实际顺序 {names}"
     assert cli.grid[(5, 1)] == "b2", "本地写 B2，云端按清单落成 b2"
 
 
-def test_unknown_address_goes_to_table_end_with_warning():
+def test_unknown_address_goes_to_table_end_without_a_risk_warning():
+    """清单外地址按设计排到表尾：行为不变，但不再报成风险（2026-09-26 用户确认）。"""
     cli = FakeCli(make_grid(BASE_HEADER, [{0: "张", 1: "小", 2: "111", 7: "3"}]))
     orders = [CloudOrder("东湖中餐", "路人", "食堂", "555", "中餐", "经济", 1)]
     plan = _plan(cli, orders, address_order={"东湖中餐": ["小"]})[0]
-    assert any("食堂" in w and "最后面" in w for w in plan.warnings)
+    assert plan.unknown_addresses == ["食堂"], "结构化数据仍要保留，便于排查"
+    assert not [w for w in plan.warnings if "食堂" in w]
     apply_plan(cli, [plan], ledger=None, marker_enabled=False)
     assert cli.grid[(2, 0)] == "张" and cli.grid[(3, 0)] == "路人", "清单外的人排在表尾"
 
@@ -1194,7 +1198,8 @@ def test_collaborator_marker_column_is_not_a_date_column():
     plan = _plan(cli, [CloudOrder("东湖中餐", "新人", "小", "222", "中餐", "经济", 1)],
                  sort=False)[0]
     assert plan.date_cols == [4, 5], f"实际 {plan.date_cols}（13 是协作者的标记列）"
-    assert any("已忽略日期区间外的日期样式格" in w for w in plan.warnings)
+    # 标记列只忽略、不再报成风险（2026-09-26 用户确认）；真要报的是「没有当天列」。
+    assert not [w for w in plan.warnings if "已忽略日期区间外" in w]
     apply_plan(cli, [plan], ledger=None, marker_enabled=False)
     row = plan.changes[0].row
     assert cli.grid[(row - 1, 8)] == f"=SUM(D{row}:E{row})", "公式不能含标记列"
@@ -1209,6 +1214,8 @@ def test_target_date_is_not_written_into_marker_column():
     plan = _plan(cli, [CloudOrder("东湖中餐", "张", "小", "111", "中餐", "经济", 6)])[0]
     assert plan.target_col == 0
     assert any("没有 9.11" in w for w in plan.warnings)
+    # 标记列的提示只在「当天列真的缺失」这个真风险里保留，否则用户会以为表坏了。
+    assert any("标记列" in w for w in plan.warnings)
     apply_plan(cli, [plan], ledger=None, marker_enabled=False)
     assert cli.grid[(1, 12)] == "9.11 周五", "协作者的标记格必须原样不动"
 

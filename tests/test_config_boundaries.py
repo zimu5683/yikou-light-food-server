@@ -12,11 +12,13 @@ falsy 兜底**（`x or "默认值"`）。但它们足够反直觉 —— 用户�
 """
 from __future__ import annotations
 
+import json
 
 import pytest
 
-from app.core.config import (AppConfig, default_wps_address_order, normalize_wps_address_order,
-                        normalize_wps_tables, normalize_wps_test_tables)
+from app.core.config import (DEFAULTS_REVISION, AppConfig, default_wps_address_order,
+                        normalize_wps_address_order, normalize_wps_tables,
+                        normalize_wps_test_tables)
 
 # 这些字段在 __init__ 里写成 `x or "默认值"`，因此**空串会被默认值取代**
 FALSY_FALLBACKS = [
@@ -105,17 +107,65 @@ def test_order_date_is_also_trimmed():
 # ----------------------------------------------------------------------
 @pytest.mark.parametrize("given,expected", [
     (0, 1), (-5, 1), (1, 1), (4, 4), (20, 20), (99, 20),
-    (None, 4), ("abc", 4), ("7", 7),
+    (None, 8), ("abc", 8), ("7", 7),
 ])
 def test_sss_max_workers_is_clamped(given, expected):
+    # 读不出来时回落到**出厂默认 8**（3.6.15 起）；显式 4 仍然原样保留，
+    # 只有「旧配置里等于旧出厂默认的 4」才由迁移搬走（见下面的迁移用例）。
     assert AppConfig(sss_max_workers=given).sss_max_workers == expected
 
 
 @pytest.mark.parametrize("given,expected", [
-    (0, 1.0), (-3, 1.0), (20.0, 20.0), (500, 120.0), (None, 20.0), ("abc", 20.0),
+    (0, 1.0), (-3, 1.0), (20.0, 20.0), (500, 120.0), (None, 30.0), ("abc", 30.0),
 ])
 def test_sss_read_timeout_is_clamped(given, expected):
     assert AppConfig(sss_read_timeout_s=given).sss_read_timeout_s == expected
+
+
+# ----------------------------------------------------------------------
+# 出厂默认迁移：v0 → v1（并发 4 → 8、读取超时 20 → 30 秒）
+# ----------------------------------------------------------------------
+def test_legacy_factory_defaults_are_migrated_once():
+    """旧配置里等于旧出厂默认的取值搬一次；用户显式改过的取值一律不动。"""
+    migrated = AppConfig(defaults_revision=0, sss_max_workers=4, sss_read_timeout_s=20.0)
+    assert migrated.sss_max_workers == 8
+    assert migrated.sss_read_timeout_s == 30.0
+    assert migrated.defaults_revision == DEFAULTS_REVISION
+
+    kept = AppConfig(defaults_revision=0, sss_max_workers=2, sss_read_timeout_s=45.0)
+    assert kept.sss_max_workers == 2
+    assert kept.sss_read_timeout_s == 45.0
+
+
+def test_current_revision_never_rewrites_explicit_values():
+    """迁移是一次性的：已经是当前版本的配置里，4 / 20.0 就是用户的真实选择。"""
+    current = AppConfig(defaults_revision=DEFAULTS_REVISION, sss_max_workers=4,
+                        sss_read_timeout_s=20.0)
+    assert current.sss_max_workers == 4
+    assert current.sss_read_timeout_s == 20.0
+
+
+def test_load_migrates_an_old_file_without_the_revision_key(tmp_path):
+    """旧 config.json 没有 defaults_revision 键 = 迁移前：加载即按新默认生效并写回。"""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"sss_max_workers": 4, "sss_read_timeout_s": 20.0},
+                               ensure_ascii=False), encoding="utf-8")
+
+    loaded = AppConfig.load(path)
+    assert loaded.sss_max_workers == 8
+    assert loaded.sss_read_timeout_s == 30.0
+    assert loaded.defaults_revision == DEFAULTS_REVISION
+
+    loaded.save()
+    assert AppConfig.load(path).sss_max_workers == 8
+
+
+def test_explicit_transport_values_survive_a_save_load_roundtrip(tmp_path):
+    path = tmp_path / "config.json"
+    AppConfig(sss_max_workers=6, sss_read_timeout_s=45.0).save(path)
+    back = AppConfig.load(path)
+    assert back.sss_max_workers == 6
+    assert back.sss_read_timeout_s == 45.0
 
 
 def test_split_ratio_is_clamped_on_construction():
@@ -145,6 +195,8 @@ ROUNDTRIP_FIELDS = {
     "sss_fixed_address_detail": "浙江农林大学东湖校区",
     "sss_dry_run": False,
     "sss_preflight": True,
+    "sss_max_workers": 6,
+    "sss_read_timeout_s": 45.0,
     "sss_idempotency_field": "client_request_id",
     "wps_enabled": True,
     "wps_test_mode": False,

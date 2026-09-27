@@ -91,6 +91,11 @@ GitHub Secrets 配置 `YIKOU_KEYSTORE_FILE` / `YIKOU_KEYSTORE_PASSWORD` / `YIKOU
 [docs/SSS-不确定记录处置.md](docs/SSS-不确定记录处置.md)。只读自检：
 `python -m app.main --sss-import-check`。闪时送登录有图形验证码，必须人工输入一次。
 
+对账只用服务端时间窗（目标送达日 ±1 天，1-2 页），不再翻全量历史；下单并发出厂 8 路、
+读取超时 30 秒（配置字段 `sss_max_workers` / `sss_read_timeout_s`，界面暂无入口），
+每轮提交后会打一行「本轮提交 N 单…每单平均 Y 秒（吞吐 Z 单/秒）」用于判断平台是否在建单上排队。
+取舍与实测见 [design/SSS-对账提速与并发.md](design/SSS-对账提速与并发.md)。
+
 ## 项目结构
 
 ```

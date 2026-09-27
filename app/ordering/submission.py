@@ -155,22 +155,53 @@ def _post_one(client: Any, payload: dict[str, Any]) -> dict[str, Any]:
         raise _SubmissionUncertain(detail) from exc
 
 
+def _emit_round_summary(callback: Callable[[str], Any] | None,
+                        latencies: list[float],
+                        started_at: float,
+                        read_timeout_s: float | None) -> None:
+    """本轮提交的实测汇总：并发到底有没有用，全看这一行。
+
+    吞吐 = 单数 / 墙钟，每单均时 = 服务端建单耗时。并发调高后若平台在建单上
+    排队，每单均时会被推高而吞吐不变——这时应当把并发调低（或放宽读取超时），
+    而不是继续加路数。
+    """
+    if not latencies:
+        return
+    wall = max(0.0, time.perf_counter() - started_at)
+    average = sum(latencies) / len(latencies)
+    throughput = (len(latencies) / wall) if wall > 0 else 0.0
+    message = (f"本轮提交 {len(latencies)} 单，耗时 {wall:.1f} 秒，"
+               f"每单平均 {average:.1f} 秒（吞吐 {throughput:.2f} 单/秒）")
+    try:
+        limit = float(read_timeout_s) if read_timeout_s else 0.0
+    except (TypeError, ValueError):
+        limit = 0.0
+    if limit > 0 and average > limit * 0.6:
+        message += (f"；已接近读取超时 {limit:g} 秒，平台可能在建单上排队，"
+                    "必要时把并发调低或把读取超时调高")
+    _emit(callback, message)
+
+
 def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
                              submit: Callable[[dict[str, Any]], dict[str, Any]],
                              stop_event: Any,
                              callback: Callable[[str], Any] | None,
                              max_workers: int = 4,
-                             on_stop: Callable[[], None] | None = None) -> _SubmitResult:
+                             on_stop: Callable[[], None] | None = None,
+                             read_timeout_s: float | None = None) -> _SubmitResult:
     """有界并发提交，停止、401、余额不足后不再派发新任务。
 
     同一轮最多保留 ``max_workers`` 个在途 POST。请求超时或断链只记录为
     ``uncertain``，由调用方查询订单列表确认，绝不在此处自动重发。
+
+    结束后输出一行本轮汇总（见 `_emit_round_summary`）。
     """
     result = _SubmitResult()
     workers = max(1, int(max_workers))
     iterator = iter(tasks)
     in_flight: dict[Any, dict[str, Any]] = {}
     stop_closed = False
+    latencies: list[float] = []
 
     def halted() -> bool:
         return bool(stop_event.is_set() or result.auth_error or result.balance_error)
@@ -195,9 +226,13 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
             state, detail = "uncertain", str(exc)
         else:
             state, detail = "success", ""
-        _trace(f"POST {task['identifier']}: {time.perf_counter() - started:.2f}s -> {state}")
+        elapsed = time.perf_counter() - started
+        # list.append 在 CPython 下是原子的；这里只做统计，不参与任何判定。
+        latencies.append(elapsed)
+        _trace(f"POST {task['identifier']}: {elapsed:.2f}s -> {state}")
         return task["identifier"], state, detail
 
+    started_at = time.perf_counter()
     with ThreadPoolExecutor(max_workers=workers) as executor:
         exhausted = False
         while in_flight or not exhausted:
@@ -248,6 +283,7 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
             for task in iterator:
                 result.not_sent.add(task["identifier"])
         result.stopped = bool(result.stopped or stop_event.is_set())
+    _emit_round_summary(callback, latencies, started_at, read_timeout_s)
     return result
 
 
@@ -347,6 +383,7 @@ def _run_reconciled_submission(
         max_workers: int,
         relogin: Callable[[], None] | None = None,
         *,
+        read_timeout_s: float | None = None,
         uncertain_sink: Callable[[list[dict[str, Any]], dict[str, Any]], None] | None = None,
         uncertain_clear: Callable[[set[str]], None] | None = None,
         uncertain_discard: Callable[[set[str]], None] | None = None,
@@ -559,7 +596,8 @@ def _run_reconciled_submission(
         submit, close = submit_factory()
         try:
             result = _submit_tasks_concurrent(round_tasks, submit, stop_event,
-                                              callback, workers, on_stop=close)
+                                              callback, workers, on_stop=close,
+                                              read_timeout_s=read_timeout_s)
         finally:
             close()
         _absorb(result)

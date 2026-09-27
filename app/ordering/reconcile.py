@@ -20,6 +20,8 @@ from app.ordering.constants import (
     _RECONCILE_POLL_INTERVAL_S,
     _SERVER_PREFILTER_MARGIN_DAYS,
     _SSS_SERVER_PREFILTER,
+    _WINDOW_CHECK_TTL_S,
+    _WINDOW_PAGE_SIZE,
 )
 from app.ordering.fingerprint import (
     _fingerprint_compatibility,
@@ -30,6 +32,28 @@ from app.ordering.fingerprint import (
 )
 from app.ordering.models import OrderFingerprint, _Reconciliation
 from app.ordering.records import _pick, _pick_scalar
+def _is_empty_shell(container: dict[str, Any]) -> bool:
+    """判断「空壳」：没有 ``records``/``list`` 但 ``total`` 明确为 0 的响应。
+
+    服务端对**空结果**返回的就是这个形状（2026-09-13 生产实测，窗口内确实没有
+    订单时）：
+
+        {"success": true, "message": "操作成功！", "code": 200,
+         "result": {"total": 0, "size": 10, "current": 1, ..., "pages": 0}}
+
+    它和「服务端没接受查询参数」的响应形状相同，因此只能按「total 明确为 0」
+    这一个**收窄**的条件认定为空页；缺 total / total 非 0 / total 读不出来时
+    调用方仍然 fail-closed。真正的兜底是 ``_verify_list_window``（只读自检）。
+    """
+    total = container.get("total")
+    if total is None or isinstance(total, bool):
+        return False
+    try:
+        return float(total) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
 def _list_records(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int | None]:
     """兼容闪时送列表响应的 ``result``/``data`` 两层分页结构。"""
     for container in (payload.get("result"), payload.get("data"), payload):
@@ -46,10 +70,15 @@ def _list_records(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int | 
             except (TypeError, ValueError):
                 total = None
             return ([item for item in records if isinstance(item, dict)], total)
-        # 服务端对不支持的过滤参数返回 success:true + 无 records 的空壳
-        # （2026-09-10 实测：带 startTime/endTime/statusList 即如此）。调用方
-        # 已改为无过滤参数 + 本地过滤；此处保留 fail-closed，但报错必须点名
-        # 结构，避免与“真的零订单”混淆。
+        # 没有 records/list 的响应有两种：**真的空结果**（total 明确为 0，服务端
+        # 的固定形状）与**结构异常/参数不被接受**。前者按空页处理——否则每次
+        # 「时间窗内没有订单」都会被判成查询失败，进而退回一次全量历史扫描
+        # （2026-09-26 生产实测 69 秒/次，且提交前必然触发）。后者保持 fail-closed，
+        # 报错必须点名结构，避免与“真的零订单”混淆。
+        if _is_empty_shell(container):
+            _trace("list 空壳（total=0 且无 records），按空页处理："
+                   + json.dumps(payload, ensure_ascii=False)[:200])
+            return ([], 0)
         if isinstance(container, dict) and container:
             raise LookupError(
                 "订单列表响应缺少 records/list（服务端可能不支持本次查询参数"
@@ -101,8 +130,13 @@ def _list_page_control(payload: dict[str, Any]) -> tuple[int | None, str | None,
 
 def _build_list_prefilter(tasks: list[dict[str, Any]],
                           *,
-                          now: _dt.datetime | None = None) -> dict[str, Any]:
+                          now: _dt.datetime | None = None,
+                          margin: int | None = None) -> dict[str, Any]:
     """按目标送达日构造「服务端预筛」查询参数（epoch 毫秒时间窗）。
+
+    `margin` 可覆盖默认的前后放宽天数（`_SERVER_PREFILTER_MARGIN_DAYS`）：
+    「只读核对未决记录」的宽窗复核按 `days_margin` 传更宽的值，这样它也能走
+    服务端时间窗，不必为了 ±3 天再翻一遍全量历史。
 
     2026-09-10 实测纠正了此前「服务端不支持时间过滤」的结论：服务端字段名是
     ``startTime``/``endTime``，**必须是 epoch 毫秒**（传字符串会被 Spring 以
@@ -131,10 +165,15 @@ def _build_list_prefilter(tasks: list[dict[str, Any]],
     if not days:
         return {}
 
-    margin = _dt.timedelta(days=max(0, _SERVER_PREFILTER_MARGIN_DAYS))
+    try:
+        days_margin = max(0, int(
+            _SERVER_PREFILTER_MARGIN_DAYS if margin is None else margin))
+    except (TypeError, ValueError):
+        days_margin = max(0, int(_SERVER_PREFILTER_MARGIN_DAYS))
+    margin_delta = _dt.timedelta(days=days_margin)
     timezone = (now or _dt.datetime.now()).astimezone().tzinfo or _dt.timezone.utc
-    start = _dt.datetime.combine(min(days) - margin, _dt.time.min, tzinfo=timezone)
-    end = _dt.datetime.combine(max(days) + margin, _dt.time.max, tzinfo=timezone)
+    start = _dt.datetime.combine(min(days) - margin_delta, _dt.time.min, tzinfo=timezone)
+    end = _dt.datetime.combine(max(days) + margin_delta, _dt.time.max, tzinfo=timezone)
     return {
         "startTime": int(start.timestamp() * 1000),
         "endTime": int(end.timestamp() * 1000),
@@ -181,7 +220,8 @@ def _list_pending_orders(fetch_json: Callable[[str], dict[str, Any]],
     records: list[dict[str, Any]] = []
     page_no = 1
     page_token = ""
-    page_size = _LIST_PAGE_SIZE
+    # 预筛窗口内通常只有 100-140 条，用更大的页一页取完（无过滤路径保持原页大小）。
+    page_size = _WINDOW_PAGE_SIZE if prefilter else _LIST_PAGE_SIZE
     max_pages = 100
     sweep_started = time.perf_counter()
     page_count = 0
@@ -311,6 +351,86 @@ def _record_created_timestamp(record: dict[str, Any]) -> float | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=_dt.timezone(_dt.timedelta(hours=8)))
     return parsed.timestamp()
+
+
+#: 时间窗自检结论的进程内缓存：{"verdict": str, "at": 单调秒}。
+_WINDOW_CHECK_CACHE: dict[str, Any] = {"verdict": "", "at": 0.0}
+
+
+def _list_probe(fetch_json: Callable[[str], dict[str, Any]],
+                params: dict[str, Any]) -> list[dict[str, Any]]:
+    """时间窗自检用的一次性只读查询：固定 pageSize=1，返回首页记录。"""
+    query = urlencode({"pageNo": 1, "pageSize": 1, "sortType": 1, "sort": 1, **params})
+    payload = fetch_json(f"{_ORDER_LIST_PATH}?{query}")
+    if payload.get("success") is False:
+        raise LookupError(str(payload.get("message") or "订单列表查询失败"))
+    records, _total = _list_records(payload)
+    return records
+
+
+def _verify_list_window(fetch_json: Callable[[str], dict[str, Any]],
+                        callback: Callable[[str], Any] | None = None) -> str:
+    """只读自检：确认服务端真的接受 startTime/endTime 时间窗过滤。
+
+    为什么需要它：整个对账判定都建立在「带时间窗的查询返回 0 条 = 窗口内确实
+    没有订单」之上。服务端对**空结果**与**不接受的查询参数**返回的是同一种
+    success:true 空壳（见 `_is_empty_shell`）。一旦服务端改了时间窗语义，对账就会
+    把「读不到」误判成「站内没有」，提交前据此放行会重复下单。
+
+    做法（最多两次 pageSize=1 的只读请求，结论按进程缓存 `_WINDOW_CHECK_TTL_S` 秒）：
+
+    1. 探针 A：不带任何过滤查 1 条（实测列表按创建时间倒序，即最新的一单；
+       自检不依赖排序——无论拿到哪一条，它自己的创建时间必然落在下面那个窗口里）；
+    2. 探针 B：用这单的**创建时间 ±1 天**做时间窗再查 1 条——该窗口按构造必然
+       包含探针 A 那单；
+    3. 探针 B 有记录 → ``ok``（时间窗被接受）；探针 A 也没有记录 → ``ok``
+       （账号本来就没有订单，空窗合理）；探针 B 空而探针 A 有记录 →
+       ``unsupported``；创建时间读不出或请求异常 → ``inconclusive``。
+
+    只返回结论、不抛异常：``unsupported`` 由调用方 fail-closed，
+    ``inconclusive`` 绝不新增停机条件（读不到 ≠ 站内没有）。
+    """
+    cached = str(_WINDOW_CHECK_CACHE.get("verdict") or "")
+    cached_at = float(_WINDOW_CHECK_CACHE.get("at") or 0.0)
+    if cached and (time.monotonic() - cached_at) < _WINDOW_CHECK_TTL_S:
+        return cached
+
+    verdict = "inconclusive"
+    reason = "查询异常或读不出创建时间"
+    try:
+        newest = _list_probe(fetch_json, {})
+        if not newest:
+            verdict = "ok"
+            reason = "账号暂无订单，空窗口合理"
+        else:
+            created = _record_created_timestamp(newest[0])
+            if created is None:
+                reason = "最新订单读不出创建时间"
+            else:
+                timezone = _dt.datetime.now().astimezone().tzinfo or _dt.timezone.utc
+                moment = _dt.datetime.fromtimestamp(created, tz=timezone)
+                window = {
+                    "startTime": int((moment - _dt.timedelta(days=1)).timestamp() * 1000),
+                    "endTime": int((moment + _dt.timedelta(days=1)).timestamp() * 1000),
+                }
+                if _list_probe(fetch_json, window):
+                    verdict = "ok"
+                    reason = "带时间窗的查询能查到账号最新订单"
+                else:
+                    verdict = "unsupported"
+                    reason = "账号有订单，但带时间窗的查询返回 0 条"
+    except Exception as exc:  # noqa: BLE001 - 自检读不到只能如实说读不到
+        _trace(f"时间窗自检查询失败（按 inconclusive 处理）：{exc}")
+
+    _WINDOW_CHECK_CACHE["verdict"] = verdict
+    _WINDOW_CHECK_CACHE["at"] = time.monotonic()
+    if verdict == "ok":
+        _emit(callback, f"时间窗自检：服务端接受 startTime/endTime（{reason}）")
+    elif verdict == "unsupported":
+        _emit(callback, f"时间窗自检：{reason}——服务端可能不再接受 startTime/endTime")
+    else:
+        _emit(callback, f"时间窗自检未能完成（{reason}），按既有逻辑继续")
+    return verdict
 
 
 # 仅使用数据模型上唯一、稳定的订单号/主键做分页去重；像 pickUpNumber
@@ -450,7 +570,11 @@ def _reconcile_person_matches(tasks: list[dict[str, Any]],
                         if len(expected_accounts) == 1 else "")
     matches: dict[str, list[dict[str, Any]]] = {}
     seen_station_records: set[tuple[str, str]] = set()
-    for record in _list_pending_orders(fetch_json, tasks, days_margin=days_margin):
+    # 宽窗复核同样走服务端时间窗（±days_margin 天）：本地「±days_margin 天」的判定
+    # 一字不改，服务端窗口只做粗筛；否则每次只读核对都要翻一遍全量历史（实测 69 秒）。
+    for record in _list_pending_orders(
+            fetch_json, tasks, days_margin=days_margin,
+            prefilter=_build_list_prefilter(tasks, margin=days_margin)):
         identity = _station_record_identity(record)
         if identity is not None:
             if identity in seen_station_records:
@@ -498,10 +622,12 @@ def _safe_reconcile(tasks: list[dict[str, Any]],
                     zero_retry_delay: float | None = None) -> _Reconciliation | None:
     """只读对账；列表延迟时有限轮询，绝不因“暂时查不到”而重发 POST。
 
-    ``prefilter`` 非空时先用服务端粗筛对账；只要粗筛没有得出「全部匹配」，
-    就再用无过滤的全量扫描复核一次，以全量结论为准。这样即使服务端将来
-    忽略或改变时间窗语义，最坏结果只是多扫一遍，绝不会因为预筛把订单
-    筛没而误判「缺失」。
+    ``prefilter`` 非空时用服务端时间窗粗筛，**结论一律由本地严格判定负责**。
+    3.6.15 起不再有「缺失 → 无过滤全量扫描复核」：全量扫描只多取记录、不改判定，
+    而提交前站内本就没有本批订单（0 匹配是常态），于是每次运行都要白扫一遍全量
+    历史（2026-09-26 生产实测 69 秒）。真正需要兜底的是「服务端不再接受时间窗」：
+    那会把「窗口内 0 条」从「确实没有」变成「读不到」，交给 `_verify_list_window`
+    只读自检识别并 fail-closed。``YIKOU_SSS_SERVER_PREFILTER=0`` 仍可退回无过滤扫描。
 
     ``zero_retry_delay`` 为秒数时：预筛窗口返回「一条都没有」会先等这么久
     再重查一次，用于覆盖「刚写入、列表还读不到」的情况。只应在**提交后**的
@@ -530,7 +656,7 @@ def _safe_reconcile(tasks: list[dict[str, Any]],
             reconciliation = None
         # 预筛窗口一条都没查到、而目标批次非空：很可能是「刚写入还没被列表读到」。
         # 先做一次短暂重查，把这种情况和「窗口真的为空」区分开；这次重查不占用
-        # attempts 配额，因此后面仍会正常进入全量兜底。
+        # attempts 配额，因此后面仍会正常进入时间窗自检。
         if (zero_retry_delay is not None and reconciliation is not None and prefilter
                 and not zero_retry_done and reconciliation.matched_count == 0
                 and len(reconciliation.missing) == len(tasks)):
@@ -556,23 +682,16 @@ def _safe_reconcile(tasks: list[dict[str, Any]],
                                 f"{_RECONCILE_POLL_INTERVAL_S:g}s 后只读复查（不重发 POST）")
                 time.sleep(_RECONCILE_POLL_INTERVAL_S)
                 continue
-        # 轮询用尽仍有缺失或查询报错：若这次用了服务端预筛，先用无过滤的全量
-        # 扫描确认不是预筛窗口/参数把站内订单挡住，再以全量结论为准。
-        if not prefilter:
-            break
-        why = (f"缺少 {len(reconciliation.missing)} 单" if reconciliation is not None
-               else f"查询失败（{last_error}）")
-        _emit(callback, f"{label}：服务端预筛{why}，正在用无过滤全量扫描复核")
-        try:
-            full = _reconcile_tasks(tasks, fetch_json, created_after=created_after)
-        except Exception as exc:
-            _emit(callback, f"{label}全量复核失败：{exc}；为避免重复下单，后续不会自动提交")
-            return None
-        _emit_reconciliation(callback, label, full, len(tasks))
-        if reconciliation is not None and len(full.confirmed) != len(reconciliation.confirmed):
-            _emit(callback, f"{label}：全量复核确认为 {len(full.confirmed)}/{len(tasks)} 单，"
-                            f"以全量结果为准")
-        return full
+        # 轮询用尽仍有缺失或查询报错：不再做无过滤全量扫描（见 docstring）。
+        # 只补一次只读的**时间窗自检**：只有「服务端不再接受 startTime/endTime」
+        # 才会让「窗口内 0 条」失去意义，那种情况必须 fail-closed，绝不提交。
+        if prefilter and reconciliation is not None and reconciliation.matched_count == 0:
+            if _verify_list_window(fetch_json, callback) == "unsupported":
+                _emit(callback, f"{label}：时间窗自检判定服务端未接受 startTime/endTime，"
+                                "「窗口内 0 条」不能当作「站内没有」；"
+                                "为避免重复下单，已停止本次对账")
+                return None
+        break
     if last is None:
         _emit(callback, f"{label}失败：{last_error}；为避免重复下单，后续不会自动提交")
     return last
