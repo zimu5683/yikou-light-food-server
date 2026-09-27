@@ -45,6 +45,11 @@
   「Fetch kdocs-cli and Android runtime」步骤 404（run 36295518213）。按官方
   `dists/stable/main/binary-aarch64/Packages` 升到 **5.1.107.95** 并重新冻结 SHA256；
   另外两个 Termux 包（libtalloc 2.4.3、libandroid-shmem 0.7）未变。
+- curl.se 的 Mozilla CA bundle 同一天也更新了：冻结的 `CA_SHA256` 不再匹配
+  （run 36296682990）。按「本机下载 curl.se/ca/cacert.pem 后计算的 sha256」重新冻结为
+  `a41b5d35…0505`（121 张证书 / 188900 字节）。
+- 两处 pin 修好后 run 36297150256 出包成功：**Release v3.6.15 已发布**
+  （APK 19,804,177 字节，sha256 `3661e14f…9efa`，内嵌 versionName 3.6.15）。
 
 ### 验证
 
