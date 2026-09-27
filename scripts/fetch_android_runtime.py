@@ -37,8 +37,10 @@ KDOCS_VERSION = "2.5.29"
 KDOCS_VENDOR = ROOT / "vendor" / "kdocs-cli"
 TERMUX_BASE = "https://packages.termux.dev/apt/termux-main"
 CA_URL = "https://curl.se/ca/cacert.pem"
-# 2026-09-17 抓取的 curl.se 官方 Mozilla bundle；上游更新后需重新冻结。
-CA_SHA256 = "f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f7384d28480bc9"
+# 2026-09-27 重新冻结的 curl.se 官方 Mozilla bundle（121 张证书，188900 字节）：
+# 上游 2026-09-27 更新了 CA 列表，旧冻结值 f66dff1b… 不再匹配（run 36296682990 卡在
+# 这一步）。新值与「本机独立下载 curl.se/ca/cacert.pem 后计算的 sha256」逐字一致。
+CA_SHA256 = "a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505"
 
 # Termux 包在 apk 里的目标文件名。
 PROOT_OUT = "libproot.so"
