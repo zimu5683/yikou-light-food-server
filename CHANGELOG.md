@@ -39,6 +39,13 @@
 - 「地址「…」不在排序清单里，将排到表格最后面」不再逐条上报：**排序行为不变**（清单外地址照旧排到
   表尾，每行落到第几行在变更列表里能看到），前 5 个仍保留为结构化数据 `sort.unknown_addresses`。
 
+### CI
+
+- Termux 再次轮转 proot 包：旧 pin `proot_5.1.107.94` 从 pool 移除，APK 构建在
+  「Fetch kdocs-cli and Android runtime」步骤 404（run 36295518213）。按官方
+  `dists/stable/main/binary-aarch64/Packages` 升到 **5.1.107.95** 并重新冻结 SHA256；
+  另外两个 Termux 包（libtalloc 2.4.3、libandroid-shmem 0.7）未变。
+
 ### 验证
 
 - `python -m pytest -q`：**1536 passed / 1 failed / 1 xpassed**。唯一失败是文档引用门禁在本地两份

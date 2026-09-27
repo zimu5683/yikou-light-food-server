@@ -70,9 +70,11 @@ PACKAGES: tuple[TermuxPackage, ...] = (
         name="proot",
         # 2026-09-23：Termux 把 5.1.107.92 从 pool 移除，旧 pin 直接 404 卡住 APK 构建。
         # 按 dists/stable/main/binary-aarch64/Packages 升到 .94，并重新冻结官方 SHA256。
-        version="5.1.107.94",
-        filename="proot_5.1.107.94_aarch64.deb",
-        sha256="b6fa26884d162f5234b0aba9f8a98971aad793706099464f7bd7eb1e21d63935",
+        # 2026-09-27：.94 同样被轮转掉（run 36295518213 再次 404）→ 升到 .95；
+        # SHA256 与官方索引 dists/stable/main/binary-aarch64/Packages 一致。
+        version="5.1.107.95",
+        filename="proot_5.1.107.95_aarch64.deb",
+        sha256="0a1b3d0f6ef76436c5ed924cd8e8f5a6b7186e99e1650eb2d9bc734e218a74cb",
         pool_group="p/proot",
         members={
             "data/data/com.termux/files/usr/bin/proot": PROOT_OUT,
