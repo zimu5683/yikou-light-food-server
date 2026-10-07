@@ -43,16 +43,71 @@ from app.wps.recovery import classify_journal_sheet, recover_pending_operations
 APPLY_PLAN_LOCK_TIMEOUT = 30.0
 
 
+def _verify_inserted_block(cli: KdocsCli, plan: SheetPlan, worksheet_id: int, *,
+                           first_row: int, count: int,
+                           new_names: set[str]) -> str:
+    """只读证明「这一段行确实只装着本次新增的人」。返回问题描述（空 = 通过）。
+
+    为什么必须先证明再删：删除行是按**行号区间**执行的。如果协作者在我们插入之后
+    又在同一区域插了行/重排过整表，那个区间里可能已经混入别人的数据 —— 直接删就
+    会删掉协作者的行。这里只读比对两件事：
+
+    1. 区间内的非空姓名必须全部属于本次新增的人（允许空行、允许我们还没写完）；
+    2. 紧邻区间上下的行里不能出现本次新增的人（那说明表被重排过，行号不再可信）。
+    """
+    name_col = plan.columns.get("name") or 0
+    if not name_col or not count:
+        return "缺少姓名列信息，无法证明待删除行的身份"
+    try:
+        grid = cli.read_grid(plan.file_id, worksheet_id,
+                             first_row - 1, first_row - 1 + count - 1,
+                             name_col - 1, name_col - 1)
+        probe_from = max(FIRST_DATA_ROW, first_row - 2)
+        probe_to = first_row + count  # 含区间下方一行
+        around = cli.read_grid(plan.file_id, worksheet_id,
+                               probe_from - 1, probe_to - 1,
+                               name_col - 1, name_col - 1)
+    except WpsCloudError as exc:
+        return f"回滚前的只读核对失败：{exc}"
+
+    inside = {str(text).strip() for (_row, _col), text in grid.items()
+              if str(text).strip()}
+    strangers = sorted(name for name in inside if name not in new_names)
+    if strangers:
+        return f"待删除区间里出现了非本次新增的人（{('、'.join(strangers[:3]))}）"
+
+    outside = {str(text).strip() for (row, _col), text in around.items()
+               if str(text).strip()
+               and not (first_row <= row + 1 <= first_row + count - 1)}
+    moved = sorted(name for name in outside if name in new_names)
+    if moved:
+        return (f"本次新增的人已经出现在区间之外（{('、'.join(moved[:3]))}），"
+                f"说明表被重排过，行号不再可信")
+    return ""
+
+
 def _rollback_inserts(cli: KdocsCli, plan: SheetPlan, worksheet_id: int,
                       inserted: Sequence[tuple[int, int]],
-                      emit: Callable[[str], Any]) -> bool:
+                      emit: Callable[[str], Any],
+                      *, new_names: set[str] | None = None) -> bool:
     """插入成功但后续写入失败时，把插出来的行删掉，避免云端留下烂尾空行。
 
     从位置最靠后的块开始删（前面的删除不会影响后面的行号）。
+    删除前先只读核对区间身份（``new_names`` 非空时）：核对不过就**不删**并返回
+    False —— 宁可残留空行交人工核对，也不能删掉协作者的行。
     """
     if not inserted:
         return True
+    names = set(new_names or ())
     for first_row, count in sorted(inserted, reverse=True):
+        if names:
+            problem = _verify_inserted_block(cli, plan, worksheet_id,
+                                             first_row=first_row, count=count,
+                                             new_names=names)
+            if problem:
+                emit(f"[云同步] {plan.sheet}：{problem}；为避免删掉协作者的行，"
+                     f"本次不回滚，请人工核对（重复上传前先确认云端状态）")
+                return False
         try:
             cli.delete_rows(plan.file_id, worksheet_id, row=first_row, count=count)
         except WpsCloudError as exc:
@@ -375,7 +430,8 @@ def _journal_set(journal: SyncJournal, operation_id: str, record_key: str,
 def _rollback_and_cleanup(cli: KdocsCli, plan: SheetPlan, worksheet_id: int,
                           inserted: Sequence[tuple[int, int]],
                           emit: Callable[[str], Any], *,
-                          helpers_written: bool) -> bool:
+                          helpers_written: bool,
+                          new_names: set[str] | None = None) -> bool:
     """排序前失败的安全回滚：先清辅助键（若已写）再删插入行，并读回确认；返回是否可证明恢复原状。"""
     if helpers_written and plan.sort_key_col:
         rows = sorted({int(row) for row in plan.row_keys})
@@ -387,7 +443,8 @@ def _rollback_and_cleanup(cli: KdocsCli, plan: SheetPlan, worksheet_id: int,
             except WpsCloudError as exc:
                 emit(f"[云同步] {plan.sheet}：排序键清理失败：{exc}", "WARN")
                 return False
-    ok = _rollback_inserts(cli, plan, worksheet_id, inserted, emit)
+    ok = _rollback_inserts(cli, plan, worksheet_id, inserted, emit,
+                           new_names=new_names)
     return bool(ok)
 
 
@@ -583,6 +640,9 @@ def _apply_one_plan(cli: KdocsCli, plan: SheetPlan, worksheet_id: int, *,
 
     inserted: list[tuple[int, int]] = []
     new_changes = [change for change in plan.changes if change.kind == "new"]
+    # 回滚删除前的身份证明依据：本次新增的人名（见 _verify_inserted_block）。
+    new_names = {str(change.name).strip() for change in new_changes
+                 if str(change.name).strip()}
     block = plan.insert_blocks[0] if plan.insert_blocks else None
 
     # 1) 插入新客户行。
@@ -630,7 +690,8 @@ def _apply_one_plan(cli: KdocsCli, plan: SheetPlan, worksheet_id: int, *,
             reason = f"新客户行写入失败：{exc}"
             emit(f"[云同步] {plan.sheet} {reason}")
             rollback_ok = _rollback_and_cleanup(cli, plan, worksheet_id, inserted, emit,
-                                                helpers_written=False)
+                                                helpers_written=False,
+                                                new_names=new_names)
             return _safe_failed_after_classify(cli, journal, operation_id, record_key,
                                                emit, reason, rollback_ok=rollback_ok)
 
@@ -686,7 +747,8 @@ def _apply_one_plan(cli: KdocsCli, plan: SheetPlan, worksheet_id: int, *,
                       "排序区覆盖不到它，已放弃排序以免行与列错位")
             emit(f"[云同步] {plan.sheet}：{reason}", "ERROR")
             rollback_ok = _rollback_and_cleanup(cli, plan, worksheet_id, inserted, emit,
-                                                helpers_written=False)
+                                                helpers_written=False,
+                                                new_names=new_names)
             return _safe_failed_after_classify(cli, journal, operation_id, record_key,
                                                emit, reason, rollback_ok=rollback_ok)
 
@@ -718,7 +780,8 @@ def _apply_one_plan(cli: KdocsCli, plan: SheetPlan, worksheet_id: int, *,
             emit(f"[云同步] {plan.sheet} {reason}", "ERROR")
             if safe_to_rollback:
                 rollback_ok = _rollback_and_cleanup(cli, plan, worksheet_id, inserted, emit,
-                                                    helpers_written=True)
+                                                    helpers_written=True,
+                                                    new_names=new_names)
                 return _safe_failed_after_classify(cli, journal, operation_id,
                                                    record_key, emit, reason,
                                                    rollback_ok=rollback_ok)

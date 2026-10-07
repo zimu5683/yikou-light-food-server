@@ -61,6 +61,19 @@ def test_default_production_tables_return_independent_copies():
     assert DEFAULT_WPS_PRODUCTION_TABLES["东湖中餐"]["file_id"] != "篡改"
 
 
+def test_hangdian_lunch_has_a_cloud_table_and_a_default_address_order():
+    """杭电信工：午餐登记了协作者云端表；晚餐还没开放，只留地址顺序。"""
+    tables = default_wps_tables()
+    assert tables["杭电午餐"]["file_id"] == "bDV7kDE3nxMmpbLBEXvL1xeYd5SMMSTRn"
+    assert "杭电晚餐" not in tables
+    assert default_wps_production_tables()["杭电午餐"]["file_id"] == (
+        "bDV7kDE3nxMmpbLBEXvL1xeYd5SMMSTRn")
+
+    order = default_wps_address_order()
+    assert order["杭电午餐"] == ["北门", "东1门"]
+    assert order["杭电晚餐"] == ["北门", "东1门"]
+
+
 # ----------------------------------------------------------------------
 # normalize_wps_tables：决定「同步哪几张表」
 # ----------------------------------------------------------------------

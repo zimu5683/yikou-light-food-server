@@ -12,8 +12,8 @@ from app.wps.errors import WpsCloudError
 from app.wps.models import CloudOrder
 
 
-LOCAL_SHEETS = ("东湖中餐", "衣锦中餐", "医学院中餐",
-                "东湖晚餐", "衣锦晚餐", "医学院晚餐")
+LOCAL_SHEETS = ("东湖中餐", "衣锦中餐", "医学院中餐", "杭电午餐",
+                "东湖晚餐", "衣锦晚餐", "医学院晚餐", "杭电晚餐")
 
 LOCAL_COL = {
     "order": 1, "name": 2, "address": 3, "phone": 4,

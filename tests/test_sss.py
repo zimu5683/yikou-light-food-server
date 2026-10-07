@@ -2127,3 +2127,37 @@ def test_expected_delivery_date_rolls_over_month_boundary():
 
     assert expected_delivery_date(dt.datetime(2026, 9, 30, 20, 0)) == dt.date(2026, 10, 1)
     assert expected_delivery_date(dt.datetime(2026, 12, 31, 16, 0)) == dt.date(2027, 1, 1)
+
+
+# ----------------------------------------------------------------------
+# 创建订单的并发路数
+# ----------------------------------------------------------------------
+def test_resolve_create_workers_takes_the_config_value_clamped():
+    from app.ordering.runner import resolve_create_workers
+
+    class _Config:
+        def __init__(self, workers):
+            self.sss_max_workers = workers
+
+    # 出厂默认 4；显式 1 = 串行回退；上限 20（与 AppConfig 的夹紧同口径）。
+    assert resolve_create_workers(_Config(4)) == 4
+    assert resolve_create_workers(_Config(1)) == 1
+    assert resolve_create_workers(_Config(8)) == 8
+    assert resolve_create_workers(_Config(0)) == 1
+    assert resolve_create_workers(_Config(-3)) == 1
+    assert resolve_create_workers(_Config(99)) == 20
+    assert resolve_create_workers(_Config("6")) == 6
+
+
+def test_resolve_create_workers_falls_back_to_serial_for_broken_config():
+    """残缺 config（缺字段/取值不可解析）→ 串行：拿不准就先别并发发非幂等 POST。"""
+    from app.ordering.runner import resolve_create_workers
+
+    class _Empty:
+        pass
+
+    class _Broken:
+        sss_max_workers = "abc"
+
+    assert resolve_create_workers(_Empty()) == 1
+    assert resolve_create_workers(_Broken()) == 1

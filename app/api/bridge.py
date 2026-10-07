@@ -3382,6 +3382,7 @@ class Bridge:
             "unchanged": cls._as_int(planned.get("unchanged")),
             "skipped": cls._as_int(planned.get("skipped")),
             "warned": cls._as_int(planned.get("warned")),
+            "blocked": cls._as_int(planned.get("blocked")),
         }
         planned["note"] = "计划要改动的行数，不是执行结果；执行结果见 execution_summary.rows"
         return planned

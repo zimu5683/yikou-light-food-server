@@ -93,6 +93,12 @@ def test_campus_detection():
     assert detect_campus("浙江省杭州市临安区浙江农林大学(东湖校区) A5") == "东湖农林"
     assert detect_campus("浙江省杭州市临安区杭州医学院 5号楼") == "医学院"
     assert detect_campus("浙江省杭州市临安区浙江农林大学联建公寓 E2") == "衣锦联建"
+    # 杭电信工：中文全称与英文全称两种写法（2026-10-07 实测）。
+    assert detect_campus("浙江省杭州市临安区杭州电子科技大学信息工程学院(青山湖校区)") == "杭电信工"
+    assert detect_campus(
+        "浙江省杭州市临安区School of Information Engineering, Hangzhou Dianzi "
+        "University Qingshan Lake Campus Zijin Court Lin'an District") == "杭电信工"
+    assert detect_campus("杭州市临安区杭电路1号北门") == "杭电信工"
     assert detect_campus("校门口") == "未知"
 
 

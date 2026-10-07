@@ -403,3 +403,17 @@ def test_w6_missing_sheet_key_and_non_dict_items_never_break_reporting(counts_en
     assert got["execution_summary"]["proven_no_write"] is False
     logs = _logs(bridge)
     assert any("?：" in line or "?" in line for line in logs)
+
+
+def test_planned_summary_reports_sheets_refused_by_the_batch_date_gate():
+    """``rows.blocked`` = 被批次日期闸门整表拒绝的子表数（计划口径的表数）。"""
+    plan = _plan()
+    plan.blocked_reason = "本地排单表的星期标记与目标日期不符"
+    plan.changes = []
+
+    planned = Bridge._wps_planned_summary([plan])
+
+    assert planned["kind"] == "plan"
+    assert planned["blocked"] == 1
+    assert planned["rows"]["blocked"] == 1
+    assert planned["rows"]["to_update"] == 0

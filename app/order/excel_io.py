@@ -12,10 +12,8 @@ from typing import Any, Callable
 
 from app.core.models import MealInfo, OrderInfo
 from app.order.delivery import normalize_delivery_point
-from app.order.parsing import get_address_base_sheet_name
+from app.order.parsing import get_address_base_sheet_name, meal_type_label, order_sheet_name
 
-
-SHEET_MEAL_SUFFIX = {"午餐": "中餐", "晚餐": "晚餐"}
 
 WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
@@ -65,7 +63,7 @@ def _write_order(wb: Any, order: OrderInfo, meal: MealInfo, meal_type: str,
         return
     weekday = WEEKDAYS[(today.weekday() + 1) % 7]
     weekday_sheet = wb[weekday] if weekday in wb.sheetnames else wb.create_sheet(weekday)
-    target_name = f"{base}{SHEET_MEAL_SUFFIX.get(meal_type, meal_type)}"
+    target_name = order_sheet_name(base, meal_type)
     target = wb[target_name] if target_name in wb.sheetnames else wb.create_sheet(target_name)
     columns = ("A", "B", "C", "D", "E", "F") if meal_type == "午餐" else ("G", "H", "I", "J", "K", "L")
     # 中餐/晚餐两栏各自从第 3 行起连续填充：只找本栏首列（A 或 G）的空行，
@@ -88,7 +86,8 @@ def _write_order(wb: Any, order: OrderInfo, meal: MealInfo, meal_type: str,
         row2 += 1
     # 「类型」列沿用表名后缀（中餐/晚餐），与工作簿里手工维护的行保持一致；
     # 例如写入「衣锦中餐」表时类型填「中餐」，而不是接口分类「午餐」。
-    type_label = SHEET_MEAL_SUFFIX.get(meal_type, meal_type)
+    # 杭电两张表例外：类型列写「午餐/晚餐」（与协作者云端表已有行一致）。
+    type_label = meal_type_label(base, meal_type)
     vals = [order.order_no, order.name, order.address, order.phone] + [1 if d == weekday else "" for d in WEEKDAYS] + [type_label, meal.grade or "", meal.total_meals or ""]
     for idx, value in enumerate(vals, 1):
         target.cell(row2, idx).value = value
@@ -119,12 +118,28 @@ def _prepare_order_address(order: OrderInfo, aliases: dict[str, str]) -> dict[st
     result = normalize_delivery_point(raw, aliases=aliases)
     campus = result.get("campus")
     base = order.address_base_sheet
+    hangdian = base == "杭电" or campus == "杭电信工"
+    if hangdian and campus in {"东湖农林", "医学院", "衣锦联建"}:
+        # 规格选的是杭电信工、收货地址却明显在别的校区：多半是客户选错了
+        # 选项（杭电两条选项都是 ¥0），交人工确认而不是照着任一边写。
+        result = {
+            **result, "campus": "杭电信工", "point": "", "confidence": "unknown",
+            "reason": f"规格指向杭电信工，但收货地址像{campus}，请人工确认",
+            "candidates": {},
+        }
+        order.delivery_address = raw
+        order.address_base_sheet = "杭电"
+        order.metadata["delivery_point"] = result
+        order.address = raw
+        return result
     if campus == "东湖农林":
         base = "东湖"
     elif campus == "医学院":
         base = "医学院"
     elif campus == "衣锦联建":
         base = "衣锦"
+    elif hangdian:
+        base = "杭电"
     order.delivery_address = raw
     order.address_base_sheet = base
     if campus == "衣锦联建":
@@ -133,11 +148,29 @@ def _prepare_order_address(order: OrderInfo, aliases: dict[str, str]) -> dict[st
             **result, "point": point, "confidence": "high",
             "reason": "衣锦沿用商品备注规则", "candidates": {point: 1},
         }
+    elif base == "杭电":
+        # 取餐点已在 _order_from_api_data 里按规格（其次地址）判定；认不出来就
+        # 降级为待确认：界面弹窗让人工填，没填的以原始地址追加到表尾（与其它
+        # 校区 medium 置信度的回退一致），不会丢单。
+        point = order.address or ""
+        if point:
+            result = {
+                **result, "campus": "杭电信工", "point": point, "confidence": "high",
+                "reason": "杭电按商品规格/地址判定", "candidates": {point: 1},
+            }
+        else:
+            result = {
+                **result, "campus": "杭电信工", "point": "", "confidence": "unknown",
+                "reason": "杭电订单未识别出取餐点（规格与地址都没有北门/东1门）",
+                "candidates": {},
+            }
     order.metadata["delivery_point"] = result
     if campus in {"东湖农林", "医学院"}:
         order.address = result.get("point") or raw
     elif campus == "衣锦联建":
         order.address = order.address or "校门口"
+    elif base == "杭电":
+        order.address = result.get("point") or raw
     else:
         order.address = raw
     return result
@@ -159,7 +192,7 @@ def _pending_report_items(orders: list[OrderInfo]) -> list[dict[str, Any]]:
     return list(grouped.values())
 
 _MANUAL_CAMPUS_TO_BASE = {
-    "东湖农林": "东湖", "医学院": "医学院", "衣锦联建": "衣锦",
+    "东湖农林": "东湖", "医学院": "医学院", "衣锦联建": "衣锦", "杭电信工": "杭电",
 }
 
 def _manual_address_base_sheet(order: OrderInfo, value: str) -> str:

@@ -622,12 +622,15 @@ def summarize_plan(plans: Iterable[SheetPlan]) -> dict[str, int]:
     * ``unchanged``：本次一个字都不用写的行
     * ``warned``：差额为负（本地比账本少，可能退单）的槽位数
     * ``skipped``：日期格被协作者写了别的值（例如 0 = 当天不送）而没动的行数
+    * ``blocked``：整表被拒绝（批次日期不符）的子表数
 
     计数单位是**行**不是人：一天下两单的客户会有两行（两餐各一行）。
-    
+
     """
-    update = new = unchanged = warn = skipped = 0
+    update = new = unchanged = warn = skipped = blocked = 0
     for plan in plans:
+        if plan.blocked_reason:
+            blocked += 1
         for change in plan.changes:
             if change.kind == "new":
                 new += 1
@@ -640,7 +643,8 @@ def summarize_plan(plans: Iterable[SheetPlan]) -> dict[str, int]:
             if change.delta < 0:
                 warn += 1
     return {"to_update": update, "to_append": new,
-            "unchanged": unchanged, "warned": warn, "skipped": skipped}
+            "unchanged": unchanged, "warned": warn, "skipped": skipped,
+            "blocked": blocked}
 
 def _local_rows_text(change: Change) -> str:
     """预览里的本地出处，例如「本地第 19 行共 6 餐」。"""

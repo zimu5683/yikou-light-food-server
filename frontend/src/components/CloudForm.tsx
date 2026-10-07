@@ -74,13 +74,16 @@ import { splitAddressLines } from '@/lib/format'
 import { saveStateView } from '@/lib/saveState'
 import { cn } from '@/lib/utils'
 
+/** 地址排序涉及的 8 张子表（顺序与后端 DEFAULT_ADDRESS_ORDER 一致）。 */
 const ADDRESS_SHEETS = [
   '东湖中餐',
   '衣锦中餐',
   '医学院中餐',
+  '杭电午餐',
   '东湖晚餐',
   '衣锦晚餐',
   '医学院晚餐',
+  '杭电晚餐',
 ] as const
 
 const ADDRESS_PLACEHOLDER = '一行一个地址，从上到下就是排列顺序；留空 = 按地址升序排列'
@@ -675,7 +678,7 @@ export function CloudForm() {
             </div>
             <button type="button" className="mt-2 flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground" onClick={() => setAddressOpen((v) => !v)}>
               {addressOpen ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
-              {addressOpen ? '收起地址顺序' : `展开地址顺序（已指定 ${ADDRESS_SHEETS.filter((s) => (addressOrder[s] ?? []).length > 0).length}/6 张）`}
+              {addressOpen ? '收起地址顺序' : `展开地址顺序（已指定 ${ADDRESS_SHEETS.filter((s) => (addressOrder[s] ?? []).length > 0).length}/${ADDRESS_SHEETS.length} 张）`}
             </button>
             {addressOpen && (
               <div className="mt-2.5">
@@ -1477,7 +1480,9 @@ function CopyCheckCard({ check }: { check: WpsCopyCheck }) {
       {!check.ok ? (
         <p>{check.reason || '核对失败'}</p>
       ) : check.all_aligned ? (
-        <p>6 张副本与正式表行数/姓名序列一致，测试结果可代表线上情况。</p>
+        <p>
+          {(check.tables ?? []).length} 张副本与正式表行数/姓名序列一致，测试结果可代表线上情况。
+        </p>
       ) : (
         <>
           <p>有副本已过时：{(check.drifted ?? []).join('、') || '详见下方'}。建议先在云端同步副本或改用正式目标重新预览。</p>

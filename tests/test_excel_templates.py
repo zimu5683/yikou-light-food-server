@@ -8,10 +8,12 @@ from openpyxl import load_workbook
 from app.order.templates import write_order_template, write_sss_template
 
 ORDER_SHEETS = (
-    "东湖中餐", "衣锦中餐", "医学院中餐",
-    "东湖晚餐", "衣锦晚餐", "医学院晚餐",
+    "东湖中餐", "衣锦中餐", "医学院中餐", "杭电午餐",
+    "东湖晚餐", "衣锦晚餐", "医学院晚餐", "杭电晚餐",
     "周一", "周二", "周三", "周四", "周五", "周六", "周日",
 )
+#: 8 张校区子表（前 8 个名字）；其余 7 张是周表。
+CAMPUS_SHEETS = 8
 SUB_HEADERS = ("订单", "姓名", "地址", "电话", "周一", "周二", "周三",
                "周四", "周五", "周六", "周日", "类型", "餐种", "餐次")
 DAY_HEADERS = ("订单", "姓名", "地址", "电话", "餐种", "餐次")
@@ -22,12 +24,12 @@ def test_write_order_template_structure(tmp_path: Path):
     write_order_template(dest)
     wb = load_workbook(dest)
     assert wb.sheetnames == list(ORDER_SHEETS)
-    for name in ORDER_SHEETS[:6]:
+    for name in ORDER_SHEETS[:CAMPUS_SHEETS]:
         ws = wb[name]
         # 表头在第 2 行、共 14 列；标题行跨 A1:N1 合并。
         assert [ws.cell(2, c).value for c in range(1, 15)] == list(SUB_HEADERS)
         assert "A1:N1" in [str(m) for m in ws.merged_cells.ranges]
-    for name in ORDER_SHEETS[6:]:
+    for name in ORDER_SHEETS[CAMPUS_SHEETS:]:
         ws = wb[name]
         # 周表三区块标题 + 第 2 行两组 6 列表头。
         assert ws["A1"].value == "中餐"

@@ -387,6 +387,26 @@ def test_collaborator_zero_cell_is_not_overwritten():
     assert summarize_plan(plans)["skipped"] == 1
 
 
+def test_summarize_plan_counts_sheets_refused_by_the_batch_date_gate():
+    """被批次日期闸门拒绝的子表要在计划摘要里单独计数（``blocked``）。
+
+    拒绝本身不改任何格子（见 ``test_stale_batch_writes_nothing_and_records_nothing``），
+    但如果摘要里连"有几张表被拒绝"都不报，用户会以为这次只是"没有变更"。
+    """
+    cli = FakeCli(make_grid(BASE_HEADER, [{0: "张", 2: "111", 7: "3"}]))
+    wrong = [CloudOrder("东湖中餐", "张", "小", "111", "中餐", "经济", 6,
+                        weekday_marks=("周六",))]
+    blocked = build_plan(cli, local_orders={"东湖中餐": wrong},
+                         tables={"东湖中餐": {"file_id": "F1"}},
+                         target=dt.date(2026, 9, 11),  # 周五：与本地标记不符
+                         ledger=None, address_order={}, sort_enabled=True)
+    assert blocked[0].blocked_reason
+    assert summarize_plan(blocked)["blocked"] == 1
+
+    ok = _plan(cli, [CloudOrder("东湖中餐", "张", "小", "111", "中餐", "经济", 6)])
+    assert summarize_plan(ok)["blocked"] == 0
+
+
 def test_blocked_cell_with_nothing_else_to_write_makes_no_call(tmp_path):
     """日期格被协作者占用 + 总餐次已一致 → 一个写入接口都不调。"""
     led = SyncLedger(tmp_path / "state.json")
@@ -1341,7 +1361,8 @@ def test_summary_counts():
         Change("existing", "d", "4", 6, 6, 5, 6, 12, False, target_occupied="0"),
     ])]
     assert summarize_plan(plans) == {"to_update": 2, "to_append": 1,
-                                     "unchanged": 1, "warned": 0, "skipped": 1}
+                                     "unchanged": 1, "warned": 0, "skipped": 1,
+                                     "blocked": 0}
 
 
 def test_format_plan_mentions_missing_column():
@@ -1407,6 +1428,58 @@ def test_read_local_orders(tmp_path: Path):
 def test_read_local_orders_missing_file(tmp_path: Path):
     with pytest.raises(WpsCloudError):
         wc.read_local_orders(tmp_path / "nope.xlsx")
+
+
+def test_local_sheets_cover_the_hangdian_pair():
+    """本地排单表要读 8 张校区子表（含「杭电午餐/杭电晚餐」）。"""
+    assert wc.LOCAL_SHEETS == (
+        "东湖中餐", "衣锦中餐", "医学院中餐", "杭电午餐",
+        "东湖晚餐", "衣锦晚餐", "医学院晚餐", "杭电晚餐",
+    )
+
+
+def test_hangdian_local_sheet_plans_against_its_cloud_table(tmp_path: Path):
+    """杭电午餐有云端表就照常出计划；杭电晚餐没配云端表则**一个请求都不发**。"""
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "杭电午餐"
+    for col, title in ((1, "订单"), (2, "姓名"), (3, "地址"), (4, "电话"),
+                       (5, "周一"), (6, "周二"), (7, "周三"), (8, "周四"),
+                       (9, "周五"), (10, "周六"), (11, "周日"),
+                       (12, "类型"), (13, "餐种"), (14, "餐次")):
+        ws.cell(2, col, title)
+    ws.cell(3, 1, "W7")
+    ws.cell(3, 2, "陈木")
+    ws.cell(3, 3, "北门")
+    ws.cell(3, 4, "15058927816")
+    ws.cell(3, 5 + ["周一", "周二", "周三", "周四", "周五", "周六", "周日"].index("周五"), 1)
+    ws.cell(3, 12, "午餐")   # 杭电的类型列写「午餐」，与协作者云端表一致
+    ws.cell(3, 13, "经济")
+    ws.cell(3, 14, 1)
+    dinner = wb.create_sheet("杭电晚餐")
+    dinner.cell(2, 2, "姓名")
+    dinner.cell(3, 2, "晚餐人")
+    path = tmp_path / "排单.xlsx"
+    wb.save(path)
+
+    local = wc.read_local_orders(path)          # 默认 8 张子表
+    assert set(local) == {"杭电午餐", "杭电晚餐"}   # 只返回本地实际存在的子表
+    assert [o.name for o in local["杭电午餐"]] == ["陈木"]
+    assert local["杭电午餐"][0].meal_type == "午餐"
+    assert [o.name for o in local["杭电晚餐"]] == ["晚餐人"]
+
+    cli = FakeCli(make_grid(BASE_HEADER, []))
+    plans = build_plan(cli, local_orders=local,
+                       tables={"杭电午餐": {"file_id": "H1"}},
+                       target=dt.date(2026, 9, 11), run_date=dt.date(2026, 9, 10),
+                       ledger=None,
+                       address_order={"杭电午餐": ["北门", "东1门"]},
+                       sort_enabled=False)
+    assert [plan.sheet for plan in plans] == ["杭电午餐"]
+    assert [c.name for c in plans[0].changes] == ["陈木"]
+    # 杭电晚餐没有云端表 → 不产生计划（一次云端调用都不发）。
+    assert all(plan.sheet != "杭电晚餐" for plan in plans)
 
 
 def _local_workbook(path: Path, rows) -> Path:

@@ -11,6 +11,7 @@ from typing import Any, Callable
 from app.core.models import OrderInfo
 from app.order.parsing import (
     get_address_base_sheet_name,
+    get_hangdian_address_from_product_note,
     get_yijin_address_from_product_note,
     parse_meal_rows,
 )
@@ -99,9 +100,14 @@ def _order_from_api_data(code: str, data: dict[str, Any]) -> OrderInfo | None:
         for material in attr.get("material") or []:
             if isinstance(material, dict) and material.get("name"):
                 notes.append(str(material["name"]))
-    base = get_address_base_sheet_name(address)
+    notes_text = " ".join(notes)
+    # 规格（加料）参与校区判定：杭电客户的取餐点是在商品选项里选的，
+    # 地址可能是中英混写的长写法（实测 W7 是英文全称）。
+    base = get_address_base_sheet_name(address, notes_text)
     if base == "衣锦":
-        address = get_yijin_address_from_product_note(" ".join(notes))
+        address = get_yijin_address_from_product_note(notes_text)
+    elif base == "杭电":
+        address = get_hangdian_address_from_product_note(notes_text, address)
     metadata = {
         "order_id": str(data.get("id") or ""),
         "created_at": next((data.get(key) for key in

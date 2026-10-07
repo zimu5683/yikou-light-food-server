@@ -230,6 +230,89 @@ def test_rollback_warns_and_stops_when_a_delete_fails():
 
 
 # ----------------------------------------------------------------------
+# 回滚删除前的身份证明：删行按行号区间执行，混进别人的行就绝不能删
+# ----------------------------------------------------------------------
+def _plan_with_name_col() -> SheetPlan:
+    plan = _plan_obj()
+    plan.columns = {"name": 1, "address": 2, "phone": 3}
+    return plan
+
+
+def test_rollback_deletes_a_block_that_provably_holds_only_new_people():
+    """区间里只有本次新增的人（允许还没写完的空格）→ 证明通过，照常回滚。"""
+    cli = FakeCli(make_grid(BASE_HEADER, _existing_rows()))
+    cli.insert_rows("F1", 1, row=4, count=1)      # 先插一行，再把名字写进去
+    cli.write_cells("F1", 1, [{"row": 4, "col": 1, "value": "新人"}])
+    messages: list[str] = []
+
+    ok = _rollback_inserts(cli, _plan_with_name_col(), 1, [(4, 1)],
+                           messages.append, new_names={"新人"})
+
+    assert ok is True
+    assert cli.deleted_rows == [(4, 1)]
+    assert [cli.grid.get((r, 0)) for r in range(2, 5)] == ["老客户", "老客户二", None]
+    assert "新人" not in {v for (r, c), v in cli.grid.items() if c == 0}
+    assert any("已回滚 1 处插入" in m and "云端恢复原状" in m for m in messages)
+
+
+def test_rollback_refuses_when_the_block_holds_a_stranger():
+    """区间里出现了非本次新增的人（协作者的行被顶进来）→ **不删**，交人工核对。"""
+    grid = make_grid(BASE_HEADER, _existing_rows())
+    grid[(3, 0)] = "协作者的人"            # 第 4 行
+    cli = FakeCli(grid)
+    messages: list[str] = []
+
+    ok = _rollback_inserts(cli, _plan_with_name_col(), 1, [(4, 1)],
+                           messages.append, new_names={"新人"})
+
+    assert ok is False
+    assert cli.deleted_rows == [], "证明不过时绝不能删任何行"
+    assert cli.grid[(3, 0)] == "协作者的人"
+    assert any("非本次新增的人" in m and "人工核对" in m for m in messages)
+
+
+def test_rollback_refuses_when_the_new_people_moved_out_of_the_block():
+    """区间里已经没有本次新增的人（跑到别处去了）→ 表被重排过、行号不可信 → 不删。"""
+    grid = make_grid(BASE_HEADER, [{0: "老客户", 1: "小", 2: "111", 7: "3"}])
+    grid[(1, 0)] = "名字"                  # 表头
+    grid[(4, 0)] = "新人"                  # 第 5 行：本次新增的人跑到区间（第 4 行）之外
+    cli = FakeCli(grid)
+    messages: list[str] = []
+
+    ok = _rollback_inserts(cli, _plan_with_name_col(), 1, [(4, 1)],
+                           messages.append, new_names={"新人"})
+
+    assert ok is False
+    assert cli.deleted_rows == []
+    assert any("行号不再可信" in m for m in messages)
+
+
+def test_rollback_refuses_when_identity_cannot_be_proven_at_all():
+    """拿不到姓名列/读不到云端 → 证明不成立即为失败（宁留空行，不删错行）。"""
+    cli = FakeCli(make_grid(BASE_HEADER, _existing_rows()))
+    messages: list[str] = []
+
+    ok = _rollback_inserts(cli, _plan_obj(), 1, [(4, 1)],       # 没有 columns
+                           messages.append, new_names={"新人"})
+
+    assert ok is False
+    assert cli.deleted_rows == []
+    assert any("无法证明待删除行的身份" in m for m in messages)
+
+    def boom(file_id, ws, row_from, row_to, col_from, col_to, *, with_format=False):
+        raise WpsCloudError("模拟读取失败")
+
+    cli2 = FakeCli(make_grid(BASE_HEADER, _existing_rows()))
+    cli2.read_grid = boom  # type: ignore[method-assign]
+    messages2: list[str] = []
+    ok2 = _rollback_inserts(cli2, _plan_with_name_col(), 1, [(4, 1)],
+                            messages2.append, new_names={"新人"})
+    assert ok2 is False
+    assert cli2.deleted_rows == []
+    assert any("只读核对失败" in m for m in messages2)
+
+
+# ----------------------------------------------------------------------
 # README：新客户行写入失败 → 回滚，云端恢复原状
 # ----------------------------------------------------------------------
 def test_write_failure_rolls_back_inserted_rows():

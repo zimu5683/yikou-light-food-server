@@ -9,6 +9,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
 
+from app.core.config import _SSS_MAX_WORKERS_CEILING
 from app.integrations.api_client import SssApiClient
 from app.integrations.sss_url import canonical_sss_origin
 from app.order.common import _emit
@@ -65,6 +66,26 @@ from app.ordering.workbook import (
     expected_delivery_date,
     load_sss_orders,
 )
+
+#: 配置对象缺 ``sss_max_workers`` 字段（或取值无法解析）时的保守回退：串行。
+#: 正常路径上 ``AppConfig`` 始终带该字段（默认 4 路），因此这条只保护传了残缺
+#: config 的调用方——宁可慢，也不要在拿不准并发语义时同时发多个非幂等 POST。
+_FALLBACK_SSS_CREATE_WORKERS = 1
+
+
+def resolve_create_workers(config: Any) -> int:
+    """本批创建订单的并发路数：取配置值并夹到 ``[1, _SSS_MAX_WORKERS_CEILING]``。
+
+    1 = 串行（平台限流或对账压力大时的回退值）。
+    """
+    try:
+        workers = int(getattr(config, "sss_max_workers",
+                              _FALLBACK_SSS_CREATE_WORKERS))
+    except (TypeError, ValueError):
+        workers = _FALLBACK_SSS_CREATE_WORKERS
+    return max(1, min(_SSS_MAX_WORKERS_CEILING, workers))
+
+
 def _exclusive_sss_job(func: Callable[..., Any]) -> Callable[..., Any]:
     """同一进程内拒绝两个闪时送下单任务并发提交。"""
     @wraps(func)
@@ -175,13 +196,9 @@ def run_sss_job(config: Any, stop_event: Any,
     common_address = str(getattr(config, "sss_common_address", "") or "")
     use_fixed_address = bool(getattr(config, "sss_use_fixed_address", False))
     goods_name = str(getattr(config, "sss_product_name", "") or "轻食")
-    # 出厂并发 8（3.6.15 起）；旧配置的 4 由 AppConfig 的一次性迁移搬过来，
-    # 这里的 getattr 兜底只对「手工拼出来的 config」生效。
-    try:
-        max_workers = int(getattr(config, "sss_max_workers", 8))
-    except (TypeError, ValueError):
-        max_workers = 8
-    max_workers = max(1, min(20, max_workers))
+    # 出厂并发 4（v2 起）；旧配置里等于 3.6.15 出厂默认的 8 由 AppConfig 的
+    # 一次性迁移搬过来，用户显式改过的其它取值原样生效。
+    max_workers = resolve_create_workers(config)
     batch_id = uuid.uuid4().hex[:12]
     idempotency_field = str(getattr(config, "sss_idempotency_field", "") or _CLIENT_IDEMPOTENCY_FIELD).strip()
 

@@ -18,20 +18,25 @@ _CONFIG_SAVE_LOCK = threading.RLock()
 
 #: 出厂默认值的迁移版本号。`sss_max_workers` / `sss_read_timeout_s` 在界面上从来
 #: 没有入口，旧配置里保存的只可能是**当时的出厂默认**；直接改默认值对已有安装无效
-#: （`load()` 会把磁盘上的 4 / 20.0 原样读回来）。因此用这个版本号做**一次性**迁移：
+#: （`load()` 会把磁盘上的旧值原样读回来）。因此用这个版本号做**一次性**迁移：
 #: 只把仍等于旧出厂默认的取值搬到新默认，用户显式改过的其它取值（1 = 串行回退、
 #: 2、6、12、20…）一律保留。旧配置缺这个键 → 视为 0（迁移前）。
-DEFAULTS_REVISION = 1
+DEFAULTS_REVISION = 2
 
 #: v0 → v1：下单并发 4 → 8、读取超时 20 → 30 秒。
+#: v1 → v2：下单并发 8 → 4（读取超时 30 秒不变）。
 #: 并发依据：生产实测 4 路吞吐 0.44-0.48 单/秒 ≈ 4 ÷ 每单 8.4-9.2 秒——吞吐随并发
 #: 线性，说明平台没有按账号串行建单；4/8/16/32 路压测无排队、无限流、无 429。
-#: 超时依据：并发翻倍后单请求耗时会上升，而超时会被归类「已发送未知」并要求人工
-#: 只读核对，所以留出余量（仍远低于 120 秒上限）。
-_LEGACY_DEFAULT_SSS_MAX_WORKERS = 4
+#: v2 回到 4 路的依据：并发只影响"同时在建的单数"，4 路已达到该平台建单耗时的
+#: 吞吐上限附近，而更低的并发在平台偶发排队/限流时留下的余量更大；想回到 8 路
+#: 把 `sss_max_workers` 配成 8 即可（字段无界面入口，改 config.json 生效）。
+_LEGACY_DEFAULT_SSS_MAX_WORKERS = 8
 _LEGACY_DEFAULT_SSS_READ_TIMEOUT_S = 20.0
-_DEFAULT_SSS_MAX_WORKERS = 8
+_DEFAULT_SSS_MAX_WORKERS = 4
 _DEFAULT_SSS_READ_TIMEOUT_S = 30.0
+#: 并发路数上限（夹紧用）。平台是否按账号限流尚未验证，放开上限前先看
+#: ``design/SSS-对账提速与并发.md`` 的实测结论。
+_SSS_MAX_WORKERS_CEILING = 20
 
 # 本地排单子表 -> 云端排单表（WPS 云文档 file_id）。
 # 表名映射来自用户确认：本地「衣锦」= 云端「校门口」（云端表标题写的是「衣锦汇总」）。
@@ -40,6 +45,10 @@ DEFAULT_WPS_PRODUCTION_TABLES: Dict[str, Dict[str, str]] = {
     "东湖中餐": {"file_id": "fr2FrpFVMrM8poHaSHFK1xAsmSSBMspye"},
     "衣锦中餐": {"file_id": "amqzgcXVMrMWopCdyxkJrxnqzcQ8UbaJG"},
     "医学院中餐": {"file_id": "qvuPzdurK1MyKwL2weiZ1xF8RzdijFdaJ"},
+    # 杭电午餐9月.xlsx（协作者维护，2026-10-07 用 kdocs-cli 搜索确认）。
+    # 杭电晚餐暂不配置：店家还没开放晚餐（云端虽有《杭电晚餐9月.xlsx》，
+    # 但正式开放后确认再用同一行格式补上 file_id 即可）。
+    "杭电午餐": {"file_id": "bDV7kDE3nxMmpbLBEXvL1xeYd5SMMSTRn"},
     "东湖晚餐": {"file_id": "noJa93Xq9xM62hfVqj6UrxEmgLjAHmqka"},
     "衣锦晚餐": {"file_id": "mAc5hDw1q1MV33kW8JE7xxnnW1KEdYc1V"},
     "医学院晚餐": {"file_id": "PpnGwh9ERxMRByaRp2EHrxUgCDjP4kZpA"},
@@ -68,6 +77,9 @@ DEFAULT_ADDRESS_ORDER: Dict[str, list] = {
     "衣锦晚餐": ["外卖柜", "校门口"],
     "医学院中餐": [],
     "医学院晚餐": [],
+    # 杭电信工：两个取餐点，北门在前（用户 2026-10-07 确认）。
+    "杭电午餐": ["北门", "东1门"],
+    "杭电晚餐": ["北门", "东1门"],
 }
 
 
@@ -230,7 +242,7 @@ class AppConfig:
     # 门店 id 缓存：按门店名命中后跳过门店列表查询（门店几乎不变）。
     sss_store_id: int | None = None
     sss_store_name_cached: str = ""
-    # 批量下单并发 worker 数（1 = 串行，用于服务端限流时回退）。3.6.15 起出厂 8。
+    # 批量下单并发 worker 数（1 = 串行，平台限流或对账压力大时回退）。v2 起出厂 4。
     sss_max_workers: int = _DEFAULT_SSS_MAX_WORKERS
     # 闪时送 API 读取超时（秒）；慢响应不会被误判成失败。3.6.15 起出厂 30。
     sss_read_timeout_s: float = _DEFAULT_SSS_READ_TIMEOUT_S
@@ -344,7 +356,7 @@ class AppConfig:
             workers = int(sss_max_workers)
         except (TypeError, ValueError):
             workers = _DEFAULT_SSS_MAX_WORKERS
-        self.sss_max_workers = max(1, min(20, workers))
+        self.sss_max_workers = max(1, min(_SSS_MAX_WORKERS_CEILING, workers))
         try:
             read_timeout = float(sss_read_timeout_s)
         except (TypeError, ValueError):

@@ -22,7 +22,7 @@ from app.order.fetching import (
     parse_order_created_date, parse_target_date, split_refund_orders,
 )
 from app.order.excel_io import (
-    HISTORICAL_SHEET_HEADERS, PENDING_ADDRESS_HEADERS, SHEET_MEAL_SUFFIX, WEEKDAYS,
+    HISTORICAL_SHEET_HEADERS, PENDING_ADDRESS_HEADERS, WEEKDAYS,
     _MANUAL_CAMPUS_TO_BASE, _historical_sheet_name, _load_order_workbook,
     _manual_address_base_sheet, _pending_report_items, _prepare_order_address,
     _save_workbook_with_retry, _write_historical_order, _write_order, _write_unrouted_order,
@@ -338,12 +338,12 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
 
         total_to_write = len(certain_orders) + len(pending_orders)
         if historical_mode:
-            # 历史补单只追加到对应日期表，绝不能清空当前六张校区表。
+            # 历史补单只追加到对应日期表，绝不能清空当前各校区表。
             _emit(progress_callback,
                   f"历史补单模式（{selected_date.isoformat()}）：保留当前校区表，"
                   "仅追加到历史日期表")
         else:
-            # 每次写入前先清空六张校区子表第 2 行后的旧数据，避免新旧混排。
+            # 每次写入前先清空各校区子表第 2 行后的旧数据，避免新旧混排。
             # 清空失败必须整体中止，绝不继续追加后保存污染结果。
             try:
                 cleared = clear_campus_sub_sheets(wb)
@@ -353,7 +353,7 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
                       f"清空旧数据失败：{exc}；本轮不写入、不保存，原文件保持不变")
                 return
             if cleared:
-                _emit(progress_callback, "已清空六张校区子表旧数据")
+                _emit(progress_callback, f"已清空 {len(cleared)} 张校区子表旧数据")
 
         # 清空成功或历史模式后，逐单写入；写入途中若取消，同样放弃保存。
         for order in certain_orders:
@@ -509,7 +509,6 @@ __all__ = [
     "ORDER_STATE_REFUND_DONE",
     "OrderInfo",
     "PENDING_ADDRESS_HEADERS",
-    "SHEET_MEAL_SUFFIX",
     "WEEKDAYS",
     "_MANUAL_CAMPUS_TO_BASE",
     "_api_list_waimai_orders",
