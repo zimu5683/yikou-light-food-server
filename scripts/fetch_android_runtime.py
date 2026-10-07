@@ -72,11 +72,12 @@ PACKAGES: tuple[TermuxPackage, ...] = (
         name="proot",
         # 2026-09-23：Termux 把 5.1.107.92 从 pool 移除，旧 pin 直接 404 卡住 APK 构建。
         # 按 dists/stable/main/binary-aarch64/Packages 升到 .94，并重新冻结官方 SHA256。
-        # 2026-09-27：.94 同样被轮转掉（run 36295518213 再次 404）→ 升到 .95；
-        # SHA256 与官方索引 dists/stable/main/binary-aarch64/Packages 一致。
-        version="5.1.107.95",
-        filename="proot_5.1.107.95_aarch64.deb",
-        sha256="0a1b3d0f6ef76436c5ed924cd8e8f5a6b7186e99e1650eb2d9bc734e218a74cb",
+        # 2026-09-27：.94 同样被轮转掉（run 36295518213 再次 404）→ 升到 .95。
+        # 2026-10-08：.95 也被轮转掉（发布 v3.6.16 的构建 37661179771 再次 404）→ 升到 .96；
+        # SHA256 与官方索引一致，并与「本机独立下载 deb 后计算的 sha256」逐字一致。
+        version="5.1.107.96",
+        filename="proot_5.1.107.96_aarch64.deb",
+        sha256="8199dca06dccb693ec09fb1759e3e1ad08b4863f0c11c612f89c20bd9ecdc1a0",
         pool_group="p/proot",
         members={
             "data/data/com.termux/files/usr/bin/proot": PROOT_OUT,
@@ -85,11 +86,14 @@ PACKAGES: tuple[TermuxPackage, ...] = (
     ),
     TermuxPackage(
         name="libtalloc",
-        version="2.4.3",
-        filename="libtalloc_2.4.3_aarch64.deb",
-        sha256="ac81ad623d74c209718b9f3acb2dd702cc8a88c431e820d212229910b4db29da",
+        # 2026-10-08：2.4.3 随 proot 一起被轮转掉（同一构建 404）→ 升到 2.5.0；
+        # deb 内的文件名跟着 soname 从 libtalloc.so.2.4.3 变成 libtalloc.so.2.5.0，
+        # 打进 APK 后统一叫 libtalloc.so（proot 的 DT_NEEDED 由 patch_elf 改写）。
+        version="2.5.0",
+        filename="libtalloc_2.5.0_aarch64.deb",
+        sha256="556591f43bb773ad8777e1a29522640866a55f95dab71914418b94a8c58ad5a7",
         pool_group="libt/libtalloc",
-        members={"data/data/com.termux/files/usr/lib/libtalloc.so.2.4.3": TALLOC_OUT},
+        members={"data/data/com.termux/files/usr/lib/libtalloc.so.2.5.0": TALLOC_OUT},
     ),
     TermuxPackage(
         name="libandroid-shmem",
