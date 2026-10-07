@@ -49,6 +49,25 @@
 - `planned_summary.rows.blocked` = 被批次日期闸门整表拒绝的子表数（与 `summarize_plan`
   的 `blocked` 同口径），避免「整表被拒绝」在摘要里显示成「没有变更」。
 
+### 验证
+
+- `python -m pytest -q`：**1557 passed / 0 failed**（另有 1 xpassed）。
+- `ruff check`（CI 规则集）与 `compileall` 通过。
+- `pnpm test` 219 passed；`pnpm lint` 0 warning；`pnpm build` 与 `pnpm check:anchors`（18/18）通过。
+- 浏览器门禁（headless Chrome + CDP）：**250/250 PASS**，未预期页面异常 0（预期内 6 条见门禁白名单）。
+
+### 发布补记：Termux 运行时包轮转与 APK 出包结果
+
+- 首次出包（run 37661179771）在「下载并校验 Termux 运行时包」这一步 404 失败：Termux 轮转包版本
+  时把 `proot 5.1.107.95` 与 `libtalloc 2.4.3` 从 pool 移除（两个 URL 均已 404）。按官方索引
+  `dists/stable/main/binary-aarch64/Packages` 重新冻结：proot → `5.1.107.96`、
+  libtalloc → `2.5.0`（deb 内成员随 soname 变成 `libtalloc.so.2.5.0`，打进 APK 仍是 `libtalloc.so`），
+  `libandroid-shmem 0.7` 未变；两个新 sha256 与「本机独立下载 deb 后计算的值」逐字一致，
+  并用脚本自身的解包函数确认三个包的成员路径都还能取出。curl.se 的 CA bundle 冻结值本次复核仍匹配
+  （`a41b5d35…0505`，188900 字节），未改动。
+- pin 修好后 run 37662427326 出包成功：**Release v3.6.16 已发布**
+  （APK 19,824,521 字节，sha256 `995c114a…af48`，内嵌 versionName 3.6.16）。
+
 ## 3.6.15
 
 一次以「提速」为主的版本：闪时送对账不再翻全量历史、下单并发翻倍；云同步预览去掉两类非风险提示。
