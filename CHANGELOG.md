@@ -72,6 +72,20 @@
   （本机 Android 运行时装不了 ruff 的 wheel，ruff 门禁以 CI 结果为准）。
 - 未改动前端；`git diff --check` 无空白错误。
 
+### 发布补记：CI 验证与出包结果
+
+- main 推送后 CI 全绿：Tests **1587 passed / 1 xpassed**（Python 3.11 与 3.13 各一遍，
+  含 `ruff check app tests scripts`「All checks passed!」、前端构建/lint/浏览器门禁与
+  Workspace hygiene），Android APK（main）出包成功。
+- tag `v3.6.17` 触发的发布流水线（run 37723744276）成功：**Release v3.6.17 已发布**，
+  APK `yikou-light-food-3.6.17-arm64.apk` **19,832,197 字节**，sha256
+  `3901b71d…68f610`（资产内 `.sha256` 与出包日志一致）。相关 run：Tests 37723655053、
+  Android APK（main）37723654958。
+- 本机网络对 `github.com:443` 超时（`git push` 不可用），本次提交与标签改走
+  `api.github.com` 的 Git Data API 镜像：按本地对象逐个建 blob/tree/commit/tag，
+  每一步都比对 SHA，远端 `refs/heads/main` = `1fd9cfe`、tag 对象 `edcea13f`
+  与本地逐字一致。仅影响推送通道，不改动仓库内容。
+
 ## 3.6.16
 
 一次「与桌面版（`yikou-light-food-desktop` v3.6.1）对齐」的版本：补齐杭电信工校区，
