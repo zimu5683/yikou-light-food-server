@@ -41,6 +41,8 @@ logs/
 *.suo
 .DS_Store
 Thumbs.db
+# ZCode 编码工具的忽略文件：由 .gitignore 自动同步生成，机器本地文件不入库
+.zcodeignore
 
 # Diagnostic artifacts / business data (never commit)
 .zcode/

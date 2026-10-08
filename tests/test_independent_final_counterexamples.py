@@ -256,9 +256,17 @@ def test_ambiguous_2xx_is_uncertain_not_explicit_failure():
     with pytest.raises(sss_submission._SubmissionUncertain):
         sss_submission._check_success({"success": False})
 
-    # 明确的 success=false + message/code 才允许走显式拒绝（discard 路径）。
+    # 只有可识别的参数校验拒绝才允许走显式拒绝（discard 路径）；
+    # 泛化文案（"参数错误"）与技术异常同样不能证明事务已回滚。
+    for payload in ({"success": False, "message": "参数错误"},
+                    {"success": False, "message": "操作失败", "code": 500},
+                    {"success": False,
+                     "message": "java.lang.IndexOutOfBoundsException: Index: 0"}):
+        with pytest.raises(sss_submission._SubmissionUncertain):
+            sss_submission._check_success(payload)
+
     with pytest.raises(sss_submission._ExplicitRejection):
-        sss_submission._check_success({"success": False, "message": "参数错误"})
+        sss_submission._check_success({"success": False, "message": "地址无效"})
 
 
 def test_malformed_transport_is_wrapped_as_uncertain():

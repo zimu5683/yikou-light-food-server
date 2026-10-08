@@ -6,8 +6,12 @@
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import random
+import re
+import secrets
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -21,6 +25,16 @@ from app.integrations.sss_url import canonical_sss_origin
 class ApiError(RuntimeError):
     """纯接口模式下请求失败或响应异常时抛出。"""
 
+    def __init__(self, message: str, *, diagnostics: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics = dict(diagnostics or {})
+
+
+class _SssApiResponse(dict[str, Any]):
+    def __init__(self, payload: dict[str, Any], diagnostics: dict[str, Any]) -> None:
+        super().__init__(payload)
+        self.diagnostics = diagnostics
+
 
 AUTH_ERROR_CODES = {401, 10000}
 AUTH_MESSAGE_KEYWORDS = (
@@ -30,13 +44,54 @@ AUTH_MESSAGE_KEYWORDS = (
 )
 
 
+_DIAGNOSTIC_KEY = secrets.token_bytes(32)
+
+
+def _context_digest(value: Any) -> str:
+    material = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return hmac.new(_DIAGNOSTIC_KEY, material, hashlib.sha256).hexdigest()[:16]
+
+
+_INTERNAL_ERROR_RE = re.compile(
+    r"\b(?:[a-z_$][\w$]*\.)*(?:[a-z_$][\w$]*)?(?:exception|error)\b"
+    r"|\b(?:stack\s*trace|traceback|internal\s+server\s+error)\b"
+    r"|系统异常|系统错误|服务异常|服务错误|服务器异常|服务器错误|内部异常|内部错误",
+    re.IGNORECASE,
+)
+
+
+def is_internal_error_payload(payload: Any) -> bool:
+    """技术异常即使包装为 success=false，也不能证明非幂等请求没有副作用。"""
+    if not isinstance(payload, dict):
+        return False
+    details = [str(payload.get(key) or "") for key in ("message", "msg")]
+    for key in ("exception", "exceptionClass", "exceptionType", "stackTrace", "traceback"):
+        if payload.get(key):
+            return True
+    details.append(str(payload.get("error") or ""))
+    return bool(_INTERNAL_ERROR_RE.search(" ".join(details)))
+
+
+def is_server_error_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    for key in ("code", "errorCode", "error_code"):
+        try:
+            if 500 <= int(payload.get(key)) <= 599:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def is_auth_expired_payload(payload: Any) -> bool:
     """Return True when a Sss JSON payload means "login expired".
 
     The platform currently uses HTTP 200 + ``code=10000`` with
     ``message="token失效，请重新登陆"``, so HTTP status alone is not enough.
     """
-    if not isinstance(payload, dict):
+    if (not isinstance(payload, dict) or is_internal_error_payload(payload)
+            or is_server_error_payload(payload)):
         return False
     try:
         code = int(payload.get("code"))
@@ -411,10 +466,10 @@ class SssApiClient:
         return session
 
     def fork(self) -> "SssApiClient":
-        """为并发 worker 创建独立 Session 的克隆（共享 token）。
+        """克隆登录上下文，但每个 worker 的 Session 与 CookieJar 保持独立。
 
-        ``requests.Session`` 非线程安全，多线程下单时每个 worker 必须用
-        自己的 Session；token 字符串共享即可，401 后由主线程统一重登。
+        ``requests.Session`` 非线程安全；复制 token、请求头和 Cookie，
+        401 后由主线程统一重登，再创建新 worker。
         """
         clone = SssApiClient.__new__(SssApiClient)
         clone.origin = self.origin
@@ -423,6 +478,8 @@ class SssApiClient:
         clone.timeout = self.timeout
         clone.pool_size = 1
         clone.session = clone._new_session(clone.pool_size)
+        clone.session.headers.update(self.session.headers)
+        clone.session.cookies.update(self.session.cookies)
         clone.token = self.token
         return clone
 
@@ -480,7 +537,15 @@ class SssApiClient:
     def _request(self, method: str, path: str, body: Any = None) -> dict[str, Any]:
         headers = {"Content-Type": "application/json"}
         if self.token:
-            headers["token"] = self.token
+            headers.update({"token": self.token, "terminal": "web"})
+        terminal = headers.get("terminal") or self.session.headers.get("terminal")
+        cookies = sorted((cookie.domain, cookie.path, cookie.name, cookie.value)
+                         for cookie in self.session.cookies)
+        diagnostics = {
+            "auth_context": _context_digest(self.token),
+            "cookie_context": _context_digest(cookies),
+            "terminal": "web" if terminal == "web" else ("present" if terminal else "absent"),
+        }
         try:
             resp = self.session.request(
                 method,
@@ -490,26 +555,39 @@ class SssApiClient:
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
-            raise SssTransportError(f"接口 {path} 请求失败：{exc}") from exc
+            raise SssTransportError(f"接口 {path} 请求失败：{exc}",
+                                    diagnostics=diagnostics) from exc
+        prepared = getattr(resp, "request", None)
+        wire_body = getattr(prepared, "body", None)
+        if isinstance(wire_body, str):
+            wire_body = wire_body.encode("utf-8")
+        if isinstance(wire_body, bytes):
+            diagnostics["wire_digest"] = hashlib.sha256(wire_body).hexdigest()[:16]
 
         # 401 有明确的恢复路径，即便反向代理返回 HTML 也必须先让上层统一
         # 重登；否则会被误分类成“状态不确定”，既不能恢复又容易误导日志。
+        diagnostics["http_status"] = resp.status_code
         if resp.status_code == 401:
-            raise ApiError("闪时送登录态已失效（接口 401），请重新登录")
+            raise ApiError("闪时送登录态已失效（接口 401），请重新登录",
+                           diagnostics=diagnostics)
 
         # 对非幂等 POST 来说，限流/服务端错误同样无法证明服务端没有落库。
         # 不解析成普通业务失败，交给上层按订单列表对账后再决定是否补发。
-        if method.upper() == "POST" and resp.status_code in self.RETRYABLE_STATUS:
-            raise SssTransportError(f"接口 {path} 返回 HTTP {resp.status_code}")
+        if method.upper() == "POST" and (resp.status_code == 429 or resp.status_code >= 500):
+            raise SssTransportError(f"接口 {path} 返回 HTTP {resp.status_code}",
+                                    diagnostics=diagnostics)
 
         try:
             payload = resp.json()
         except ValueError as exc:
             raise SssTransportError(
-                f"接口 {path} 返回非 JSON（HTTP {resp.status_code}）") from exc
+                f"接口 {path} 返回非 JSON（HTTP {resp.status_code}）",
+                diagnostics=diagnostics) from exc
 
         if is_auth_expired_payload(payload):
-            raise ApiError(auth_error_message(payload))
+            raise ApiError(auth_error_message(payload), diagnostics=diagnostics)
+        if isinstance(payload, dict):
+            return _SssApiResponse(payload, diagnostics)
         return payload
 
     def get_json(self, path: str) -> dict[str, Any]:

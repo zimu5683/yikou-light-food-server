@@ -241,7 +241,7 @@ def _collect_tasks(orders_by_sheet: dict[str, list[dict[str, Any]]],
         is_dinner = sheet_name == "晚餐"
         expected_time = compute_delivery_time(is_dinner, now)
         for order in orders:
-            identifier = f"第 {order['row']} 行 {order.get('name') or '未填写'}"
+            identifier = f"{sheet_name}第 {order['row']} 行 {order.get('name') or '未填写'}"
             fingerprint = _payload_fingerprint(
                 build_order_payload(order, is_dinner, store_id, address, goods_name,
                                     expected_time=expected_time),

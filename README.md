@@ -95,6 +95,9 @@ GitHub Secrets 配置 `YIKOU_KEYSTORE_FILE` / `YIKOU_KEYSTORE_PASSWORD` / `YIKOU
 读取超时 30 秒（配置字段 `sss_max_workers` / `sss_read_timeout_s`，界面暂无入口），
 每轮提交后会打一行「本轮提交 N 单…每单平均 Y 秒（吞吐 Z 单/秒）」用于判断平台是否在建单上排队。
 取舍与实测见 [design/SSS-对账提速与并发.md](design/SSS-对账提速与并发.md)。
+部分下单失败、单单重试成功的排查与脱敏诊断说明见
+[docs/SSS-下单失败与重试排查.md](docs/SSS-下单失败与重试排查.md)；Java 内部异常
+不等于确定未落单，不会据此直接重发。
 
 ## 项目结构
 

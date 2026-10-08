@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from threading import Lock, local
@@ -10,14 +11,18 @@ from typing import Any, Callable
 
 from app.integrations.api_client import (
     ApiError, SssApiClient, SssTransportError,
-    auth_error_message, is_auth_expired_payload,
+    auth_error_message, is_auth_expired_payload, is_internal_error_payload,
+    is_server_error_payload,
 )
 from app.order.common import _emit
 from app.ordering.common import _trace
+from app.ordering.diagnostics import (
+    diagnostic_log_path, payload_digest, submission_diagnostic,
+    write_submission_diagnostic,
+)
 from app.ordering.fingerprint import _task_fingerprint
 from app.ordering.constants import (
     _ACCOUNT_PATH,
-    _BALANCE_KEYWORDS,
     _BATCH_CLOCK_SKEW_S,
     _CREATE_ORDER_PATH,
     _PREFILTER_ZERO_RETRY_DELAY_S,
@@ -30,7 +35,23 @@ from app.ordering.models import (
 )
 from app.ordering.reconcile import _merge_reconciliation, _safe_reconcile
 class _ExplicitRejection(LookupError):
-    """平台明确拒绝且给出 message/code：有充分依据认为该单未落单。"""
+    """平台返回可识别的参数校验拒绝，允许在只读对账后决定是否重试。"""
+
+
+_VALIDATION_REJECTION_RE = re.compile(
+    r"^(?:(?:操作失败|下单失败|创建失败)[!！,，:：\s]*)?"
+    r"(?:地址无效|(?:收货|收件)?地址(?:不能为空|不完整|格式错误)"
+    r"|(?:手机号|手机号码|电话|收件电话)(?:无效|不合法|格式错误|不能为空)"
+    r"|(?:姓名|收件姓名|门牌号|商品名称|商品数量|预约时间|送达时间|门店)"
+    r"(?:不能为空|未填写|必填))[!！。.,，\s]*$"
+)
+_BALANCE_REJECTION_RE = re.compile(
+    r"^(?:(?:账户|帐户|账号|当前|可用)\s*)?余额不足"
+    r"(?:[，,。.!！\s]*(?:请)?充值)?[。.!！\s]*$"
+    r"|^欠费(?:停服)?[。.!！\s]*$"
+    r"|^(?:insufficient\s+balance|balance\s+(?:is\s+)?insufficient)[.!\s]*$",
+    re.IGNORECASE,
+)
 
 
 def _balance_precheck(tasks: list[dict[str, Any]], total: float | None,
@@ -67,42 +88,39 @@ def _preflight_tasks(tasks: list[dict[str, Any]],
 
 
 def _check_success(resp: Any) -> None:
-    """把下单响应分成：明确成功 / 明确拒绝 / 结果不确定三类。
+    """只有明确成功、登录拒绝或可识别的校验拒绝才能离开未知状态。
 
-    只有明确 success 才放行；``success=false`` 且有 message/code 才视为
-    “有充分依据确认未落单”的显式拒绝。空对象、空数组、缺 success 字段、
-    code-only、畸形/未知格式都视为已发送未知，保留 prewrite，交给只读对账，
-    绝不能 discard 后自动重发。
+    success=false、错误码、Java 异常都不能证明事务已回滚；不认识的失败
+    保留前置记录，仅做只读对账，不能据此重发非幂等 POST。
     """
     if not isinstance(resp, dict):
         raise _SubmissionUncertain(
-            "平台 2xx 响应格式未知（无法确认下单结果）："
-            + json.dumps(resp, ensure_ascii=False, default=str)[:200])
+            "平台响应格式未知，无法确认下单结果")
+    message = str(resp.get("message") or resp.get("msg") or "").strip()
+    if is_internal_error_payload(resp):
+        exception = re.search(r"\b(?:java|javax|org|com)\.[\w.]*(?:Exception|Error)\b", message)
+        detail = f"：{exception.group(0)}" if exception else ""
+        raise _SubmissionUncertain(f"平台内部异常，无法确认是否落单{detail}")
+    if is_server_error_payload(resp):
+        raise _SubmissionUncertain("平台返回服务端错误，无法确认是否落单")
     if is_auth_expired_payload(resp):
-        raise _AuthExpired(auth_error_message(resp, fallback="平台 2xx 响应表示登录态失效"))
+        raise _AuthExpired(auth_error_message(resp, fallback="平台响应表示登录态失效"))
     success = resp.get("success")
     if success is True or (isinstance(success, int) and not isinstance(success, bool)
                            and success == 1):
         return
-    message = str(resp.get("message") or resp.get("msg") or "")
-    lowered = message.lower()
-    if any(kw.lower() in lowered or (kw in message) for kw in _BALANCE_KEYWORDS):
-        raise _BalanceDepleted(message or json.dumps(resp, ensure_ascii=False)[:200])
     if success is False:
+        if _BALANCE_REJECTION_RE.fullmatch(message):
+            raise _BalanceDepleted(message)
+        if _VALIDATION_REJECTION_RE.fullmatch(message):
+            raise _ExplicitRejection(message)
         code = resp.get("code")
         if code in (None, ""):
             code = resp.get("errorCode") or resp.get("error_code")
-        has_code = code not in (None, "", 0, "0")
-        if message.strip() or has_code:
-            detail = message.strip() or f"平台明确拒绝（code={code}）"
-            raise _ExplicitRejection(detail)
-        # success=false 但没有任何 message/code：证据不足，不能确定未落单。
-        raise _SubmissionUncertain(
-            "平台返回 success=false 但缺少 message/code，无法确认是否落单")
+        detail = f"（code={code}）" if re.fullmatch(r"[0-9]{1,6}", str(code)) else ""
+        raise _SubmissionUncertain(f"平台返回失败，但无法证明未落单{detail}")
     raise _SubmissionUncertain(
-        "平台 2xx 响应缺少明确 success 字段，无法确认下单结果："
-        + json.dumps(resp, ensure_ascii=False, default=str)[:200]
-    )
+        "平台响应缺少明确 success 字段，无法确认下单结果")
 
 
 def _is_auth_expired(exc: BaseException) -> bool:
@@ -112,6 +130,8 @@ def _is_auth_expired(exc: BaseException) -> bool:
     因此不能只看 401。
     """
     text = str(exc)
+    if is_internal_error_payload({"message": text}):
+        return False
     lowered = text.lower()
     keywords = (
         "401", "code=10000", "code: 10000", "code:10000",
@@ -147,9 +167,12 @@ def _post_one(client: Any, payload: dict[str, Any]) -> dict[str, Any]:
     except _AuthExpired:
         raise
     except ApiError as exc:
-        if _is_auth_expired(exc):
-            raise _AuthExpired(str(exc)) from exc
-        raise _SubmissionUncertain(str(exc)) from exc
+        if not isinstance(exc, SssTransportError) and _is_auth_expired(exc):
+            wrapped = _AuthExpired(str(exc))
+        else:
+            wrapped = _SubmissionUncertain(str(exc))
+        wrapped.diagnostics = dict(getattr(exc, "diagnostics", {}) or {})
+        raise wrapped from exc
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
         raise _SubmissionUncertain(detail) from exc
@@ -202,6 +225,7 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
     in_flight: dict[Any, dict[str, Any]] = {}
     stop_closed = False
     latencies: list[float] = []
+    diagnostic_records: dict[str, dict[str, Any]] = {}
 
     def halted() -> bool:
         return bool(stop_event.is_set() or result.auth_error or result.balance_error)
@@ -210,15 +234,22 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
         if stop_event.is_set():
             return task["identifier"], "stopped", ""
         started = time.perf_counter()
+        started_at = time.time()
+        request_digest = payload_digest(task["payload"])
+        response: Any = None
+        transport: dict[str, Any] = {}
         try:
-            _check_success(submit(task["payload"]))
+            response = submit(task["payload"])
+            _check_success(response)
         except _AuthExpired as exc:
+            transport = dict(getattr(exc, "diagnostics", {}) or {})
             state, detail = "auth", str(exc)
         except _BalanceDepleted as exc:
             state, detail = "balance", str(exc)
         except _ExplicitRejection as exc:
             state, detail = "failure", str(exc)
         except (_SubmissionUncertain, SssTransportError) as exc:
+            transport = dict(getattr(exc, "diagnostics", {}) or {})
             state, detail = "uncertain", str(exc)
         except Exception as exc:
             # 非幂等 POST 一旦调用出去，非显式拒绝的异常一律是“已发送未知”；
@@ -229,6 +260,9 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
         elapsed = time.perf_counter() - started
         # list.append 在 CPython 下是原子的；这里只做统计，不参与任何判定。
         latencies.append(elapsed)
+        diagnostic_records[task["identifier"]] = submission_diagnostic(
+            task, response, started_at=started_at, elapsed_s=elapsed, state=state,
+            payload_hash=request_digest, transport=transport)
         _trace(f"POST {task['identifier']}: {elapsed:.2f}s -> {state}")
         return task["identifier"], state, detail
 
@@ -259,6 +293,16 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
                     identifier, state, detail = future.result()
                 except Exception as exc:  # pragma: no cover - run_one already contains errors
                     identifier, state, detail = task["identifier"], "uncertain", str(exc)
+                diagnostic = diagnostic_records.pop(identifier, None)
+                if diagnostic is not None:
+                    diagnostic["workers"] = workers
+                    try:
+                        write_submission_diagnostic(diagnostic)
+                    except Exception as exc:
+                        _emit(callback, f"提交诊断记录写入失败（{type(exc).__name__}），"
+                                        "订单仍按前置记录与只读对账处理")
+                    if state != "success":
+                        _emit(callback, f"提交诊断：{json.dumps(diagnostic, ensure_ascii=False, sort_keys=True)}")
                 if state == "success":
                     result.succeeded.add(identifier)
                     if len(result.succeeded) % _PROGRESS_EVERY_N == 0:
@@ -284,6 +328,8 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
                 result.not_sent.add(task["identifier"])
         result.stopped = bool(result.stopped or stop_event.is_set())
     _emit_round_summary(callback, latencies, started_at, read_timeout_s)
+    if latencies:
+        _emit(callback, f"脱敏提交诊断日志：{diagnostic_log_path()}")
     return result
 
 
@@ -447,6 +493,20 @@ def _run_reconciled_submission(
         auth_ids.update(round_result.auth)
         balance_ids.update(round_result.balance)
         success_ids.update(round_result.succeeded)
+        for identifier in round_result.succeeded:
+            failure_ids.discard(identifier)
+            not_sent_ids.discard(identifier)
+            auth_ids.discard(identifier)
+            balance_ids.discard(identifier)
+            state["errors"].pop(identifier, None)
+        _sync_outcome()
+
+    def _mark_confirmed(reconciliation: _Reconciliation) -> None:
+        confirmed = reconciliation.confirmed
+        for identifiers in (uncertain_ids, failure_ids, not_sent_ids, auth_ids, balance_ids):
+            identifiers.difference_update(confirmed)
+        for identifier in confirmed:
+            state["errors"].pop(identifier, None)
         _sync_outcome()
 
     def _persist_uncertain(round_result: _SubmitResult) -> None:
@@ -479,6 +539,7 @@ def _run_reconciled_submission(
             _sync_outcome()
 
     def _resolve_confirmed_uncertain(reconciliation: _Reconciliation) -> None:
+        _mark_confirmed(reconciliation)
         if uncertain_clear is None or not journal_ids:
             return
         confirmed = {identifier for identifier in journal_ids
@@ -635,6 +696,7 @@ def _run_reconciled_submission(
             return _merge_reconciliation(preconfirmed, after_login), True
         # 重登后对账确认的订单也要计入最终 confirmed，否则 created 数会少算。
         preconfirmed.update(after_login.confirmed)
+        _resolve_confirmed_uncertain(after_login)
         current = list(after_login.missing)
         allowed = auth_ids | not_sent_ids | failure_ids
         resend = [

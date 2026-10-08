@@ -1287,7 +1287,7 @@ def discard_uncertain_records(path: str | os.PathLike[str], key: str,
                               *, note: str = "", actor: str = "") -> int:
     """有充分证据证明 POST 未落单时关闭记录，避免误阻断后续运行。
 
-    仅用于明确 401/余额不足/显式 success=false/从未派发等“未发送”证据。
+    仅用于明确 401/余额不足/可识别的参数校验拒绝/从未派发等证据。
     resolved 只用于站内只读对账确认；discarded 记录保留审计但不参与阻断。
     """
     target = Path(path)

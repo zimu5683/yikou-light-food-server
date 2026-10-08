@@ -30,7 +30,9 @@ from app.ordering.models import OrderFingerprint
 
 @pytest.fixture(autouse=True)
 def _isolated_authoritative_state(tmp_path, monkeypatch):
-    # 每个测试独立的权威共享 journal / 旧默认目录，避免真实用户目录和测试间串扰。
+    monkeypatch.setenv("YIKOU_SSS_AUTHORITATIVE_ROOT", str(tmp_path / "authority-root"))
+    monkeypatch.setenv("YIKOU_SSS_AUTHORITY_LOCATIONS", str(tmp_path / "authority-locations.json"))
+    monkeypatch.delenv("YIKOU_SSS_UNCERTAIN_PATH", raising=False)
     monkeypatch.setenv("YIKOU_DATA_DIR", str(tmp_path / "userdata"))
     monkeypatch.setenv("YIKOU_SSS_LOCK_ROOT", str(tmp_path / "locks"))
     monkeypatch.setenv(
@@ -127,7 +129,7 @@ def test_timeout_uncertain_not_resent_after_other_task_gets_401():
     assert calls == ["t0", "t1", "t1"], calls
     assert relogins == [True]
     assert outcome["uncertain"] == ["t0"]
-    assert outcome["auth"] == ["t1"]
+    assert outcome["auth"] == []
     assert outcome["success_responses"] == ["t1"]
     assert final is not None and "t0" in {item["identifier"] for item in final.missing}
     assert reconciled is True
@@ -153,7 +155,7 @@ def test_explicit_failure_can_retry_only_after_readonly_reconcile():
     def submit(payload):
         calls.append(payload["tag"])
         if len(calls) == 1:
-            return {"success": False, "message": "boom"}
+            return {"success": False, "message": "地址无效"}
         on_site.append({**station_record, "created_at": int(time.time() * 1000)})
         return {"success": True}
 
@@ -171,7 +173,7 @@ def test_explicit_failure_can_retry_only_after_readonly_reconcile():
         max_workers=1)
 
     assert calls == ["t0", "t0"]
-    assert decisions == [("t0", "boom")]
+    assert decisions == [("t0", "地址无效")]
     assert reconciled is True
     assert final is not None and final.confirmed == {"t0"}
     assert final.missing == []
@@ -1938,11 +1940,10 @@ def test_check_success_ambiguous_2xx_is_uncertain():
             sss._check_success(response)
     # 1 在平台上等价于明确成功，可以放行；其余未知 truthy 格式保持不确定。
     sss._check_success({"success": 1})
-    # 有 message 的 success=false 才是明确拒绝，不能当 uncertain。
     try:
-        sss._check_success({"success": False, "message": "boom"})
+        sss._check_success({"success": False, "message": "地址无效"})
     except sss._SubmissionUncertain:
-        raise AssertionError("显式 success=false + message 不应视为不确定")
+        raise AssertionError("可识别的参数校验拒绝不应视为不确定")
     except LookupError:
         pass
     else:

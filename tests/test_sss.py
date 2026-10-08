@@ -14,6 +14,9 @@ from app.ordering import submission as sss_submission
 
 @pytest.fixture(autouse=True)
 def _isolated_authoritative_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("YIKOU_SSS_AUTHORITATIVE_ROOT", str(tmp_path / "authority-root"))
+    monkeypatch.setenv("YIKOU_SSS_AUTHORITY_LOCATIONS", str(tmp_path / "authority-locations.json"))
+    monkeypatch.delenv("YIKOU_SSS_UNCERTAIN_PATH", raising=False)
     monkeypatch.setenv("YIKOU_DATA_DIR", str(tmp_path / "userdata"))
     monkeypatch.setenv("YIKOU_SSS_LOCK_ROOT", str(tmp_path / "locks"))
     monkeypatch.setenv(
@@ -296,7 +299,7 @@ def test_submit_tasks_concurrent_reports_failures():
 
     def submit(payload):
         if payload["i"] == 2:
-            return {"success": False, "message": "boom"}
+            return {"success": False, "message": "地址无效"}
         return {"success": True}
 
     class Stop:
@@ -305,7 +308,7 @@ def test_submit_tasks_concurrent_reports_failures():
 
     result = sss._submit_tasks_concurrent(tasks, submit, Stop(), None, max_workers=2)
     assert result.succeeded == {"t0", "t1", "t3"}
-    assert result.failures == [("t2", "boom")]
+    assert result.failures == [("t2", "地址无效")]
 
 
 def test_submit_tasks_concurrent_auth_expired_aborts():
@@ -1549,8 +1552,8 @@ def test_collect_tasks_reuses_stable_client_request_id_on_retry():
 @pytest.mark.parametrize("payload", [
     {"success": False, "message": "token失效，请重新登陆", "code": 10000},
     {"success": False, "message": "登录态失效，请重新登录", "code": 10000},
-    {"success": False, "message": "TOKEN INVALID", "code": 500},
-    {"success": False, "message": "Unauthorized", "code": 500},
+    {"success": False, "message": "TOKEN INVALID", "code": 401},
+    {"success": False, "message": "Unauthorized", "code": 401},
 ])
 def test_sss_client_detects_auth_expired_payload(payload):
     from app.integrations.api_client import ApiError, SssApiClient
