@@ -3,6 +3,75 @@
 只记录**已发布**的版本；开发过程资料见 `design/archive/`（历史，含逐轮迭代日志），
 当前手册与规则见 `README.md` 与 `docs/`。
 
+## 3.6.17
+
+一次「落单证据收紧 + 可取证」的版本：闪时送下单失败不再凭错误文字认定事务已回滚，
+提交诊断改为脱敏 JSONL，并修复跨餐任务标识与工作线程登录上下文两处缺陷。
+现场事实、离线复现与报文核对见 [docs/SSS-下单失败与重试排查.md](docs/SSS-下单失败与重试排查.md)。
+
+### 闪时送：失败分类收紧（技术异常不再可重发）
+
+- **内部异常不算“明确拒绝”**：响应体里带 Java 异常/堆栈（`exception` 字段或 message
+  含 `…Exception`/`…Error`/`系统异常` 等）一律保持“已发送未知”，只做只读对账，
+  不再进入“可以直接补发”的人工重试决策；仅有错误码、或 `success=false` 带泛化
+  文案（如“参数错误”“系统繁忙”）同样不确定。
+- **服务端错误码不算业务失败**：`success=false` 且 `code`/`errorCode` 在 500–599，
+  以及 POST 收到 HTTP 429 与**全部 5xx**（原先是固定集合 429/500/502/503/504）
+  都归类为不确定，保留前置记录。
+- **显式拒绝改为白名单**：只有可识别的参数校验拒绝（地址无效 / 地址必填 / 手机号
+  无效 / 姓名、门牌号、商品等必填缺失）才判“明确未落单”，对账后可单单重试；
+  余额不足（`余额不足` / `欠费` / `insufficient balance`）单独识别为余额类。
+- **内部异常不再误判为登录失效**：`token` 字样出现在 Java 异常文本里时不再触发
+  重登路径（401 恢复只认真正的登录态失效报文），测试里的同类用例同步改为 401。
+
+### 闪时送：跨餐任务标识冲突
+
+- 任务标识从「第 N 行 姓名」改为含子表名（`午餐第 63 行 姓名`）。原先午餐、晚餐
+  同行同名共用一个标识，会共用 `task_by_id` 与状态集合，可能把另一餐的成功当作
+  本餐确认、或清掉另一餐的未决记录；客户端 `client_request_id` 生成材料未变，
+  历史 journal 仍按原 UUID 核对。
+
+### 闪时送：工作线程补登录上下文与请求头
+
+- `fork()` 除 token 外现在复制登录 Session 的请求头与 Cookie，每个 worker 仍有独立
+  Session/CookieJar（不跨线程共享可变会话）；建单请求补 `terminal: web` 头，与网页端
+  请求拦截器一致（它是 HTTP header，不是 JSON 字段）。
+- 恢复已确认/重试成功后清除该单的失败计数与错误文案，不再同时报“已确认”和旧失败；
+  重登后对账确认的订单一并计入最终 confirmed。
+
+### 新增：脱敏提交诊断
+
+- 每次真实提交写一条 JSONL 到用户数据目录 `sss-diagnostics/YYYY-MM-DD.jsonl`（目录
+  0700、文件 0600、`O_NOFOLLOW`）：批次/本地请求标识、餐次与行号、开始时间、耗时、
+  并发路数、分类、HTTP 状态、响应 `success`/`code`、技术异常类名，以及请求 payload
+  与实际发出 HTTP body 的 sha256 前 16 位摘要。
+- **不保存**凭据、姓名、手机号、地址、原始请求体或响应正文；token 与 Cookie 只记录
+  用进程内随机密钥生成的 HMAC 上下文摘要（仅用于同一进程内比较是否变化）。
+- 失败诊断同时写入界面运行日志（`提交诊断：{…}`），本轮有提交时日志末尾给出诊断文件
+  路径；写诊断失败只给警告，不改变订单结果——防重复仍由前置 journal 与只读对账负责。
+
+### 测试与文档
+
+- 新增 `tests/test_sss_submission_regressions.py`（内部异常不重发、未决记录跨运行保留、
+  跨餐同名同行不互相确认、恢复后清理失败状态、Cookie 独立复制、全部 5xx、诊断脱敏
+  与写失败不改变结果）。
+- `tools/r7-acceptance/mutation_check_r6_4.py` 的 m6 变异锚点随 `_post_one` 新结构更新；
+  `tests/test_independent_final_counterexamples.py` 的 2xx 分类用例改为“泛化文案仍
+  不确定、可识别校验拒绝才显式”，与新行为一致。
+- 新增 [docs/SSS-下单失败与重试排查.md](docs/SSS-下单失败与重试排查.md)（现场事实、
+  离线复现的问题、网页报文核对、诊断字段与取证方法），README 增加指引。
+
+### 验证
+
+- `python -m pytest -q`：**1582 passed / 1 xpassed**。本机另有 5 项环境性失败
+  （4 项 WPS 多进程信号量 `PermissionError`、1 项缺 `cryptography` 模块），在未改动的
+  `HEAD` 基线上同样失败，与本版无关；CI（ubuntu）不受影响。
+- 变异门禁 `test_r6_4_mutations_force_probe_defect_before_injected_restored` 与反例探针
+  全绿：m6 锚点随 `_post_one` 新结构更新后，注入仍被判 DEFECT、恢复后通过。
+- `python -m compileall -q app tests scripts tools` 通过；`pyflakes` 对改动文件无告警
+  （本机 Android 运行时装不了 ruff 的 wheel，ruff 门禁以 CI 结果为准）。
+- 未改动前端；`git diff --check` 无空白错误。
+
 ## 3.6.16
 
 一次「与桌面版（`yikou-light-food-desktop` v3.6.1）对齐」的版本：补齐杭电信工校区，
