@@ -43,6 +43,15 @@ _PREFILTER_ZERO_RETRY_DELAY_S = 2.0
 
 _BATCH_CLOCK_SKEW_S = 120.0
 
+#: 建单提交的最小间隔（``sss_submit_min_interval_s``）出厂默认值定义在
+#: ``app.core.config``；这里只放「平台过载特征 → 自动放宽间隔」的行为参数。
+#: 2026-10-09 现场（见 docs/SSS-下单失败与重试排查.md）：平台对同一账号的建单
+#: 受理上限约 1 单 / 2.1 秒，超速请求约 0.3-1 秒内被快速驳回（HTTP 200 + 内部
+#: 异常 IndexOutOfBoundsException，且仍消耗平台订单序列号），成功请求约 7-9 秒。
+_SUBMIT_FAST_REJECT_MAX_S = 1.5
+_SUBMIT_INTERVAL_PENALTY_FACTOR = 1.5
+_SUBMIT_INTERVAL_PENALTY_MAX_S = 10.0
+
 _LIST_PAGE_SIZE = 100
 
 #: 带时间窗（预筛）查询的页大小。窗口内通常 100-140 条（2026-09-13 生产实测 116 条），

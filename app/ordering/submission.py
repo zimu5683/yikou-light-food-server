@@ -28,6 +28,9 @@ from app.ordering.constants import (
     _PREFILTER_ZERO_RETRY_DELAY_S,
     _PROGRESS_EVERY_N,
     _RECONCILE_POLL_ATTEMPTS,
+    _SUBMIT_FAST_REJECT_MAX_S,
+    _SUBMIT_INTERVAL_PENALTY_FACTOR,
+    _SUBMIT_INTERVAL_PENALTY_MAX_S,
 )
 from app.ordering.models import (
     _AuthExpired, _BalanceDepleted, _Reconciliation,
@@ -181,12 +184,14 @@ def _post_one(client: Any, payload: dict[str, Any]) -> dict[str, Any]:
 def _emit_round_summary(callback: Callable[[str], Any] | None,
                         latencies: list[float],
                         started_at: float,
-                        read_timeout_s: float | None) -> None:
+                        read_timeout_s: float | None,
+                        min_interval_s: float | None = None) -> None:
     """本轮提交的实测汇总：并发到底有没有用，全看这一行。
 
     吞吐 = 单数 / 墙钟，每单均时 = 服务端建单耗时。并发调高后若平台在建单上
     排队，每单均时会被推高而吞吐不变——这时应当把并发调低（或放宽读取超时），
-    而不是继续加路数。
+    而不是继续加路数。启用提交节流时补一句当前的最小间隔，便于与平台受理
+    节奏（约 1 单 / 2.1 秒）对照。
     """
     if not latencies:
         return
@@ -195,6 +200,12 @@ def _emit_round_summary(callback: Callable[[str], Any] | None,
     throughput = (len(latencies) / wall) if wall > 0 else 0.0
     message = (f"本轮提交 {len(latencies)} 单，耗时 {wall:.1f} 秒，"
                f"每单平均 {average:.1f} 秒（吞吐 {throughput:.2f} 单/秒）")
+    try:
+        pacing = float(min_interval_s) if min_interval_s else 0.0
+    except (TypeError, ValueError):
+        pacing = 0.0
+    if pacing > 0:
+        message += f"；提交最小间隔 {pacing:g} 秒"
     try:
         limit = float(read_timeout_s) if read_timeout_s else 0.0
     except (TypeError, ValueError):
@@ -205,22 +216,106 @@ def _emit_round_summary(callback: Callable[[str], Any] | None,
     _emit(callback, message)
 
 
+def _is_rate_reject_response(response: Any) -> bool:
+    """平台「受理超速」特征的快速驳回：内部异常为 IndexOutOfBounds（空列表取 0）。
+
+    2026-10-09 实测（见 docs/SSS-下单失败与重试排查.md）：超过平台受理节奏
+    （约 1 单 / 2.1 秒）的建单请求在约 0.3-1 秒内返回
+    ``java.lang.IndexOutOfBoundsException: Index: 0, Size: 0``，且仍会消耗一个
+    平台订单序列号（幽灵单）。该判定只用于提交节奏的自适应放宽
+    （``_SubmitPacer.penalize``），不参与任何结果分类、记录或重发语义。
+    """
+    if not isinstance(response, dict) or not is_internal_error_payload(response):
+        return False
+    message = str(response.get("message") or response.get("msg") or "")
+    return "IndexOutOfBounds" in message
+
+
+class _SubmitPacer:
+    """提交节流：令相邻两次 POST 的起点至少间隔 ``interval`` 秒。
+
+    平台对同一账号的建单受理上限约 1 单 / 2.1 秒（2026-10-09 实测）。4 路滚动
+    补位下，被快速驳回的车道 0.36 秒就能补发下一单，实际发送节奏会被推到约
+    1.37 单/秒，远超平台上限，于是每轮约 2/3 的请求被驳回。这里在 POST 之前统一
+    排队，让发送起点按最小间隔错开；出现平台的快速驳回特征时自动放宽间隔
+    （``penalize``）。节流只影响节奏，不改变任何结果分类与重发语义。
+    """
+
+    def __init__(self, interval_s: float) -> None:
+        self._lock = Lock()
+        self._interval = max(0.0, float(interval_s or 0.0))
+        self._ceiling = max(_SUBMIT_INTERVAL_PENALTY_MAX_S, self._interval)
+        self._next_allowed = 0.0  # time.perf_counter 时间基准
+
+    def wait(self, stop_event: Any = None,
+             halted: Callable[[], bool] | None = None) -> bool:
+        """阻塞到可以发送下一次 POST；返回 False = 等待期间停止/中止（未发送）。
+
+        节流关闭（间隔为 0）时不等待也不中止，行为与未引入节流前完全一致；
+        等待路径上出现停止、401 或余额不足时返回 False，调用方应把该任务记为
+        「未发送」（它确实没有发出，重登后按未发送语义允许补发）。
+        """
+        if self._interval <= 0.0:
+            return True
+
+        def aborted() -> bool:
+            if halted is not None and halted():
+                return True
+            return stop_event is not None and bool(stop_event.is_set())
+
+        while True:
+            if aborted():
+                return False
+            with self._lock:
+                now = time.perf_counter()
+                if now >= self._next_allowed:
+                    self._next_allowed = now + self._interval
+                    return True
+                delay = min(self._next_allowed - now, 0.25)
+            time.sleep(delay)
+
+    def penalize(self) -> float | None:
+        """平台快速驳回后放宽间隔；返回放宽后的值，未启用/已到上限时返回 None。"""
+        with self._lock:
+            if self._interval <= 0.0 or self._interval >= self._ceiling:
+                return None
+            self._interval = min(self._ceiling,
+                                 self._interval * _SUBMIT_INTERVAL_PENALTY_FACTOR)
+            return self._interval
+
+    @property
+    def interval(self) -> float:
+        """当前生效的最小间隔（秒）。"""
+        with self._lock:
+            return self._interval
+
+
 def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
                              submit: Callable[[dict[str, Any]], dict[str, Any]],
                              stop_event: Any,
                              callback: Callable[[str], Any] | None,
                              max_workers: int = 4,
                              on_stop: Callable[[], None] | None = None,
-                             read_timeout_s: float | None = None) -> _SubmitResult:
+                             read_timeout_s: float | None = None,
+                             min_interval_s: float = 0.0) -> _SubmitResult:
     """有界并发提交，停止、401、余额不足后不再派发新任务。
 
     同一轮最多保留 ``max_workers`` 个在途 POST。请求超时或断链只记录为
     ``uncertain``，由调用方查询订单列表确认，绝不在此处自动重发。
 
+    ``min_interval_s`` > 0 时启用全局提交节流（见 `_SubmitPacer`）：相邻两次
+    POST 的起点至少间隔该值，以贴合平台对同一账号的建单受理上限（约 1 单 /
+    2.1 秒）；出现平台快速驳回特征时自动放宽间隔。0 = 关闭节流。
+
     结束后输出一行本轮汇总（见 `_emit_round_summary`）。
     """
     result = _SubmitResult()
     workers = max(1, int(max_workers))
+    try:
+        pacing = max(0.0, float(min_interval_s or 0.0))
+    except (TypeError, ValueError):
+        pacing = 0.0
+    pacer = _SubmitPacer(pacing)
     iterator = iter(tasks)
     in_flight: dict[Any, dict[str, Any]] = {}
     stop_closed = False
@@ -233,6 +328,11 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
     def run_one(task: dict[str, Any]) -> tuple[str, str, str]:
         if stop_event.is_set():
             return task["identifier"], "stopped", ""
+        if not pacer.wait(stop_event, halted):
+            # 节流等待期间收到停止/中止：请求确实没有发出，按「未发送」处理
+            # （重登后仍属于可补发的明确未发送任务）。
+            return task["identifier"], "stopped", ""
+        interval_at_send = pacer.interval
         started = time.perf_counter()
         started_at = time.time()
         request_digest = payload_digest(task["payload"])
@@ -258,11 +358,20 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
         else:
             state, detail = "success", ""
         elapsed = time.perf_counter() - started
+        if (state == "uncertain" and elapsed <= _SUBMIT_FAST_REJECT_MAX_S
+                and _is_rate_reject_response(response)):
+            widened = pacer.penalize()
+            if widened is not None:
+                _emit(callback, "平台快速驳回（疑似建单受理超速）；"
+                                f"提交最小间隔自动放宽到 {widened:g} 秒"
+                                "（结果分类与重发语义不变）")
         # list.append 在 CPython 下是原子的；这里只做统计，不参与任何判定。
         latencies.append(elapsed)
-        diagnostic_records[task["identifier"]] = submission_diagnostic(
+        record = submission_diagnostic(
             task, response, started_at=started_at, elapsed_s=elapsed, state=state,
             payload_hash=request_digest, transport=transport)
+        record["min_interval_s"] = round(interval_at_send, 3)
+        diagnostic_records[task["identifier"]] = record
         _trace(f"POST {task['identifier']}: {elapsed:.2f}s -> {state}")
         return task["identifier"], state, detail
 
@@ -327,7 +436,8 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
             for task in iterator:
                 result.not_sent.add(task["identifier"])
         result.stopped = bool(result.stopped or stop_event.is_set())
-    _emit_round_summary(callback, latencies, started_at, read_timeout_s)
+    _emit_round_summary(callback, latencies, started_at, read_timeout_s,
+                        pacer.interval)
     if latencies:
         _emit(callback, f"脱敏提交诊断日志：{diagnostic_log_path()}")
     return result
@@ -430,6 +540,7 @@ def _run_reconciled_submission(
         relogin: Callable[[], None] | None = None,
         *,
         read_timeout_s: float | None = None,
+        submit_min_interval_s: float = 0.0,
         uncertain_sink: Callable[[list[dict[str, Any]], dict[str, Any]], None] | None = None,
         uncertain_clear: Callable[[set[str]], None] | None = None,
         uncertain_discard: Callable[[set[str]], None] | None = None,
@@ -658,7 +769,8 @@ def _run_reconciled_submission(
         try:
             result = _submit_tasks_concurrent(round_tasks, submit, stop_event,
                                               callback, workers, on_stop=close,
-                                              read_timeout_s=read_timeout_s)
+                                              read_timeout_s=read_timeout_s,
+                                              min_interval_s=submit_min_interval_s)
         finally:
             close()
         _absorb(result)

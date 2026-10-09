@@ -9,7 +9,11 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
 
-from app.core.config import _SSS_MAX_WORKERS_CEILING
+from app.core.config import (
+    _DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S,
+    _SSS_MAX_WORKERS_CEILING,
+    _SSS_SUBMIT_MIN_INTERVAL_CEILING_S,
+)
 from app.integrations.api_client import SssApiClient
 from app.integrations.sss_url import canonical_sss_origin
 from app.order.common import _emit
@@ -84,6 +88,24 @@ def resolve_create_workers(config: Any) -> int:
     except (TypeError, ValueError):
         workers = _FALLBACK_SSS_CREATE_WORKERS
     return max(1, min(_SSS_MAX_WORKERS_CEILING, workers))
+
+
+def resolve_submit_min_interval_s(config: Any) -> float:
+    """本批提交的最小间隔（秒）：取配置值并夹到 ``[0, 60]``；0 = 关闭节流。
+
+    平台对同一账号的建单受理上限约 1 单 / 2.1 秒（2026-10-09 实测，见
+    docs/SSS-下单失败与重试排查.md）；拿不到配置（缺字段或取值不可解析）时按
+    出厂默认（2.5 秒）保守节流——宁可按节奏慢发，也不要全速连发触发平台的
+    快速驳回（内部异常 + 消耗平台订单序列号）。
+    """
+    try:
+        interval = float(getattr(config, "sss_submit_min_interval_s",
+                                 _DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S))
+    except (TypeError, ValueError):
+        interval = _DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S
+    if interval != interval:  # NaN
+        interval = _DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S
+    return max(0.0, min(_SSS_SUBMIT_MIN_INTERVAL_CEILING_S, interval))
 
 
 def _exclusive_sss_job(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -199,6 +221,7 @@ def run_sss_job(config: Any, stop_event: Any,
     # 出厂并发 4（v2 起）；旧配置里等于 3.6.15 出厂默认的 8 由 AppConfig 的
     # 一次性迁移搬过来，用户显式改过的其它取值原样生效。
     max_workers = resolve_create_workers(config)
+    submit_min_interval_s = resolve_submit_min_interval_s(config)
     batch_id = uuid.uuid4().hex[:12]
     idempotency_field = str(getattr(config, "sss_idempotency_field", "") or _CLIENT_IDEMPOTENCY_FIELD).strip()
 
@@ -526,7 +549,9 @@ def run_sss_job(config: Any, stop_event: Any,
                             else "预检未通过或对账不确定，未提交任何 POST；先处理日志风险"))
 
         _emit(progress_callback,
-              f"开始下单：共 {len(tasks)} 单，并发 {max_workers} 路，读取超时 {read_timeout_s:g}s")
+              f"开始下单：共 {len(tasks)} 单，并发 {max_workers} 路，读取超时 {read_timeout_s:g}s"
+              + (f"，提交最小间隔 {submit_min_interval_s:g}s"
+                 if submit_min_interval_s > 0 else ""))
         journal_meta = {
             "delivery_date": expected_delivery_date(now).isoformat(),
             "source": source,
@@ -560,6 +585,7 @@ def run_sss_job(config: Any, stop_event: Any,
             max_workers,
             relogin=relogin,
             read_timeout_s=read_timeout_s,
+            submit_min_interval_s=submit_min_interval_s,
             uncertain_sink=_journal_sink,
             uncertain_clear=_journal_clear,
             uncertain_discard=_journal_discard,

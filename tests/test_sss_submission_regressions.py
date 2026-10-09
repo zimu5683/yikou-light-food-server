@@ -44,6 +44,21 @@ def _tasks(*, both_meals=False):
     )
 
 
+def _many_tasks(count):
+    """同一餐次的多条任务：行号/电话/门牌各不相同，避免指纹相同时互相影响。"""
+    orders = [
+        {"row": 60 + index, "name": f"测试{index}",
+         "phone": f"1380000000{index}", "door": f"A10{index}"}
+        for index in range(count)
+    ]
+    return sss_payload._collect_tasks(
+        {"午餐": orders}, 99,
+        {"lnt": 1.0, "lat": 2.0, "areaCode": "330110", "addressDetail": "测试地址"},
+        "轻食", account="test-account", batch_id="test-batch",
+        now=dt.datetime(2026, 10, 8, 7, 30),
+    )
+
+
 def _empty_fetch(path):
     return {"success": True, "result": {"records": [], "total": 0}}
 
@@ -397,3 +412,111 @@ def test_unknown_error_details_never_echo_private_values(message):
         sss_submission._check_success({"success": False, "message": message})
     for private_value in ("secret-token", "13800000001", "测试地址"):
         assert private_value not in str(caught.value)
+
+
+# ----------------------------------------------------------------------
+# 提交节流（平台对同一账号的建单受理上限约 1 单 / 2.1 秒，超速会被快速驳回）
+# ----------------------------------------------------------------------
+def test_min_interval_spaces_post_starts():
+    """配置提交最小间隔后，相邻两次 POST 的起点至少间隔该值。"""
+    tasks = _many_tasks(4)
+    starts = []
+
+    def submit(body):
+        starts.append(time.perf_counter())
+        return {"success": True}
+
+    result = sss_submission._submit_tasks_concurrent(
+        tasks, submit, Event(), None, max_workers=4, min_interval_s=0.15)
+    assert result.succeeded == {task["identifier"] for task in tasks}
+    gaps = [later - earlier for earlier, later in zip(starts, starts[1:])]
+    assert len(gaps) == 3
+    assert all(gap >= 0.12 for gap in gaps), gaps
+
+
+def test_zero_interval_keeps_immediate_dispatch_without_penalty():
+    """0 = 关闭节流：不排队等待、也不自动放宽（与引入节流前的行为一致）。"""
+    tasks = _many_tasks(3)
+    logs = []
+
+    def submit(body):
+        return {"success": False, "message": INTERNAL_ERROR}
+
+    result = sss_submission._submit_tasks_concurrent(
+        tasks, submit, Event(), logs.append, max_workers=3)
+    assert {identifier for identifier, _detail in result.uncertain} == {
+        task["identifier"] for task in tasks}
+    assert result.succeeded == set()
+    assert not any("自动放宽" in message for message in logs)
+
+
+def test_platform_fast_reject_widens_the_submit_interval():
+    """平台快速驳回（IndexOutOfBounds）后自动放宽间隔，且分类不变。"""
+    tasks = _many_tasks(4)
+    starts = []
+    logs = []
+
+    def submit(body):
+        starts.append(time.perf_counter())
+        return {"success": False, "message": INTERNAL_ERROR}
+
+    result = sss_submission._submit_tasks_concurrent(
+        tasks, submit, Event(), logs.append, max_workers=4, min_interval_s=0.15)
+    gaps = [later - earlier for earlier, later in zip(starts, starts[1:])]
+    assert len(result.uncertain) == 4 and not result.succeeded
+    # 首次驳回即放宽到 0.225 秒，第二次再放宽：最后一个间隔应明显大于最初间隔。
+    assert gaps[-1] >= 0.3, gaps
+    assert gaps[-1] > gaps[0]
+    assert any("自动放宽" in message for message in logs)
+
+
+def test_pacer_penalty_stops_at_its_ceiling():
+    pacer = sss_submission._SubmitPacer(4.0)
+    assert pacer.wait() is True
+    assert pacer.penalize() == pytest.approx(6.0)
+    assert pacer.penalize() == pytest.approx(9.0)
+    assert pacer.penalize() == pytest.approx(10.0)  # 13.5 → 夹到上限
+    assert pacer.penalize() is None  # 已到上限，不再放宽
+
+
+def test_pacer_aborts_waiting_on_stop_or_halt():
+    """节流等待期间出现停止/401/余额不足：请求未发出，返回 False。"""
+    pacer = sss_submission._SubmitPacer(4.0)
+    stopped = Event()
+    stopped.set()
+    assert pacer.wait(stopped) is False
+    assert pacer.wait(Event(), halted=lambda: True) is False
+
+
+def test_disabled_pacer_never_waits_or_aborts():
+    """关闭节流时不引入任何新的等待/中止语义（保持原有行为）。"""
+    pacer = sss_submission._SubmitPacer(0.0)
+    assert pacer.penalize() is None
+    stopped = Event()
+    stopped.set()
+    assert pacer.wait(stopped) is True
+
+
+def test_rate_reject_signature_only_matches_the_over_rate_error():
+    assert sss_submission._is_rate_reject_response(
+        {"success": False, "message": INTERNAL_ERROR}) is True
+    assert sss_submission._is_rate_reject_response(
+        {"success": False, "message": "地址无效"}) is False
+    assert sss_submission._is_rate_reject_response(
+        {"success": False, "message": "java.lang.RuntimeException: 其他异常"}) is False
+    assert sss_submission._is_rate_reject_response(None) is False
+
+
+def test_submission_diagnostic_records_the_active_interval():
+    """诊断记录带上请求发出时生效的提交最小间隔，供后续取证对照。"""
+    task = _tasks()[0]
+
+    def submit(body):
+        return {"success": True}
+
+    sss_submission._submit_tasks_concurrent(
+        [task], submit, Event(), None, 1, min_interval_s=2.5)
+    record = json.loads(sss_diagnostics.diagnostic_log_path().read_text(
+        encoding="utf-8").splitlines()[-1])
+    assert record["min_interval_s"] == 2.5
+    assert record["state"] == "success"

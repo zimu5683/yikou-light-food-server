@@ -2164,3 +2164,36 @@ def test_resolve_create_workers_falls_back_to_serial_for_broken_config():
 
     assert resolve_create_workers(_Empty()) == 1
     assert resolve_create_workers(_Broken()) == 1
+
+
+# ----------------------------------------------------------------------
+# 创建订单的提交最小间隔
+# ----------------------------------------------------------------------
+def test_resolve_submit_min_interval_takes_the_config_value_clamped():
+    from app.ordering.runner import resolve_submit_min_interval_s
+
+    class _Config:
+        def __init__(self, interval):
+            self.sss_submit_min_interval_s = interval
+
+    # 出厂默认 2.5 秒；0 = 显式关闭节流；上限 60（与 AppConfig 的夹紧同口径）。
+    assert resolve_submit_min_interval_s(_Config(2.5)) == 2.5
+    assert resolve_submit_min_interval_s(_Config(0)) == 0.0
+    assert resolve_submit_min_interval_s(_Config(3)) == 3.0
+    assert resolve_submit_min_interval_s(_Config(-1)) == 0.0
+    assert resolve_submit_min_interval_s(_Config(999)) == 60.0
+    assert resolve_submit_min_interval_s(_Config("4.5")) == 4.5
+
+
+def test_resolve_submit_min_interval_falls_back_to_paced_default():
+    """残缺 config（缺字段/取值不可解析）→ 按出厂默认 2.5 秒保守节流。"""
+    from app.ordering.runner import resolve_submit_min_interval_s
+
+    class _Empty:
+        pass
+
+    class _Broken:
+        sss_submit_min_interval_s = "abc"
+
+    assert resolve_submit_min_interval_s(_Empty()) == 2.5
+    assert resolve_submit_min_interval_s(_Broken()) == 2.5

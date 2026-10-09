@@ -122,6 +122,38 @@ def test_sss_read_timeout_is_clamped(given, expected):
     assert AppConfig(sss_read_timeout_s=given).sss_read_timeout_s == expected
 
 
+@pytest.mark.parametrize("given,expected", [
+    (0, 0.0), (-5, 0.0), (2.5, 2.5), (10, 10.0), (999, 60.0),
+    (None, 2.5), ("abc", 2.5), ("3.5", 3.5),
+])
+def test_sss_submit_min_interval_is_clamped(given, expected):
+    # 出厂 2.5 秒（平台建单受理节奏约 1 单 / 2.1 秒 + 余量）；显式 0 = 关闭节流。
+    assert AppConfig(sss_submit_min_interval_s=given).sss_submit_min_interval_s == expected
+
+
+def test_sss_submit_min_interval_nan_falls_back_to_default():
+    assert AppConfig(sss_submit_min_interval_s=float("nan")).sss_submit_min_interval_s == 2.5
+
+
+def test_legacy_config_without_the_interval_gets_the_paced_default(tmp_path):
+    """旧 config.json 没有 sss_submit_min_interval_s：加载即按出厂默认 2.5 秒节流。"""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"sss_max_workers": 4,
+                                "defaults_revision": DEFAULTS_REVISION},
+                               ensure_ascii=False), encoding="utf-8")
+    loaded = AppConfig.load(path)
+    assert loaded.sss_submit_min_interval_s == 2.5
+    loaded.save()
+    assert AppConfig.load(path).sss_submit_min_interval_s == 2.5
+
+
+def test_explicit_zero_interval_survives_a_save_load_roundtrip(tmp_path):
+    """0 = 显式关闭节流，保存后不能被出厂默认覆盖回 2.5。"""
+    path = tmp_path / "config.json"
+    AppConfig(sss_submit_min_interval_s=0.0).save(path)
+    assert AppConfig.load(path).sss_submit_min_interval_s == 0.0
+
+
 # ----------------------------------------------------------------------
 # 出厂默认迁移：v0 → v1（并发 4 → 8、读取超时 20 → 30 秒）
 #           v1 → v2（并发 8 → 4、读取超时 30 秒不变）
