@@ -35,6 +35,19 @@
 - 前端（对应 main 上的管理员门槛改动）：`pnpm build` / `pnpm lint`（0 警告）/
   `pnpm test`（210）/ `pnpm check:anchors`（18/18）与 headless Chrome 浏览器门禁通过。
 
+### 发布补记：CI 验证、出包与发布结果
+
+- main 推送（`381a9c7`）后 CI 全绿：Tests **1547 passed**（Python 3.11 与 3.13 各一遍，
+  含 `ruff check app tests scripts`「All checks passed!」、前端构建/lint/测试/锚点与
+  headless Chrome 浏览器门禁、Workspace hygiene），Android APK（main）出包成功。
+  相关 run：Tests 37967824471、Android APK（main）37967824456。
+- tag `v3.6.20` 触发的发布流水线（run 37969652382）成功：**Release v3.6.20 已发布**
+  （https://github.com/zimu5683/yikou-light-food-server/releases/tag/v3.6.20），
+  APK `yikou-light-food-3.6.20-arm64.apk` **19,815,633 字节**，sha256
+  `60b41add…eff950`（资产内 `.sha256` 与出包日志一致）。
+- 本机网络对 `github.com:443` 继续间歇性握手失败：`git push` 在重试内完成
+  （main 第 1 次、tag 第 4 次成功）。仅影响推送通道，不改动仓库内容。
+
 ## 3.6.19
 
 一次「回退跨运行阻断 + 补上诊断日志导出」的版本：移除 3.6.17 引入的「人工核对 +
