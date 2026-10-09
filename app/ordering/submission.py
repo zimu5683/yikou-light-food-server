@@ -870,11 +870,12 @@ def _run_reconciled_submission(
         identifier = str(task.get("identifier"))
         if identifier in uncertain_ids:
             _emit(callback, f"订单未确认：{identifier}：POST 发送结果未知；"
-                            "下一步只做只读核对，禁止重试或重跑")
+                            "可再运行一次重试（重跑前会先做站内对账，"
+                            "已存在的订单不会重复提交；本批不自动重发）")
             continue
         if identifier in success_ids:
             _emit(callback, f"订单未确认：{identifier}：POST 已返回成功但站内尚未查到；"
-                            "下一步只做只读核对，禁止重发")
+                            "可直接再运行一次（重跑前会先做站内对账；本批不自动重发）")
             continue
         error = state["errors"].get(identifier, "站内未查询到对应订单")
         _emit(callback, f"订单未确认：{identifier}：{error}")

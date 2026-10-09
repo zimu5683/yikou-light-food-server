@@ -413,14 +413,20 @@ def fixed_clock(moment: tuple[int, int, int, int, int, int] = (2026, 9, 16, 10, 
 
 
 def run_job(config: Any, *, now: tuple[int, int, int, int, int, int] =
-            (2026, 9, 16, 10, 0, 0)) -> dict[str, Any]:
-    """在当前进程调用真实 ``run_sss_job``（固定时钟、真实安全闸门）。"""
+            (2026, 9, 16, 10, 0, 0),
+            messages: list[str] | None = None) -> dict[str, Any]:
+    """在当前进程调用真实 ``run_sss_job``（固定时钟、真实安全闸门）。
+
+    ``messages`` 非空时收集进度/提示日志行（3.6.19 起多处守卫改为「只提示、
+    不阻断」，测试需要断言提示文案时使用）；默认行为与原来完全一致。
+    """
     from app.ordering import runner as sss_runner
 
     stop = _Stop()
+    callback = messages.append if messages is not None else (lambda _message: None)
     with fixed_clock(now):
         return sss_runner.run_sss_job(
-            config, stop, lambda _message: None, password="synthetic",
+            config, stop, callback, password="synthetic",
             captcha_callback=lambda _image: "1234")
 
 

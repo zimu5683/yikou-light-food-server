@@ -1,15 +1,18 @@
-"""R8-S1 专项测试：URL 写法不得绕过未确认订单保护。
+"""R8-S1 专项测试：URL 写法规则 + 遗留未决记录的只读核对（3.6.19 起只提示）。
 
 覆盖范围（本文件即这组验收清单的权威副本）：
 
 * 闪时送网址分类：大小写/默认端口/path 归一；尾点、中文域名、缺协议、
-  非法端口、非法 IP 等明确配置错误；
+  非法端口、非法 IP 等明确配置错误（这条没变：非规范写法在任何请求之前抛出）；
 * 配置保存入口、任务启动入口、``SssApiClient`` 直接路径规则一致；
-* 跨作用域只读核对：修复前遗留的尾点 scope unresolved 记录必须阻断提交，
-  且不被迁移/改写/删除/标成 verified；
-* 真实 ``run_sss_job`` + 本地模拟平台的端到端：第一次进入 uncertain 后，
-  同写法重跑被阻断，换写法启动直接配置错误（0 次 POST）；
-* 进程重启、并发启动、损坏 journal、HTTP 与本地 HTTPS 链路；
+* 跨作用域只读核对：修复前遗留的尾点 scope unresolved 记录仍会被只读扫描报告，
+  但 3.6.19 起**只提示、不再阻断**提交；记录不被迁移/改写/删除/标成 verified
+  （原文件字节保持原样），执行期配置漂移也不会把它拆到第二个作用域；
+* 真实 ``run_sss_job`` + 本地模拟平台的端到端：第一次进入 uncertain 后，同写法
+  重跑照常提交（站内可见时由只读对账去重，不重复下单），换写法启动直接配置
+  错误（0 次 POST）；
+* 进程重启、并发启动（同一批次的跨进程锁仍拒绝第二个进程）、损坏 journal、
+  HTTP 与本地 HTTPS 链路；
 * 无旧未确认记录的正常配置仍能完成一次模拟提交。
 
 隔离：所有环境变量指向 ``tmp_path``；请求只发给 ``127.0.0.1`` 的模拟平台，
@@ -370,7 +373,7 @@ def test_explicit_single_file_override_skips_scan(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 # 4) 端到端：真实 run_sss_job + 本地模拟平台（HTTP）
 # ---------------------------------------------------------------------------
-def test_uncertain_then_same_writing_blocked_then_alias_rejected(tmp_path):
+def test_uncertain_then_same_writing_submits_then_alias_rejected(tmp_path):
     with MockPlatform(list_visible=False) as platform:
         port = platform.port
         canonical = f"http://sss.example.invalid:{port}"
@@ -386,16 +389,20 @@ def test_uncertain_then_same_writing_blocked_then_alias_rejected(tmp_path):
             assert platform.count == 1
             assert len(active_records(journal)) == 1
 
-            # 同写法重跑：既有反重复闸门阻断
-            second = run_job(config)
-            assert second["status"] == "blocked_uncertain"
-            assert second["semantics"] == "uncertain-journal-guard"
-            assert platform.count == 1
+            # 同写法重跑：3.6.19 起历史未决记录不再阻断提交（只提示），本轮
+            # 自己的 1 次 POST 照发；站内不可见 → 仍是未确认，记录只留一条。
+            messages: list[str] = []
+            second = run_job(config, messages=messages)
+            assert second["status"] == "unconfirmed"
+            assert platform.count == 2
+            assert any("本批继续提交" in message for message in messages), messages
+            assert len(active_records(journal)) == 1
+            assert [r["status"] for r in active_records(journal)] == ["unresolved"]
 
             # 只改 URL 写法（尾点）：在任何请求之前配置错误
             with pytest.raises(SssUrlConfigError):
                 run_job(make_config(work, alias))
-            assert platform.count == 1
+            assert platform.count == 2
             assert first["created"] == 0
 
 
@@ -414,8 +421,12 @@ def test_normal_config_still_submits_once(tmp_path):
             assert active_records(journal) == []
 
 
-def test_legacy_alias_journal_blocks_canonical_start(tmp_path):
-    """修复前遗留的尾点 scope unresolved → 规范写法启动必须 0 POST 阻断。"""
+def test_legacy_alias_journal_no_longer_blocks_canonical_start(tmp_path):
+    """修复前遗留的尾点 scope unresolved：3.6.19 起只提示、不再阻断提交。
+
+    只读扫描仍会报告这条跨作用域记录（提示里点名 journal 与记录），但本批照常
+    提交；原文件字节不变、记录仍 unresolved、不被标成 verified。
+    """
     with MockPlatform(list_visible=True) as platform:
         port = platform.port
         canonical = f"http://sss.example.invalid:{port}"
@@ -427,14 +438,17 @@ def test_legacy_alias_journal_blocks_canonical_start(tmp_path):
         before = legacy.read_bytes()
         with loopback_guard(port):
             config = make_config(work, canonical)
-            result = run_job(config)
-            assert result["status"] == "blocked_uncertain"
-            assert result["semantics"] == "cross-scope-authority-guard"
-            assert result["summary"]["cross_scope_records"] == 1
-            assert platform.count == 0
-            assert "影响范围" in result["next_action"]
+            messages: list[str] = []
+            result = run_job(config, messages=messages)
+            assert result["status"] == "confirmed", result
+            assert result["created"] == 1
+            assert platform.count == 1
+            hints = [message for message in messages
+                     if "提示" in message and "本批继续提交" in message]
+            assert any(legacy.name in message for message in hints), messages
         assert legacy.read_bytes() == before
         assert active_records(legacy)[0]["status"] == "unresolved"
+        assert "verified" not in legacy.read_text(encoding="utf-8")
 
 
 def test_canonical_unresolved_then_alias_start_is_config_error(tmp_path):
@@ -460,10 +474,11 @@ def test_config_change_after_validation_does_not_split_scope(tmp_path,
                                                             monkeypatch):
     """校验与执行之间配置被改写：整个执行期仍绑定启动时冻结的规范 origin。
 
-    R8-S1 要求“校验与执行之间配置变化不能绕过保护”。这里在验证码请求（即校验
-    之后、提交之前）把 ``config.sss_url`` 改成另一个合法 URL，未决记录必须仍落在
-    启动时冻结的作用域；否则下一次用原网址启动就会看不到它，等于再开一条重复
-    提交通道。
+    R8-S1 的“校验与执行之间配置变化不能拆分作用域”仍然生效（作用域冻结 +
+    只读对账是 3.6.19 之后仅存的防线）。这里在验证码请求（即校验之后、提交
+    之前）把 ``config.sss_url`` 改成另一个合法 URL，未决记录必须仍落在启动时
+    冻结的作用域；否则下一次用原网址启动就会看不到它，重跑时站内对账也就
+    对不到这条记录。
     """
     from app.integrations import api_client as api_client_module
 
@@ -491,7 +506,8 @@ def test_config_change_after_validation_does_not_split_scope(tmp_path,
             assert active_records(
                 sss_uncertain.authoritative_uncertain_path(config)) == []
 
-        # 用原网址再启动：冻结作用域里的未决记录仍然阻断，且不再 POST
+        # 用原网址再启动：3.6.19 起历史未决记录不再阻断提交；但记录必须仍留在
+        # 启动时冻结的作用域里（不能被改写后的 URL 拆到第二个作用域）。
         # （只还原 fetch_captcha 这一个补丁，不能 undo 掉隔离环境变量）
         monkeypatch.setattr(api_client_module.SssApiClient,
                             "fetch_captcha", original_fetch)
@@ -500,12 +516,15 @@ def test_config_change_after_validation_does_not_split_scope(tmp_path,
                 == frozen_journal)
         with loopback_guard(port):
             second = run_job(config2)
-        assert second["status"] == "blocked_uncertain"
-        assert second["semantics"] == "uncertain-journal-guard"
-        assert platform.count == 1
+        assert second["status"] == "unconfirmed"
+        assert platform.count == 2
+        assert len(active_records(frozen_journal)) == 1
+        assert active_records(sss_uncertain.authoritative_uncertain_path(
+            _config(f"http://other.invalid:{port}"))) == []
 
 
-def test_corrupt_foreign_journal_blocks_real_run(tmp_path):
+def test_corrupt_foreign_journal_does_not_block_real_run(tmp_path):
+    """权威根里的损坏 journal：只读核对失败也只提示，本批照常提交。"""
     with MockPlatform(list_visible=True) as platform:
         port = platform.port
         work = tmp_path / "work"
@@ -515,10 +534,11 @@ def test_corrupt_foreign_journal_blocks_real_run(tmp_path):
         before = broken.read_bytes()
         with loopback_guard(port):
             config = make_config(work, f"http://sss.example.invalid:{port}")
-            result = run_job(config)
-        assert result["status"] == "failed"
-        assert result["semantics"] == "cross-scope-authority-guard"
-        assert platform.count == 0
+            messages: list[str] = []
+            result = run_job(config, messages=messages)
+        assert result["status"] == "confirmed", result
+        assert platform.count == 1
+        assert any("不阻断本批" in message for message in messages), messages
         assert broken.read_bytes() == before
 
 
@@ -550,7 +570,8 @@ def test_https_chain_confirms_and_alias_rejected(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # 6) 进程重启 / 并发
 # ---------------------------------------------------------------------------
-def test_restart_with_legacy_alias_journal_still_blocks(tmp_path):
+def test_restart_with_legacy_alias_journal_still_submits(tmp_path):
+    """重启后尾点遗留 journal 仍在：只提示、不阻断；站内可见时不会重复提交。"""
     with MockPlatform(list_visible=True) as platform:
         port = platform.port
         canonical = f"http://sss.example.invalid:{port}"
@@ -562,41 +583,65 @@ def test_restart_with_legacy_alias_journal_still_blocks(tmp_path):
                                         platform=origin_from_url(alias))])
         before = legacy.read_bytes()
 
-        for _attempt in range(2):  # 两次独立进程 = 重启后仍阻断
+        for _attempt in range(2):  # 两次独立进程 = 重启后都照常运行
             process, result_path = spawn_child(work=work, url=canonical,
                                                port=port)
             payload = child_result(process, result_path)
             assert payload["returncode"] == 0, payload
-            assert payload["status"] == "blocked_uncertain", payload
-            assert payload["semantics"] == "cross-scope-authority-guard"
+            assert payload["status"] == "confirmed", payload
+
+        # 站内可见（list_visible=True）时，第二次运行的只读对账会认出订单已在
+        # 站内：不重复 POST —— 两次重启合计恰好 1 次 POST。
+        assert platform.count == 1, platform.snapshot()
 
         # 尾点写法：配置错误，且不留任何 POST
         process, result_path = spawn_child(work=work, url=alias, port=port)
         payload = child_result(process, result_path)
         assert payload["returncode"] == 3, payload
         assert "SssUrlConfigError" in payload.get("error", "")
+        assert platform.count == 1
 
-        assert platform.count == 0
         assert legacy.read_bytes() == before
+        assert active_records(legacy)[0]["status"] == "unresolved"
 
 
-def test_concurrent_starts_never_double_post(tmp_path):
+def test_concurrent_starts_never_double_post(tmp_path, monkeypatch):
+    """同一批次并发：持有批次锁的一方让第二个进程在 POST 之前被拒。
+
+    3.6.18 及以前，同写法并发的第二个进程由「未确认记录闸门」挡住；3.6.19 起
+    记录本身不再阻断提交，**同一批次的跨进程提交锁仍是保留的守卫**：这里父进程
+    按生产 API 持锁（等价于「另一个进程正在处理同一批次」），子进程必须被拒
+    （``blocked_concurrent`` / ``batch-submission-lock``）且 0 次 POST；释放后
+    同一批次的运行恰好 1 次 POST —— 同批次绝不双发。
+    """
     with MockPlatform(list_visible=False) as platform:
         port = platform.port
         canonical = f"http://sss.example.invalid:{port}"
         work = tmp_path / "job"
-        first_proc, first_result = spawn_child(work=work, url=canonical,
-                                               port=port)
-        second_proc, second_result = spawn_child(work=work, url=canonical,
-                                                 port=port)
-        first = child_result(first_proc, first_result)
-        second = child_result(second_proc, second_result)
+        # 子进程的锁根是 work/locks（与 spawn_child 注入的环境一致）
+        monkeypatch.setenv("YIKOU_SSS_LOCK_ROOT", str(work / "locks"))
+        guard = sss_uncertain.batch_submission_lock(
+            None, sss_uncertain.batch_key("2026-09-16", "excel", ACCOUNT))
+        guard.acquire()
+        try:
+            locked_proc, locked_result = spawn_child(
+                work=work, url=canonical, port=port,
+                env_extra={"YIKOU_SSS_JOURNAL_LOCK_TIMEOUT": "1"})
+            locked = child_result(locked_proc, locked_result)
+        finally:
+            guard.release()
 
-        assert platform.count <= 1, (platform.snapshot(), first, second)
-        statuses = {first.get("status"), second.get("status")}
-        assert statuses & {"blocked_concurrent", "blocked_uncertain"}, statuses
-        if platform.count == 1:
-            assert "unconfirmed" in statuses, statuses
+        assert locked["returncode"] == 0, locked
+        assert locked["status"] == "blocked_concurrent", locked
+        assert locked["semantics"] == "batch-submission-lock", locked
+        assert platform.count == 0, platform.snapshot()
+
+        free_proc, free_result = spawn_child(work=work, url=canonical, port=port)
+        free = child_result(free_proc, free_result)
+
+    assert free["returncode"] == 0, free
+    assert free["status"] == "unconfirmed", free
+    assert platform.count == 1, platform.snapshot()
 
 
 # ---------------------------------------------------------------------------

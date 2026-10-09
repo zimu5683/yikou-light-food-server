@@ -937,8 +937,9 @@ def test_two_processes_different_journals_only_one_post(tmp_path):
         sss_uncertain.load_journal(authority)["records"]) == []
 
 
-def test_crash_different_journal_second_does_not_repost(tmp_path):
-    """R2 红项 1：首进程 POST 后崩溃，次进程换 journal 路径也不能重发。"""
+def test_crash_different_journal_second_submits_again(tmp_path):
+    """R2 红项 1（3.6.19 改写）：首进程 POST 后崩溃，换 journal 路径的重跑**会再次提交**，
+    崩溃留下的活跃记录不得被丢弃。"""
     work = tmp_path / "crash-diff-journals"
     work.mkdir()
     (work / "hidden").write_text("1", encoding="utf-8")  # 站内列表延迟不可见
@@ -962,15 +963,16 @@ def test_crash_different_journal_second_does_not_repost(tmp_path):
         capture_output=True, text=True, timeout=40)
     assert recover.returncode == 0, recover.stderr
     state = json.loads((work / "platform.json").read_text(encoding="utf-8"))
-    assert state["count"] == 1
+    assert state["count"] == 2
     authority = Path(os.environ["YIKOU_SSS_AUTHORITATIVE_PATH"])
     pending = sss_uncertain.pending_records(
         sss_uncertain.load_journal(authority)["records"])
-    assert len(pending) == 1
+    assert len(pending) >= 1, "崩溃留下的活跃记录不得被重跑丢弃"
 
 
-def test_ambiguous_2xx_different_journals_second_does_not_repost(tmp_path):
-    """R2 红项 1：模糊 2xx + 不同 journal，权威状态仍阻止第二实例重发。"""
+def test_ambiguous_2xx_different_journals_second_submits_again(tmp_path):
+    """R2 红项 1（3.6.19 改写）：模糊 2xx + 换 journal，重跑不再被历史记录挡住——
+    第二次运行照常提交（POST 计数 1 → 2）；权威状态仍保留上一轮的未决记录。"""
     work = tmp_path / "ambiguous-diff-journals"
     work.mkdir()
     (work / "hidden").write_text("1", encoding="utf-8")
@@ -994,7 +996,10 @@ def test_ambiguous_2xx_different_journals_second_does_not_repost(tmp_path):
         capture_output=True, text=True, timeout=40)
     assert second.returncode == 0, second.stderr
     state = json.loads((work / "platform.json").read_text(encoding="utf-8"))
-    assert state["count"] == 1
+    assert state["count"] == 2
+    authority = Path(os.environ["YIKOU_SSS_AUTHORITATIVE_PATH"])
+    assert sss_uncertain.pending_records(
+        sss_uncertain.load_journal(authority)["records"]), "历史未决记录不得被丢弃"
 
 
 def test_authoritative_path_independent_of_configured_journal(monkeypatch, tmp_path):
@@ -1240,7 +1245,11 @@ def test_workbook_change_without_authority_path_override_only_one_post(monkeypat
 
 
 def test_workbook_change_crash_without_authority_path_override_does_not_repost(monkeypatch, tmp_path):
-    """生产身份回归：workbook 变化 + 首进程 POST 后崩溃，次实例不能重发。"""
+    """生产身份回归：workbook 变化 + 首进程 POST 后崩溃。
+
+    3.6.19 起跨运行阻断已下线：换 journal 路径的重跑会**重新提交**（站内不可见时
+    POST 计数从 1 增到 2）；这里锁定「崩溃留下的记录仍在、重跑不再被历史记录卡住」。
+    """
     monkeypatch.delenv("YIKOU_SSS_AUTHORITATIVE_PATH", raising=False)
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     work = tmp_path / "workbook-crash"
@@ -1261,7 +1270,14 @@ def test_workbook_change_crash_without_authority_path_override_does_not_repost(m
          str(work / "journal-b.json"), "workbook-b.xlsx"],
         cwd=str(_repo_root()), env=env, capture_output=True, text=True, timeout=40)
     assert recover.returncode == 0, recover.stderr
-    assert json.loads((work / "platform.json").read_text(encoding="utf-8"))["count"] == 1
+    state = json.loads((work / "platform.json").read_text(encoding="utf-8"))
+    assert state["count"] == 2
+    journal = sss_uncertain.authoritative_uncertain_path(
+        SimpleNamespace(sss_uncertain_path=str(work / "journal-a.json"),
+                        sss_url="http://local.invalid",
+                        sss_account="18758187837"))
+    pending = sss_uncertain.pending_records(sss_uncertain.load_journal(journal)["records"])
+    assert pending, "崩溃留下的活跃记录不得被重跑丢弃"
 
 
 def test_origin_normalization_matches_client_rules():
@@ -1301,8 +1317,9 @@ def test_authority_scope_uses_shared_origin_and_isolates_real_differences(monkey
     ("https://example.invalid/takeout", "HTTPS://EXAMPLE.INVALID:443/other"),
     ("HTTP://EXAMPLE.INVALID:80/a", "http://example.invalid/b"),
 ])
-def test_equivalent_origin_crash_does_not_repost(monkeypatch, tmp_path, first_url, second_url):
-    """A/B/C：等价 origin（大小写/默认端口）POST 后崩溃，次实例不能重发。"""
+def test_equivalent_origin_crash_submits_again(monkeypatch, tmp_path, first_url, second_url):
+    """A/B/C（3.6.19 改写）：等价 origin（大小写/默认端口）POST 后崩溃，换 workbook 的重跑
+    **会再次提交**（POST 计数 1 → 2）；等价写法仍归入同一权威作用域。"""
     monkeypatch.delenv("YIKOU_SSS_AUTHORITATIVE_PATH", raising=False)
     monkeypatch.setenv("YIKOU_SSS_AUTHORITATIVE_ROOT", str(tmp_path / "authority-root"))
     work = tmp_path / "origin-crash"
@@ -1323,7 +1340,10 @@ def test_equivalent_origin_crash_does_not_repost(monkeypatch, tmp_path, first_ur
          str(work / "journal-b.json"), "wb-b.xlsx", second_url],
         cwd=str(_repo_root()), env=env, capture_output=True, text=True, timeout=40)
     assert recover.returncode == 0, recover.stderr
-    assert json.loads((work / "platform.json").read_text(encoding="utf-8"))["count"] == 1
+    assert json.loads((work / "platform.json").read_text(encoding="utf-8"))["count"] == 2
+    authority_root = Path(os.environ["YIKOU_SSS_AUTHORITATIVE_ROOT"])
+    scope_files = list(authority_root.glob("*.json"))
+    assert len(scope_files) == 1, f"等价写法必须归入同一权威作用域：{scope_files}"
 
 
 def test_non_default_ports_and_accounts_are_isolated_and_can_post(monkeypatch, tmp_path):
@@ -1383,8 +1403,9 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def test_legacy_hash_files_are_readonly_sources_not_mirrors(monkeypatch, tmp_path):
-    """E/F/G：旧哈希目录只读迁移；其他账号/平台文件字节级不变。"""
+def test_legacy_hash_files_are_readonly_sources_and_runs_proceed(monkeypatch, tmp_path):
+    """E/F/G（3.6.19 改写）：旧哈希目录只读迁移——运行照常提交（不再被阻断），
+    其他账号/平台文件字节级不变。"""
     monkeypatch.delenv("YIKOU_SSS_AUTHORITATIVE_PATH", raising=False)
     userdata = tmp_path / "userdata"
     hash_dir = userdata / "sss_authoritative"
@@ -1412,7 +1433,7 @@ def test_legacy_hash_files_are_readonly_sources_not_mirrors(monkeypatch, tmp_pat
     platform_file = work / "platform.json"
     first_count = (json.loads(platform_file.read_text(encoding="utf-8"))["count"]
                    if platform_file.exists() else 0)
-    assert first_count == 0
+    assert first_count == 1
     for path in (account_a, account_b, other_platform):
         assert _sha256(path) == before[path.name], f"{path.name} 被镜像覆盖/改写"
 
@@ -1423,13 +1444,13 @@ def test_legacy_hash_files_are_readonly_sources_not_mirrors(monkeypatch, tmp_pat
     assert second.returncode == 0, second.stderr
     second_count = (json.loads(platform_file.read_text(encoding="utf-8"))["count"]
                     if platform_file.exists() else 0)
-    assert second_count == 0
+    assert second_count == 2
     for path in (account_a, account_b, other_platform):
         assert _sha256(path) == before[path.name], f"{path.name} 被镜像覆盖/改写"
 
 
-def test_corrupt_legacy_hash_file_not_overwritten_and_zero_post(monkeypatch, tmp_path):
-    """H：损坏旧文件 fail-closed、不覆盖、零 POST。"""
+def test_corrupt_legacy_hash_file_not_overwritten_and_run_proceeds(monkeypatch, tmp_path):
+    """H（3.6.19 改写）：损坏旧文件**不被覆盖**；跨运行阻断已下线，运行照常提交。"""
     monkeypatch.delenv("YIKOU_SSS_AUTHORITATIVE_PATH", raising=False)
     userdata = tmp_path / "userdata"
     hash_dir = userdata / "sss_authoritative"
@@ -1456,13 +1477,13 @@ def test_corrupt_legacy_hash_file_not_overwritten_and_zero_post(monkeypatch, tmp
     platform_file = work / "platform.json"
     child_count = (json.loads(platform_file.read_text(encoding="utf-8"))["count"]
                    if platform_file.exists() else 0)
-    assert child_count == 0
+    assert child_count == 1
     assert _sha256(corrupt) == before_corrupt
     assert _sha256(other) == before_other
 
 
-def test_unknown_legacy_hash_file_quarantined_not_overwritten_zero_post(monkeypatch, tmp_path):
-    """H：归属未知旧文件必须 fail-closed、不覆盖、不放行 POST。"""
+def test_unknown_legacy_hash_file_not_overwritten_and_run_proceeds(monkeypatch, tmp_path):
+    """H（3.6.19 改写）：归属未知旧文件**不被覆盖**；运行照常提交（不再阻断）。"""
     monkeypatch.delenv("YIKOU_SSS_AUTHORITATIVE_PATH", raising=False)
     userdata = tmp_path / "userdata"
     hash_dir = userdata / "sss_authoritative"
@@ -1489,7 +1510,7 @@ def test_unknown_legacy_hash_file_quarantined_not_overwritten_zero_post(monkeypa
     platform_file = work / "platform.json"
     count = (json.loads(platform_file.read_text(encoding="utf-8"))["count"]
              if platform_file.exists() else 0)
-    assert count == 0
+    assert count == 1
     assert _sha256(unknown) == before_unknown
     assert _sha256(other) == before_other
 
@@ -1674,6 +1695,44 @@ def _blocked_config(tmp_path, journal_path, account="18758187837"):
     )
 
 
+def _submitting_fake_client(post_records, list_records):
+    """3.6.19 新契约下的假客户端：POST 正常成功并记录，站内列表返回给定记录。
+
+    （旧契约里“有历史未决记录就绝不能发 POST”的断言属于已下线的跨运行闸门；
+    本客户端用于验证“照常提交 + 记录保留”。）
+    """
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def fetch_captcha(self):
+            return b"\x89PNG fake"
+
+        def login(self, code):
+            pass
+
+        def get_json(self, path):
+            if "get-login-user-account" in path:
+                return {"success": True,
+                        "result": {"totalAmount": 500.0, "freezeAmount": 0.0}}
+            if "one-touch-send/list" in path:
+                return {"success": True,
+                        "result": {"records": list(list_records), "total": len(list_records)}}
+            raise AssertionError(f"未预期的 GET：{path}")
+
+        def post_json(self, path, body=None):
+            post_records.append((path, body))
+            return {"success": True, "code": 200}
+
+        def fork(self):
+            return self
+
+        def close(self):
+            pass
+
+    return FakeClient
+
+
 def _blocked_fake_client(post_records, list_records):
     class FakeClient:
         def __init__(self, *args, **kwargs):
@@ -1751,7 +1810,9 @@ def test_run_sss_job_timeout_records_unknown_and_never_resends(monkeypatch, tmp_
     assert result["partial"] is True
     assert result["summary"]["uncertain"] == 1
     assert result["summary"]["success_responses"] == 0
-    assert "只读" in result["next_action"]
+    # 3.6.19：文案不再要求“只做只读核对/禁止重跑”，改为“可直接再运行一次补单”。
+    assert "不会自动重发" in result["next_action"]
+    assert "再运行" in result["next_action"]
     pending = sss_uncertain.pending_records(sss_uncertain.load_journal(journal)["records"])
     assert len(pending) == 1
     assert pending[0]["error"] == "ReadTimeout"
@@ -1830,7 +1891,9 @@ def test_run_sss_job_journal_write_failure_returns_failed_without_post(monkeypat
     assert result["summary"]["failed"] >= 1
 
 
-def test_run_sss_job_blocks_across_runs_when_journal_unresolved(monkeypatch, tmp_path):
+def test_run_sss_job_continues_across_runs_with_unresolved_journal(monkeypatch, tmp_path):
+    """3.6.19 改写：历史未决记录不再阻断本批——照常提交 1 单，日志只提示，
+    历史记录（cr-t0 / cr-t1）保留、不被删除或越权清掉。"""
     excel = tmp_path / "闪时送.xlsx"
     _write_lunch_excel(excel)
     journal = tmp_path / "sss_uncertain.json"
@@ -1855,22 +1918,20 @@ def test_run_sss_job_blocks_across_runs_when_journal_unresolved(monkeypatch, tmp
 
     posts: list = []
     monkeypatch.setattr(sss_runner, "SssApiClient",
-                        _blocked_fake_client(posts, []))
+                        _submitting_fake_client(posts, []))
     cfg = _blocked_config(tmp_path, journal, account)
     logs: list[str] = []
     result = sss.run_sss_job(cfg, _Stop(), logs.append, password="x",
                              captcha_callback=lambda img: "1234")
 
-    assert result["status"] == "blocked_uncertain"
-    assert result["uncertain_records"] == 2
-    assert result["stopped"] is True
-    assert result["next_action"]
-    assert posts == []
-    assert any("拒绝任何 POST" in line for line in logs)
-    # 记录没有被后续运行绕过；跨运行仍然是 unresolved。
+    assert len(posts) == 1, "历史未决记录不再阻断：本批照常发送"
+    assert result["status"] != "blocked_uncertain"
+    assert result["stopped"] is False
+    assert any("本批继续提交" in line for line in logs)
+    # 记录没有被后续运行绕过；历史记录仍跨运行保留。
     records = sss_uncertain.pending_records(
         sss_uncertain.load_journal(journal)["records"], key)
-    assert {record["journal_id"] for record in records} == {"cr-t0", "cr-t1"}
+    assert {"cr-t0", "cr-t1"} <= {record["journal_id"] for record in records}
 
 
 def test_account_normalisation_is_conservative():
@@ -2053,8 +2114,9 @@ def test_ambiguous_2xx_with_platform_landed_is_reconciled_without_repost(tmp_pat
         sss_uncertain.load_journal(journal)["records"], key) == []
 
 
-def test_run_sss_job_account_variant_blocks_across_runs(monkeypatch, tmp_path):
-    """SN-C2：历史 journal 账号带空格，本次 compact，仍跨运行阻断。"""
+def test_run_sss_job_account_variant_continues_across_runs(monkeypatch, tmp_path):
+    """SN-C2（3.6.19 改写）：历史 journal 账号带空格也不再跨运行阻断；
+    两次运行都照常提交，记录仍按规范化账号命中且未被清掉。"""
     excel = tmp_path / "闪时送.xlsx"
     _write_lunch_excel(excel)
     journal = tmp_path / "sss_uncertain.json"
@@ -2074,17 +2136,18 @@ def test_run_sss_job_account_variant_blocks_across_runs(monkeypatch, tmp_path):
     }, ensure_ascii=False), encoding="utf-8")
     monkeypatch.setattr(sss_runner, "expected_delivery_date", lambda now: fixed_date)
     posts: list = []
-    monkeypatch.setattr(sss_runner, "SssApiClient", _blocked_fake_client(posts, []))
+    monkeypatch.setattr(sss_runner, "SssApiClient", _submitting_fake_client(posts, []))
     cfg = _blocked_config(tmp_path, journal, compact)
     first = sss.run_sss_job(cfg, _Stop(), [], password="x",
                             captcha_callback=lambda img: "1234")
     second = sss.run_sss_job(cfg, _Stop(), [], password="x",
                              captcha_callback=lambda img: "1234")
-    assert first["status"] == "blocked_uncertain"
-    assert second["status"] == "blocked_uncertain"
-    assert posts == []
-    assert sss_uncertain.pending_records(
+    assert len(posts) == 2, "历史账号写法不再阻断：两次运行各照常发送"
+    assert first["status"] != "blocked_uncertain"
+    assert second["status"] != "blocked_uncertain"
+    remaining = sss_uncertain.pending_records(
         sss_uncertain.load_journal(journal)["records"], key)
+    assert any(record["journal_id"] == "cr-account-variant" for record in remaining)
 
 
 def test_batch_key_ignores_source_but_keeps_date_and_account():
@@ -2121,8 +2184,9 @@ def test_legacy_journal_record_matches_after_source_change(tmp_path):
         sss_uncertain.load_journal(path)["records"], new_key) == []
 
 
-def test_run_sss_job_cross_source_blocks_and_repeats(monkeypatch, tmp_path):
-    """SN-C8：上次 journal 来自 excel，本次 source=wps，同日期/账号仍必须阻断。"""
+def test_run_sss_job_cross_source_continues(monkeypatch, tmp_path):
+    """SN-C8（3.6.19 改写）：上次 journal 来自 excel、本次 source=wps 也不再阻断；
+    两次运行都照常提交，旧记录保留在原处。"""
     from app.ordering.import_models import DayOrders
 
     fixed_date = dt.date(2026, 9, 16)
@@ -2147,7 +2211,7 @@ def test_run_sss_job_cross_source_blocks_and_repeats(monkeypatch, tmp_path):
                         lambda config, **kwargs: day)
     monkeypatch.setattr(sss_runner, "expected_delivery_date", lambda now: fixed_date)
     posts: list = []
-    monkeypatch.setattr(sss_runner, "SssApiClient", _blocked_fake_client(posts, []))
+    monkeypatch.setattr(sss_runner, "SssApiClient", _submitting_fake_client(posts, []))
     cfg = _blocked_config(tmp_path, journal, account)
     cfg.sss_order_source = "wps"
 
@@ -2156,13 +2220,12 @@ def test_run_sss_job_cross_source_blocks_and_repeats(monkeypatch, tmp_path):
     second = sss.run_sss_job(cfg, _Stop(), [], password="x",
                              captcha_callback=lambda img: "1234")
 
-    assert first["status"] == "blocked_uncertain"
-    assert first["uncertain_records"] == 1
-    assert second["status"] == "blocked_uncertain"
-    assert posts == []
+    assert len(posts) == 2
+    assert first["status"] != "blocked_uncertain"
+    assert second["status"] != "blocked_uncertain"
     remaining = sss_uncertain.pending_records(
         sss_uncertain.load_journal(journal)["records"])
-    assert [item["journal_id"] for item in remaining] == ["cr-cross-source"]
+    assert "cr-cross-source" in [item["journal_id"] for item in remaining]
 
 
 def test_run_sss_job_clears_journal_when_readonly_reconcile_confirms(monkeypatch, tmp_path):

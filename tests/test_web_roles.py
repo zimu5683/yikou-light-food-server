@@ -187,11 +187,10 @@ def test_non_admin_password_never_returned(server, auth):
     "check_updates",
     "wps_authorize",          # 重新授权云文档
     "open_external",
-    # 闪时送未决记录：列表含客户信息、核对要登录、解除会放开重发闸门，
-    # 三者都默认仅管理员（白名单未登记 → 403）。
-    "sss_uncertain_records",
-    "start_sss_review",
-    "sss_uncertain_resolve",
+    # 诊断日志入口跟着「更多工具」一起仅管理员（脱敏日志本身无客户信息，
+    # 但整组运维工具保持同一道门）。
+    "sss_diagnostics_files",
+    "sss_diagnostics_read",
 ])
 def test_non_admin_blocked_from_admin_methods(server, method):
     cookie = _token(server, USER, USER_PW)
@@ -258,27 +257,68 @@ def test_admin_is_allowed_the_same_method(server):
     assert status == 200
 
 
-def test_admin_uncertain_records_fail_closed_without_config(server):
-    """管理员可调只读入口；但没配网址/账号时必须如实报错，不能假装“没有记录”。"""
-    cookie = _token(server, ADMIN, ADMIN_PW)
-    status, body = _api(server, cookie, "sss_uncertain_records")
-    assert status == 200
-    assert body["ok"] is False and body["code"] == "journal_unreadable"
-    assert body["records"] == []
-    assert "read_only" in body
+# ----------------------------------------------------------------------
+# 6b. 闪时送提交诊断日志：只读查看 / 复制 / 导出（记录已脱敏，按会话权限开放）
+# ----------------------------------------------------------------------
+def _write_diagnostic(tmp_path, monkeypatch, name, text):
+    monkeypatch.setenv("YIKOU_DATA_DIR", str(tmp_path / "data"))
+    directory = tmp_path / "data" / "sss-diagnostics"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / name).write_text(text, encoding="utf-8")
+    return directory / name
 
 
-def test_admin_uncertain_resolve_requires_confirmation(server):
-    """管理员入口也必须走确认/备注校验；缺一不可，且不能返回 ok:true。"""
+def _diag_read(server, cookie, *args):
+    """按位置参数调用 sss_diagnostics_read（与真实前端 createHttpApi 同口径）。"""
+    status, text = _call(server, "POST", "/api/sss_diagnostics_read",
+                         body=list(args), cookie=cookie)
+    return status, json.loads(text)
+
+
+def test_diagnostics_files_list_and_read(server, tmp_path, monkeypatch):
+    _write_diagnostic(tmp_path, monkeypatch, "2026-10-09.jsonl",
+                      '{"row": 61, "state": "uncertain"}\n{"row": 62, "state": "success"}\n')
     cookie = _token(server, ADMIN, ADMIN_PW)
-    status, body = _api(server, cookie, "sss_uncertain_resolve", {
-        "decision": "station_absent", "confirm": "wrong",
-        "note": "人工核对完成", "record_ids": ["cr-1"]})
-    assert status == 200
-    assert body["ok"] is False
-    assert body["code"] in ("confirmation_required", "journal_unreadable")
-    assert body["changed"] is False
-    assert body["post_sent"] is False
+    status, body = _api(server, cookie, "sss_diagnostics_files")
+    assert status == 200 and body["ok"] is True
+    assert [item["name"] for item in body["files"]] == ["2026-10-09.jsonl"]
+    assert body["files"][0]["size"] > 0
+
+    status, body = _diag_read(server, cookie, "2026-10-09.jsonl")
+    assert status == 200 and body["ok"] is True
+    assert '"row": 61' in body["content"] and '"row": 62' in body["content"]
+    assert body["truncated"] is False and body["size"] > 0
+
+
+def test_diagnostics_read_rejects_invalid_names(server, tmp_path, monkeypatch):
+    """不允许目录穿越、非 .jsonl、非文件名的取值。"""
+    monkeypatch.setenv("YIKOU_DATA_DIR", str(tmp_path / "data"))
+    cookie = _token(server, ADMIN, ADMIN_PW)
+    for name in ("../config.json", "config.json", "a/b.jsonl", "", "x.txt",
+                 "sss-diagnostics/2026-10-09.jsonl"):
+        status, body = _diag_read(server, cookie, name)
+        assert status == 200, name
+        assert body["ok"] is False and body["code"] == "invalid_name", name
+        assert body["content"] == ""
+
+
+def test_diagnostics_read_returns_tail_when_oversized(server, tmp_path, monkeypatch):
+    lines = "".join(f'{{"n": {index}}}\n' for index in range(2000))
+    _write_diagnostic(tmp_path, monkeypatch, "big.jsonl", lines)
+    cookie = _token(server, ADMIN, ADMIN_PW)
+    status, body = _diag_read(server, cookie, "big.jsonl", 4096)
+    assert status == 200 and body["ok"] is True
+    assert body["truncated"] is True
+    assert body["size"] == len(lines.encode("utf-8"))
+    assert '"n": 1999' in body["content"] and '"n": 0' not in body["content"]
+
+
+def test_diagnostics_read_missing_file_is_reported(server, tmp_path, monkeypatch):
+    monkeypatch.setenv("YIKOU_DATA_DIR", str(tmp_path / "data"))
+    cookie = _token(server, ADMIN, ADMIN_PW)
+    status, body = _diag_read(server, cookie, "2026-01-01.jsonl")
+    assert status == 200 and body["ok"] is False
+    assert body["code"] == "not_found"
 
 
 def test_non_admin_cannot_change_target_via_short_field_names(server):

@@ -29,7 +29,7 @@ import {
 import { Switch } from '@/components/ui/switch'
 import { DateField, Field, GhostButton, Stepper, TextInput } from '@/components/fields'
 import { FileBrowserDialog } from '@/components/FileBrowserDialog'
-import { UncertainPanel } from '@/components/UncertainPanel'
+import { DiagnosticsDialog } from '@/components/DiagnosticsDialog'
 import {
   AdvancedSection,
   Callout,
@@ -46,7 +46,6 @@ import { toFieldErrors, validateOrderDraft, validateSssDraft } from '@/lib/formV
 import { passwordResetVersion } from '@/lib/passwordDraft'
 import { classifyRequestError } from '@/lib/requestError'
 import { previewLocalKey } from '@/lib/preview'
-import { shouldShowUncertainPanel } from '@/lib/uncertainReview'
 import { saveStateView } from '@/lib/saveState'
 import { cn } from '@/lib/utils'
 
@@ -418,7 +417,6 @@ type SssExecutionMode = 'dry_run' | 'preflight' | 'live'
 function SssForm() {
   const {
     config, passwords, startSss, workerAlive, operationActive, operationView, isAdmin, passwordReset,
-    operation, operations,
   } = useApp()
   const sssResetVersion = passwordResetVersion(passwordReset, 'sss')
   const [url, setUrl] = useState(config?.sss_url ?? '')
@@ -459,8 +457,6 @@ function SssForm() {
 
   const dryRun = executionMode === 'dry_run'
   const preflight = executionMode === 'preflight'
-  // 只在闪时送任务结果被阻断或存在未决记录时挂载；面板展开时才只读记录（不轮询）。
-  const showUncertain = shouldShowUncertainPanel(operationView, operation, operations)
 
   const save = useCallback(async () => {
     if (!isWebTransport() || !isApiReady()) {
@@ -622,8 +618,6 @@ function SssForm() {
         {(workerAlive || operationActive || operationView.needsReview || operationView.key === 'error') && (
           <FlowStrip steps={flow} label="闪时送执行流程" />
         )}
-
-        {showUncertain && <UncertainPanel password={password} isAdmin={Boolean(isAdmin)} />}
 
         {isAdmin && (
           <AdvancedSection
@@ -940,6 +934,7 @@ function ToolsMenu({ mode }: { mode: TaskMode }) {
   const toolsLabel = isSss ? '闪时送更多工具' : '订单处理更多工具'
   const accountHint = isSss ? '闪时送账号' : '管理后台账号'
   const [clearOpen, setClearOpen] = useState(false)
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false)
   const [clearing, setClearing] = useState(false)
   const [clearError, setClearError] = useState('')
 
@@ -969,9 +964,11 @@ function ToolsMenu({ mode }: { mode: TaskMode }) {
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" className="rounded-md text-xs">
           <DropdownMenuItem onClick={() => { setClearError(''); setClearOpen(true) }}>{passwordLabel}</DropdownMenuItem>
+          {isSss && <DropdownMenuItem onClick={() => setDiagnosticsOpen(true)}>闪时送诊断日志</DropdownMenuItem>}
           <DropdownMenuItem onClick={() => checkUpdates(true)}>检查更新</DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
+      <DiagnosticsDialog open={diagnosticsOpen} onOpenChange={setDiagnosticsOpen} />
       <Dialog open={clearOpen} onOpenChange={(next) => { if (!clearing) setClearOpen(next) }}>
         <DialogContent className="sm:max-w-sm rounded-lg">
           <DialogHeader>

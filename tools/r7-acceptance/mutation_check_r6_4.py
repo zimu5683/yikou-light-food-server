@@ -73,13 +73,12 @@ CASES: list[dict] = [
     },
     {
         "id": "m6",
-        "title": "M6：POST 超时/断线被当成“明确失败、允许直接重发”",
-        "scenario": "POST 超时/断线被当作明确失败并允许盲目重发",
+        "title": "M6：POST 超时/断线被当成“明确失败” → 已发送未知记录被丢弃",
+        "scenario": "POST 超时/断线被当作明确失败（已发送未知记录被丢弃）",
         "aliases": ["m6-post-timeout"],
         "expect_details": [
             'timeout:journal_lost_active_uncertain_record',
-            'timeout:blind_resend_post=2',
-            'connection_reset:blind_resend_post=2',
+            'connection_reset:journal_lost_active_uncertain_record',
         ],
         "edits": [{
             "file": "app/ordering/submission.py",
@@ -100,7 +99,7 @@ CASES: list[dict] = [
                 "        if not isinstance(exc, SssTransportError) and _is_auth_expired(exc):\n"
                 "            wrapped = _AuthExpired(str(exc))\n"
                 "        else:\n"
-                "            # MUTATION(R6-4/M6)：断线/超时当成“明确失败”，可重发。\n"
+                "            # MUTATION(R6-4/M6)：断线/超时当成“明确失败”，记录被丢弃。\n"
                 "            wrapped = _ExplicitRejection(str(exc))\n"
                 "        wrapped.diagnostics = dict(getattr(exc, \"diagnostics\", {}) or {})\n"
                 "        raise wrapped from exc\n"
@@ -110,8 +109,11 @@ CASES: list[dict] = [
                 "        raise _ExplicitRejection(detail) from exc\n"
             ),
             "catches": (
-                "超时/断线被降级为显式失败后，本地记录被 discard，第二次运行不再"
-                "阻断而是真的又发了一次 POST（合成平台计数 1 → 2）。"
+                "超时/断线被降级为显式失败后，本地「已发送未知」记录被 discard："
+                "POST 已经落库（合成平台计数 1）却不再有任何活跃记录，跨运行与事后"
+                "排查都失去依据。探针在首轮就报 "
+                "``journal_lost_active_uncertain_record``（3.6.19 起跨运行不再阻断，"
+                "判据从“第二次运行被拦”改为“记录不得被丢弃”）。"
             ),
         }],
     },
@@ -121,7 +123,8 @@ CASES: list[dict] = [
         "scenario": "批次范围（日期/账号/平台）隔离失效",
         "aliases": ["m8-batch-scope"],
         "expect_details": [
-            'other_scope_should_not_block:rc=0,post=0',
+            'other_scope_record_clobbered:scope-d-other-account',
+            'other_scope_record_clobbered:scope-d-other-date',
         ],
         "edits": [{
             "file": "app/ordering/uncertain.py",
@@ -154,8 +157,11 @@ CASES: list[dict] = [
                 "    return True\n"
             ),
             "catches": (
-                "其他账号/其他日期的未决记录被当成当前批次 → 合法新订单被错误"
-                "阻断（探针 A 场景 POST=1 变 POST=0）。"
+                "其他账号/其他日期的记录被当成当前批次：站内只读对账会把它们当成"
+                "本批记录去匹配「另一个人的站内订单」，匹配上就被标记 resolved ——"
+                " 探针 D 场景报 ``other_scope_record_clobbered:scope-d-other-*``"
+                "（3.6.19 起跨运行不再阻断，判据从“误阻断本批”改为“误清/改写"
+                "其他 scope 的记录”）。"
             ),
         }],
     },
@@ -165,7 +171,8 @@ CASES: list[dict] = [
         "scenario": "批次范围（日期/账号/平台）隔离失效",
         "aliases": ["m8-batch-scope"],
         "expect_details": [
-            'other_scope_should_not_block:rc=0,post=0',
+            'other_scope_record_clobbered:scope-d-other-account',
+            'other_scope_record_clobbered:scope-d-other-date',
         ],
         "edits": [{
             "file": "app/ordering/uncertain.py",
@@ -210,7 +217,8 @@ CASES: list[dict] = [
             ),
             "catches": (
                 "只要日期或账号任一相同就命中：其他账号（同日期）或其他日期"
-                "（同账号）的记录都会错误阻断本批合法新订单。"
+                "（同账号）的记录被当成当前批次去对账，匹配上就被标记 resolved ——"
+                " 探针 D 场景报 ``other_scope_record_clobbered:scope-d-other-*``。"
             ),
         }],
     },
@@ -220,7 +228,7 @@ CASES: list[dict] = [
         "scenario": "批次范围（日期/账号/平台）隔离失效",
         "aliases": ["m8-batch-scope"],
         "expect_details": [
-            'same_batch_legacy_key_should_block:rc=0,post=1',
+            'own_batch_record_not_reconciled:unresolved',
         ],
         "edits": [{
             "file": "app/ordering/uncertain.py",
@@ -253,8 +261,10 @@ CASES: list[dict] = [
                 "    return False\n"
             ),
             "catches": (
-                "同账号同日期的未决记录（含旧三段 batch_key）不再命中 → 本批"
-                "直接放行并真的又发了一次 POST（探针 B 场景 POST=0 变 1）。"
+                "同账号同日期的未决记录（含旧三段 batch_key）不再被选中做只读对账："
+                "本批自己的历史记录永远不会被确认清理（探针 D 场景报 "
+                "``own_batch_record_not_reconciled:unresolved``）；A/B 场景还要求"
+                "「照常提交」，所以这里用 D 的“本批记录必须被对账”作为判据。"
             ),
         }],
     },

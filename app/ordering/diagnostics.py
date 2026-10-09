@@ -24,8 +24,13 @@ def payload_digest(payload: dict[str, Any]) -> str:
     return hashlib.sha256(material).hexdigest()[:16]
 
 
+def diagnostic_dir() -> Path:
+    """提交诊断日志目录（``sss-diagnostics/``，只读查看/导出入口用）。"""
+    return user_data_dir() / "sss-diagnostics"
+
+
 def diagnostic_log_path() -> Path:
-    return user_data_dir() / "sss-diagnostics" / f"{dt.date.today().isoformat()}.jsonl"
+    return diagnostic_dir() / f"{dt.date.today().isoformat()}.jsonl"
 
 
 def submission_diagnostic(task: dict[str, Any], response: Any, *, started_at: float,

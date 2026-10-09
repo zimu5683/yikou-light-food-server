@@ -89,21 +89,27 @@ def _platform_count(work: Path, *, shared_dir: Path | None = None) -> int:
 
 
 def test_same_journal_two_processes_only_one_post(tmp_path):
-    """真实子进程 + 合成平台：同一 journal 路径时只能产生 1 次 POST。"""
+    """真实子进程 + 合成平台：站内可见时第二次运行必须靠对账去重，不重复 POST。
+
+    3.6.19：跨运行阻断（历史未决记录闸门）已下线，本用例只依赖「提交前站内
+    对账」识别已存在订单；批次锁等待放宽，让第二个进程在锁上串行而不是等超时。
+    """
     work = tmp_path / "same"
     work.mkdir()
-    (work / "hidden").write_text("1", encoding="utf-8")
     journal = work / "sss_uncertain.json"
 
-    first = _spawn(work, journal)
+    first = _spawn(work, journal, lock_timeout="60")
     _wait_signal(work)
-    second = _spawn(work, journal)
-    first_out, first_err = first.communicate(timeout=40)
-    second_out, second_err = second.communicate(timeout=40)
+    second = _spawn(work, journal, lock_timeout="60")
+    first_out, first_err = first.communicate(timeout=60)
+    second_out, second_err = second.communicate(timeout=60)
 
     assert first.returncode == 0, first_err or first_out
     assert second.returncode == 0, second_err or second_out
     assert _platform_count(work) == 1
+    result = json.loads(second_out.strip().splitlines()[-1])
+    assert result.get("status") == "confirmed", result
+    assert result.get("created") == 1, result
 
 
 def test_crash_after_post_same_journal_does_not_repost(tmp_path):
@@ -119,66 +125,107 @@ def test_crash_after_post_same_journal_does_not_repost(tmp_path):
     assert _platform_count(work) == 1
 
 
-def test_account_variant_two_processes_same_journal_blocked(tmp_path):
-    """等价账号写法（空格/NFKC）跨真实子进程必须命中同一 unresolved 阻断。"""
+def test_account_variant_two_processes_share_authority_and_submit(tmp_path):
+    """等价账号写法（空格/NFKC）必须映射到同一权威作用域，且各自照常提交。
+
+    3.6.19：跨运行阻断已下线（本用例原名 ``..._blocked``），改为锁定
+    「账号规范化 + 不破坏 + 照常提交」：等价写法共享同一个按规范化账号命名的
+    权威文件、记录里的 account 是规范化写法；跨运行重复不再被拦，再次运行照常提交。
+    """
     work = tmp_path / "account-variant"
     work.mkdir()
     (work / "hidden").write_text("1", encoding="utf-8")
-    journal = work / "sss_uncertain.json"
 
-    first = _spawn(work, journal, account="１８７ ５８１８ ７８３７")
+    first = _spawn(work, work / "journal-a.json",
+                   account="１８７ ５８１８ ７８３７",
+                   set_authority=False, lock_timeout="60")
     _wait_signal(work)
-    second = _spawn(work, journal, account="18758187837")
-    first_out, first_err = first.communicate(timeout=40)
-    second_out, second_err = second.communicate(timeout=40)
+    second = _spawn(work, work / "journal-b.json", account="18758187837",
+                    set_authority=False, lock_timeout="60")
+    first_out, first_err = first.communicate(timeout=60)
+    second_out, second_err = second.communicate(timeout=60)
 
     assert first.returncode == 0, first_err or first_out
     assert second.returncode == 0, second_err or second_out
-    assert _platform_count(work) == 1
+    assert _platform_count(work) == 2
 
-    recover = _spawn(work, journal)
-    out2, err2 = recover.communicate(timeout=40)
-    assert recover.returncode == 0, err2 or out2
-    assert _platform_count(work) == 1
+    files = sorted((work / "authoritative-root").glob("*.json"))
+    assert len(files) == 1, [path.name for path in files]
+    records = json.loads(files[0].read_text(encoding="utf-8"))["records"]
+    active = [record for record in records
+              if str(record.get("status") or "unresolved")
+              not in ("resolved", "discarded")]
+    assert active, records
+    assert all(record.get("account") == "18758187837" for record in active), active
+
+    recover = _spawn(work, work / "journal-c.json", set_authority=False,
+                     lock_timeout="60")
+    recover_out, recover_err = recover.communicate(timeout=60)
+    assert recover.returncode == 0, recover_err or recover_out
+    assert _platform_count(work) == 3
 
 
-def test_different_journal_paths_two_processes_only_one_post(tmp_path):
-    """同一业务批次，即使实例配置了不同 sss_uncertain_path，也只能 POST=1。"""
+def test_different_journal_paths_two_processes_each_submit_and_keep_records(tmp_path):
+    """同一业务批次即使实例配置了不同 sss_uncertain_path，也照常提交、记录不丢。
+
+    3.6.19：跨运行阻断已下线（本用例原名 ``..._only_one_post``）——两次运行
+    各提交一次（站内不可见时无法证明已存在），共享权威 journal 必须保留活跃记录。
+    """
     work = tmp_path / "different-journal"
     work.mkdir()
     (work / "hidden").write_text("1", encoding="utf-8")
-    data_dir = work / "deployment-data"
-    data_dir.mkdir()
-    authority = work / "authoritative-uncertain.json"
 
-    first = _spawn(work, work / "journal-a.json")
+    first = _spawn(work, work / "journal-a.json", lock_timeout="60")
     _wait_signal(work)
-    second = _spawn(work, work / "journal-b.json")
-    first_out, first_err = first.communicate(timeout=40)
-    second_out, second_err = second.communicate(timeout=40)
+    second = _spawn(work, work / "journal-b.json", lock_timeout="60")
+    first_out, first_err = first.communicate(timeout=60)
+    second_out, second_err = second.communicate(timeout=60)
 
     assert first.returncode == 0, first_err or first_out
     assert second.returncode == 0, second_err or second_out
-    assert _platform_count(work) == 1
-    # 第二个进程必须在权威共享 journal 上看到并处理第一个进程的未决记录。
+    assert _platform_count(work) == 2
+    # 两个进程共享同一权威共享 journal，记录必须留下（不丢）。
+    authority = work / "authoritative-uncertain.json"
     assert authority.exists()
+    records = json.loads(authority.read_text(encoding="utf-8"))["records"]
+    active = [record for record in records
+              if str(record.get("status") or "unresolved")
+              not in ("resolved", "discarded")]
+    assert active, records
 
 
-def test_crash_then_different_journal_does_not_repost(tmp_path):
-    """首进程 POST 后崩溃，次进程用不同 journal 路径也不能盲目重发。"""
+def test_crash_then_different_journal_submits_again_and_keeps_record(tmp_path):
+    """首进程 POST 后崩溃，次进程用不同 journal 路径：照常提交、不丢崩溃记录。
+
+    3.6.19：跨运行阻断已下线（本用例原名 ``..._does_not_repost``）——崩溃进程
+    本身只 POST 一次；换路径重跑照常提交（站内不可见），崩溃记录保持活跃。
+    """
     work = tmp_path / "crash-different-journal"
     work.mkdir()
     (work / "hidden").write_text("1", encoding="utf-8")
 
     crash = _spawn(work, work / "journal-a.json", "crash")
-    out, err = crash.communicate(timeout=40)
+    out, err = crash.communicate(timeout=60)
     assert crash.returncode == 17, err or out
     assert _platform_count(work) == 1
 
-    recover = _spawn(work, work / "journal-b.json")
-    out2, err2 = recover.communicate(timeout=40)
+    authority = work / "authoritative-uncertain.json"
+    records = json.loads(authority.read_text(encoding="utf-8"))["records"]
+    crashed_ids = {str(record.get("journal_id")) for record in records
+                   if str(record.get("status") or "unresolved")
+                   not in ("resolved", "discarded")}
+    assert crashed_ids, records
+
+    recover = _spawn(work, work / "journal-b.json", lock_timeout="60")
+    out2, err2 = recover.communicate(timeout=60)
     assert recover.returncode == 0, err2 or out2
-    assert _platform_count(work) == 1
+    assert _platform_count(work) == 2
+
+    still_records = json.loads(authority.read_text(encoding="utf-8"))["records"]
+    still_active = {str(record.get("journal_id")) for record in still_records
+                    if str(record.get("status") or "unresolved")
+                    not in ("resolved", "discarded")}
+    assert crashed_ids <= still_active, still_records
 
 
 def test_legal_new_order_is_created_once_across_two_processes(tmp_path):
@@ -200,8 +247,13 @@ def test_legal_new_order_is_created_once_across_two_processes(tmp_path):
     assert _platform_count(work) == 1
 
 
-def test_legacy_journal_is_migrated_and_blocks_before_post(tmp_path):
-    """旧 sss_uncertain_path 中的 unresolved 必须先合并并保守阻断。"""
+def test_legacy_journal_is_migrated_and_submits_with_record_kept(tmp_path):
+    """旧 sss_uncertain_path 中的 unresolved 先迁移进权威状态，本批照常提交。
+
+    3.6.19：历史未决记录不再阻断本批（本用例原名 ``..._blocks_before_post``），
+    改为断言「照常提交（POST=1）+ 旧记录不丢」：迁移后的旧记录保持活跃
+    unresolved，兼容镜像（显式配置的旧路径）里这条记录也仍在。
+    """
     work = tmp_path / "legacy"
     work.mkdir()
     (work / "hidden").write_text("1", encoding="utf-8")
@@ -215,15 +267,24 @@ def test_legacy_journal_is_migrated_and_blocks_before_post(tmp_path):
               "source": "excel"})
 
     child = _spawn(work, legacy)
-    out, err = child.communicate(timeout=40)
+    out, err = child.communicate(timeout=60)
 
     assert child.returncode == 0, err or out
-    assert _platform_count(work) == 0, "旧 unresolved 未阻断，POST 被发出了"
+    assert _platform_count(work) == 1, "本批应照常提交一次"
+
+    def _by_id(path: Path, journal_id: str):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for record in payload["records"]:
+            if str(record.get("journal_id") or "") == journal_id:
+                return record
+        return None
+
     authority = work / "authoritative-uncertain.json"
-    assert authority.exists()
-    pending = sss_uncertain.pending_records(
-        sss_uncertain.load_journal(authority)["records"])
-    assert len(pending) == 1
+    migrated = _by_id(authority, "cr-legacy-1")
+    assert migrated is not None, authority.read_text(encoding="utf-8")
+    assert migrated.get("status") == "unresolved", migrated
+    assert _by_id(legacy, "cr-legacy-1") is not None, \
+        "兼容镜像里旧记录不得被删除"
 
 
 def test_batch_lock_failure_blocks_before_post(tmp_path):
@@ -747,7 +808,7 @@ def _load_probe_module():
 
 
 def test_probe_still_detects_dangerous_recovery_leak(monkeypatch):
-    """证明修正后的探针仍会因“危险返回”失败，而不是硬编码 BLOCKED。"""
+    """证明修正后的探针仍会因“危险返回”失败，而不是硬编码 SAFE。"""
     def dangerous_full(_ledger):
         return {
             "ok": True,
@@ -775,15 +836,23 @@ def test_probe_still_detects_dangerous_recovery_leak(monkeypatch):
     assert probe.probe_recovery_status_name_leak() is True
 
 
-def test_probe_script_is_green_all_safety_invariants_blocked():
-    """把探针纳入 pytest 自动回归：正常实现必须 exit 0 且全部不变量 BLOCKED。"""
+def test_probe_script_is_green_all_safety_invariants_hold():
+    """把探针纳入 pytest 自动回归：正常实现必须 exit 0 且全部场景 SAFE。
+
+    3.6.19：报告词从 BLOCKED 改为 SAFE（旧词是「跨运行阻断」语义，已下线），
+    判定仍是「每个选中场景都没有复现缺陷」。
+    """
     completed = subprocess.run(
         [sys.executable, str(REPO_ROOT / "tests" /
                              "independent_final_counterexample_probe.py")],
-        cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=300)
+        cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=900)
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert "DEFECT" not in completed.stdout, completed.stdout
-    assert completed.stdout.count("BLOCKED") == 21, completed.stdout
+    lines = completed.stdout.splitlines()
+    defect_lines = [line for line in lines if line.startswith("DEFECT")]
+    assert not defect_lines, completed.stdout
+    assert "BLOCKED" not in completed.stdout, completed.stdout
+    safe_lines = [line for line in lines if line.startswith("SAFE")]
+    assert len(safe_lines) == 21, completed.stdout
 
 
 def test_probe_registry_covers_r6_4_blind_spots():
@@ -793,7 +862,7 @@ def test_probe_registry_covers_r6_4_blind_spots():
     assert len(probe.SCENARIOS) == 21, registry
     assert registry["m4-json-corrupt"] == "JSON 语法损坏 journal 被当作空状态放行"
     assert registry["m6-post-timeout"] == \
-        "POST 超时/断线被当作明确失败并允许盲目重发"
+        "POST 超时/断线被当作明确失败（已发送未知记录被丢弃）"
     assert registry["m8-batch-scope"] == "批次范围（日期/账号/平台）隔离失效"
     # 只读用法/别名帮助可用，且 --only 不会静默跑空。
     listed = subprocess.run(
@@ -804,6 +873,11 @@ def test_probe_registry_covers_r6_4_blind_spots():
     assert listed.returncode == 0, listed.stdout + listed.stderr
     for alias in ("m4-json-corrupt", "m6-post-timeout", "m8-batch-scope"):
         assert alias in listed.stdout, listed.stdout
+    # 3.6.19：跨运行阻断已下线，旧词不得再出现在场景名/用法说明里。
+    assert "BLOCKED" not in listed.stdout
+    assert "BLOCKED" not in probe.USAGE
+    assert all("未保守阻断" not in name or alias == "batch-lock"
+               for alias, name, _func in probe.SCENARIOS), registry
 
 
 def _load_mutation_check_r6_4():

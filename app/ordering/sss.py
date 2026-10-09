@@ -128,7 +128,6 @@ from app.ordering.submission import (
 from app.ordering.runner import (
     _exclusive_sss_job,
     run_sss_job,
-    run_sss_review_job,
 )
 from app.ordering.cloud_import import ImportRefused, prepare_day_orders
 from app.ordering.uncertain import (
@@ -275,7 +274,6 @@ __all__ = [
     "pending_record_views",
     "platform_origin",
     "resolve_uncertain_records",
-    "run_sss_review_job",
     "auth_error_message",
     "build_order_payload",
     "compute_delivery_time",
