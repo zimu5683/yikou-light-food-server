@@ -938,7 +938,9 @@ function ToolsMenu({ mode }: { mode: TaskMode }) {
   const [clearing, setClearing] = useState(false)
   const [clearError, setClearError] = useState('')
 
-  if (!isAdmin) return null
+  // 闪时送页的「更多」对所有会话可用（诊断日志不再要求管理员）；
+  // 订单页只有管理员才有内容（清除密码/检查更新）。
+  if (!isAdmin && !isSss) return null
 
   async function doClear() {
     setClearing(true)
@@ -963,9 +965,9 @@ function ToolsMenu({ mode }: { mode: TaskMode }) {
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" className="rounded-md text-xs">
-          <DropdownMenuItem onClick={() => { setClearError(''); setClearOpen(true) }}>{passwordLabel}</DropdownMenuItem>
+          {isAdmin && <DropdownMenuItem onClick={() => { setClearError(''); setClearOpen(true) }}>{passwordLabel}</DropdownMenuItem>}
           {isSss && <DropdownMenuItem onClick={() => setDiagnosticsOpen(true)}>闪时送诊断日志</DropdownMenuItem>}
-          <DropdownMenuItem onClick={() => checkUpdates(true)}>检查更新</DropdownMenuItem>
+          {isAdmin && <DropdownMenuItem onClick={() => checkUpdates(true)}>检查更新</DropdownMenuItem>}
         </DropdownMenuContent>
       </DropdownMenu>
       <DiagnosticsDialog open={diagnosticsOpen} onOpenChange={setDiagnosticsOpen} />

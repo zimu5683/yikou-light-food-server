@@ -187,10 +187,6 @@ def test_non_admin_password_never_returned(server, auth):
     "check_updates",
     "wps_authorize",          # 重新授权云文档
     "open_external",
-    # 诊断日志入口跟着「更多工具」一起仅管理员（脱敏日志本身无客户信息，
-    # 但整组运维工具保持同一道门）。
-    "sss_diagnostics_files",
-    "sss_diagnostics_read",
 ])
 def test_non_admin_blocked_from_admin_methods(server, method):
     cookie = _token(server, USER, USER_PW)
@@ -258,7 +254,8 @@ def test_admin_is_allowed_the_same_method(server):
 
 
 # ----------------------------------------------------------------------
-# 6b. 闪时送提交诊断日志：只读查看 / 复制 / 导出（记录已脱敏，按会话权限开放）
+# 6b. 闪时送提交诊断日志：只读查看 / 复制 / 导出（记录已脱敏；任何登录会话可用——
+#     本项目不再按管理员区分功能，随下个版本发布）
 # ----------------------------------------------------------------------
 def _write_diagnostic(tmp_path, monkeypatch, name, text):
     monkeypatch.setenv("YIKOU_DATA_DIR", str(tmp_path / "data"))
@@ -278,7 +275,7 @@ def _diag_read(server, cookie, *args):
 def test_diagnostics_files_list_and_read(server, tmp_path, monkeypatch):
     _write_diagnostic(tmp_path, monkeypatch, "2026-10-09.jsonl",
                       '{"row": 61, "state": "uncertain"}\n{"row": 62, "state": "success"}\n')
-    cookie = _token(server, ADMIN, ADMIN_PW)
+    cookie = _token(server, USER, USER_PW)  # 非管理员也应可用（不再区分管理员）
     status, body = _api(server, cookie, "sss_diagnostics_files")
     assert status == 200 and body["ok"] is True
     assert [item["name"] for item in body["files"]] == ["2026-10-09.jsonl"]
@@ -293,7 +290,7 @@ def test_diagnostics_files_list_and_read(server, tmp_path, monkeypatch):
 def test_diagnostics_read_rejects_invalid_names(server, tmp_path, monkeypatch):
     """不允许目录穿越、非 .jsonl、非文件名的取值。"""
     monkeypatch.setenv("YIKOU_DATA_DIR", str(tmp_path / "data"))
-    cookie = _token(server, ADMIN, ADMIN_PW)
+    cookie = _token(server, USER, USER_PW)
     for name in ("../config.json", "config.json", "a/b.jsonl", "", "x.txt",
                  "sss-diagnostics/2026-10-09.jsonl"):
         status, body = _diag_read(server, cookie, name)
@@ -305,7 +302,7 @@ def test_diagnostics_read_rejects_invalid_names(server, tmp_path, monkeypatch):
 def test_diagnostics_read_returns_tail_when_oversized(server, tmp_path, monkeypatch):
     lines = "".join(f'{{"n": {index}}}\n' for index in range(2000))
     _write_diagnostic(tmp_path, monkeypatch, "big.jsonl", lines)
-    cookie = _token(server, ADMIN, ADMIN_PW)
+    cookie = _token(server, USER, USER_PW)
     status, body = _diag_read(server, cookie, "big.jsonl", 4096)
     assert status == 200 and body["ok"] is True
     assert body["truncated"] is True
@@ -315,7 +312,7 @@ def test_diagnostics_read_returns_tail_when_oversized(server, tmp_path, monkeypa
 
 def test_diagnostics_read_missing_file_is_reported(server, tmp_path, monkeypatch):
     monkeypatch.setenv("YIKOU_DATA_DIR", str(tmp_path / "data"))
-    cookie = _token(server, ADMIN, ADMIN_PW)
+    cookie = _token(server, USER, USER_PW)
     status, body = _diag_read(server, cookie, "2026-01-01.jsonl")
     assert status == 200 and body["ok"] is False
     assert body["code"] == "not_found"

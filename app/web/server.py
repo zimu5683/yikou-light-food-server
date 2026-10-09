@@ -87,6 +87,9 @@ _NON_ADMIN_METHODS = frozenset({
     "wps_status", "wps_preview", "wps_upload", "wps_check_copies",
     # 闪时送每日订单查询（只读）
     "sss_day_orders",
+    # 闪时送诊断日志查看/导出（只读、已脱敏；任何登录会话都可用——本项目不再按
+    # 管理员区分功能，随下个版本发布）
+    "sss_diagnostics_files", "sss_diagnostics_read",
     # 操作断线查询（订单/闪时送/云上传/授权/更新的 active/最近结果）
     "operation_status",
     # 只读恢复：WPS 恢复对账 + pending 交互列表（普通用户只会看到自己的交互）
