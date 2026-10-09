@@ -51,6 +51,21 @@
   （预期）；`python -m compileall -q app` 与 `git diff --check` 通过。
 - 未改动前端；干跑/预检路径不受节流影响（不产生 POST）。
 
+### 发布补记：CI 验证、出包与发布结果
+
+- main 推送（`2639a66`）后 CI 全绿：Tests **1608 passed / 1 xpassed**（Python 3.11 与
+  3.13 各一遍，含 `ruff check app tests scripts`「All checks passed!」、前端构建/lint、
+  锚点唯一性与 headless Chrome 浏览器门禁、Workspace hygiene；`mutation` 作业按设计
+  只在 PR/手动触发时运行，本次跳过），Android APK（main）出包成功。相关 run：
+  Tests 37882785144、Android APK（main）37882785058。
+- tag `v3.6.18` 触发的发布流水线（run 37883489473）成功：**Release v3.6.18 已发布**
+  （https://github.com/zimu5683/yikou-light-food-server/releases/tag/v3.6.18），
+  APK `yikou-light-food-3.6.18-arm64.apk` **19,836,741 字节**，sha256
+  `99d5ad4c…cce6dab8`（资产内 `.sha256` 与出包日志一致）。
+- 本机网络对 `github.com:443` 继续间歇性握手失败：`git push` 均在数次重试内完成
+  （main 第 2 次、tag `v3.6.18` 第 1 次成功），未使用 API 镜像。仅影响推送通道，
+  不改动仓库内容。
+
 ## 3.6.17
 
 一次「落单证据收紧 + 可取证」的版本：闪时送下单失败不再凭错误文字认定事务已回滚，
