@@ -62,6 +62,19 @@
   `java.lang.IndexOutOfBoundsException`（当晚 99 单成功 26）。该现象与发送间隔无关
   （放宽间隔不改变失败比例），根因与后续处置另行排查。
 
+### 发布补记：CI 验证、出包与发布结果
+
+- main 推送（`7f963d7`）后 CI 全绿：Tests **1549 passed**（Python 3.11 与 3.13 各一遍，
+  含 `ruff check app tests scripts`「All checks passed!」、前端构建/lint/测试/锚点与
+  headless Chrome 浏览器门禁、Workspace hygiene），Android APK（main）出包成功。
+  相关 run：Tests 37957402565、Android APK（main）37957402559。
+- tag `v3.6.19` 触发的发布流水线（run 37958520290）成功：**Release v3.6.19 已发布**
+  （https://github.com/zimu5683/yikou-light-food-server/releases/tag/v3.6.19），
+  APK `yikou-light-food-3.6.19-arm64.apk` **19,815,209 字节**，sha256
+  `624366df…e954901`（资产内 `.sha256` 与出包日志一致）。
+- 本机网络对 `github.com:443` 继续间歇性握手失败：`git push` 在重试内完成
+  （main 第 6 次、tag 第 1 次成功）。仅影响推送通道，不改动仓库内容。
+
 ## 3.6.18
 
 一次「把建单发送节奏压回平台受理上限之内」的版本：定位并修复 2026-10-09
