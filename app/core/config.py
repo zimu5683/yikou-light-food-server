@@ -19,32 +19,32 @@ _CONFIG_SAVE_LOCK = threading.RLock()
 #: 出厂默认值的迁移版本号。`sss_max_workers` / `sss_read_timeout_s` 在界面上从来
 #: 没有入口，旧配置里保存的只可能是**当时的出厂默认**；直接改默认值对已有安装无效
 #: （`load()` 会把磁盘上的旧值原样读回来）。因此用这个版本号做**一次性**迁移：
-#: 只把仍等于旧出厂默认的取值搬到新默认，用户显式改过的其它取值（1 = 串行回退、
-#: 2、6、12、20…）一律保留。旧配置缺这个键 → 视为 0（迁移前）。
-DEFAULTS_REVISION = 2
+#: 只把仍等于旧出厂默认的取值搬到新默认，用户显式改过的其它取值（2、6、12、20…）
+#: 一律保留。旧配置缺这个键 → 视为 0（迁移前）。
+DEFAULTS_REVISION = 3
 
 #: v0 → v1：下单并发 4 → 8、读取超时 20 → 30 秒。
 #: v1 → v2：下单并发 8 → 4（读取超时 30 秒不变）。
-#: 并发依据：v1 以「生产实测 4 路吞吐 0.44-0.48 单/秒，吞吐随并发线性」判定平台
-#: 不做账号级串行；2026-10-09 的现场证明那个 0.44-0.48 单/秒恰是平台对同一账号的
-#: 建单受理上限（约 1 单 / 2.1 秒），且当时的 4/8/16/32 路压测压的是「校验失败」
-#: 分支，不能代表真实建单路径：超速请求会被平台快速驳回（内部异常，仍消耗平台
-#: 订单序列号）。提交节奏现由 ``sss_submit_min_interval_s``（出厂 2.5 秒）兜住。
-#: v2 回到 4 路的依据：并发只影响"同时在建的单数"，4 路已达到该平台建单耗时的
-#: 吞吐上限附近，而更低的并发在平台偶发排队/限流时留下的余量更大；把
-#: `sss_max_workers` 配成 8 等其它值即可（字段无界面入口，改 config.json 生效）。
-_LEGACY_DEFAULT_SSS_MAX_WORKERS = 8
+#: v2 → v3：下单并发 4 → 1（默认串行；读取超时 30 秒不变）。
+#: 并发依据（2026-10-10 更新）：平台建单路径存在偶发缺陷——约 2/3 的请求被快速
+#: 驳回（`IndexOutOfBoundsException`），且 3.6.18 实测证明**失败比例与提交节奏无关**
+#: （最小间隔放宽到 10 秒后照旧失败）；此前「4 路吞吐 0.44-0.48 单/秒 ≈ 平台受理上限」
+#: 的判定已被推翻。串行把同时在建的单数压到最少、日志更干净，也避免快速失败在
+#: 多路之间互相穿插；需要并发时把 `sss_max_workers` 配成 2/4/8 等即可（字段无界面
+#: 入口，改 config.json 生效，上限 20）。
+_V1_DEFAULT_SSS_MAX_WORKERS = 8
+_V2_DEFAULT_SSS_MAX_WORKERS = 4
 _LEGACY_DEFAULT_SSS_READ_TIMEOUT_S = 20.0
-_DEFAULT_SSS_MAX_WORKERS = 4
+_DEFAULT_SSS_MAX_WORKERS = 1
 _DEFAULT_SSS_READ_TIMEOUT_S = 30.0
-#: 并发路数上限（夹紧用）。平台是否按账号限流尚未验证，放开上限前先看
-#: ``design/SSS-对账提速与并发.md`` 的实测结论。
+#: 并发路数上限（夹紧用）。2026-10-09 实测表明失败与节奏无关（见上），上限保留 20
+#: 供受控实验；放开上限前先看 ``design/SSS-对账提速与并发.md``。
 _SSS_MAX_WORKERS_CEILING = 20
 #: 闪时送建单提交的全局最小间隔（秒）：相邻两次 POST 起点至少间隔该值。
-#: 2026-10-09 实测：平台对同一账号的建单受理上限约 1 单 / 2.1 秒，4 路滚动补位
-#: 全速提交约 1.37 单/秒 = 约 3 倍超速，导致每轮约 2/3 失败并呈现「每 3 单成功
-#: 1 单」的节拍（超速请求被快速驳回且烧掉平台订单序列号）。出厂 2.5 秒 =
-#: 实测受理间隔 + 余量；0 = 关闭节流（仅在确认平台已无限速时使用）。
+#: 用途是给平台建单留出受理间隔、并限制快速失败时的请求兜圈速度（每次失败请求都会
+#: 消耗一个平台订单序列号）。注意：2026-10-09 晚的实测证明它**不能**消除批量驳回
+#: （间隔放宽到 10 秒后失败比例不变）——它只是节奏保险，不是本次平台缺陷的解药。
+#: 出厂 2.5 秒；0 = 关闭节流。
 _DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S = 2.5
 _SSS_SUBMIT_MIN_INTERVAL_CEILING_S = 60.0
 
@@ -252,7 +252,7 @@ class AppConfig:
     # 门店 id 缓存：按门店名命中后跳过门店列表查询（门店几乎不变）。
     sss_store_id: int | None = None
     sss_store_name_cached: str = ""
-    # 批量下单并发 worker 数（1 = 串行，平台限流或对账压力大时回退）。v2 起出厂 4；
+    # 批量下单并发 worker 数（1 = 串行；v3 起出厂 1，需要并发时配成 2/4/8，上限 20）；
     # 提交节奏另由下方 sss_submit_min_interval_s 节流。
     sss_max_workers: int = _DEFAULT_SSS_MAX_WORKERS
     # 建单最小间隔（秒）：相邻两次 POST 起点的全局最小间隔；0 = 关闭节流。
@@ -391,11 +391,14 @@ class AppConfig:
         except (TypeError, ValueError):
             revision = DEFAULTS_REVISION
         if revision < DEFAULTS_REVISION:
-            # 一次性迁移：只搬「仍等于旧出厂默认」的取值，用户改过的其它值不动。
-            if self.sss_max_workers == _LEGACY_DEFAULT_SSS_MAX_WORKERS:
-                self.sss_max_workers = _DEFAULT_SSS_MAX_WORKERS
-            if self.sss_read_timeout_s == _LEGACY_DEFAULT_SSS_READ_TIMEOUT_S:
-                self.sss_read_timeout_s = _DEFAULT_SSS_READ_TIMEOUT_S
+            # 逐代迁移：每一代只搬「仍等于该代出厂默认」的取值，用户改过的其它值不动。
+            if revision < 2:
+                if self.sss_max_workers == _V1_DEFAULT_SSS_MAX_WORKERS:
+                    self.sss_max_workers = _V2_DEFAULT_SSS_MAX_WORKERS  # v1 出厂值 8 → 4
+                if self.sss_read_timeout_s == _LEGACY_DEFAULT_SSS_READ_TIMEOUT_S:
+                    self.sss_read_timeout_s = _DEFAULT_SSS_READ_TIMEOUT_S
+            if revision < 3 and self.sss_max_workers == _V2_DEFAULT_SSS_MAX_WORKERS:
+                self.sss_max_workers = _DEFAULT_SSS_MAX_WORKERS  # v2 出厂值 4 → 1
         self.defaults_revision = DEFAULTS_REVISION
         try:
             self.sss_unit_price = max(0.0, float(sss_unit_price))

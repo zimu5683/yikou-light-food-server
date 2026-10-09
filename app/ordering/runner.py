@@ -213,8 +213,8 @@ def run_sss_job(config: Any, stop_event: Any,
     common_address = str(getattr(config, "sss_common_address", "") or "")
     use_fixed_address = bool(getattr(config, "sss_use_fixed_address", False))
     goods_name = str(getattr(config, "sss_product_name", "") or "轻食")
-    # 出厂并发 4（v2 起）；旧配置里等于 3.6.15 出厂默认的 8 由 AppConfig 的
-    # 一次性迁移搬过来，用户显式改过的其它取值原样生效。
+    # 出厂并发 1（v3 起，串行）；旧配置里等于历史出厂默认的 8 / 4 由 AppConfig 的
+    # 逐代迁移搬过来，用户显式改过的其它取值原样生效。
     max_workers = resolve_create_workers(config)
     submit_min_interval_s = resolve_submit_min_interval_s(config)
     batch_id = uuid.uuid4().hex[:12]

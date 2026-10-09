@@ -9,7 +9,7 @@
 
 - [WPS-CLOUD-SYNC-PLAN.md](WPS-CLOUD-SYNC-PLAN.md) — WPS 云同步总体方案、列定位与地址排序规则
 - [SSS-云端名单导入.md](SSS-云端名单导入.md) — 闪时送云端名单的日期口径、地址过滤与拒绝语义
-- [SSS-对账提速与并发.md](SSS-对账提速与并发.md) — 对账为什么不再全量扫描、时间窗自检与并发/超时出厂默认（3.6.15 提到 8 路，v2 起回到 4 路）
+- [SSS-对账提速与并发.md](SSS-对账提速与并发.md) — 对账为什么不再全量扫描、时间窗自检与并发/超时出厂默认（3.6.15 提到 8 路，v2 回到 4 路，3.6.20 起出厂 1 路串行）
 - [APK-PLAN.md](APK-PLAN.md) / [APK-STATUS.md](APK-STATUS.md) — Android APK 方案与状态
 - [DESIGN-WEB.md](DESIGN-WEB.md) — 网页版界面设计说明
 - [公网访问现状与域名阻断.md](公网访问现状与域名阻断.md) — Cloudflare Tunnel / 域名阻断证据与切换步骤

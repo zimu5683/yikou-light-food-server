@@ -92,10 +92,11 @@ GitHub Secrets 配置 `YIKOU_KEYSTORE_FILE` / `YIKOU_KEYSTORE_PASSWORD` / `YIKOU
 [docs/SSS-不确定记录处置.md](docs/SSS-不确定记录处置.md)）。只读自检：
 `python -m app.main --sss-import-check`。闪时送登录有图形验证码，必须人工输入一次。
 
-对账只用服务端时间窗（目标送达日 ±1 天，1-2 页），不再翻全量历史；下单并发出厂 4 路、
-读取超时 30 秒、提交最小间隔 2.5 秒（配置字段 `sss_max_workers` / `sss_read_timeout_s` /
-`sss_submit_min_interval_s`，界面暂无入口），每轮提交后会打一行「本轮提交 N 单…每单平均
-Y 秒（吞吐 Z 单/秒）；提交最小间隔 X 秒」用于判断平台是否在建单上排队。
+对账只用服务端时间窗（目标送达日 ±1 天，1-2 页），不再翻全量历史；下单**出厂 1 路
+（串行）**、读取超时 30 秒、提交最小间隔 2.5 秒（配置字段 `sss_max_workers` /
+`sss_read_timeout_s` / `sss_submit_min_interval_s`，界面暂无入口；需要并发时把
+`sss_max_workers` 配成 2/4/8 等，上限 20）。每轮提交后会打一行「本轮提交 N 单…每单
+平均 Y 秒（吞吐 Z 单/秒）；提交最小间隔 X 秒」用于判断平台侧行为。
 取舍与实测见 [design/SSS-对账提速与并发.md](design/SSS-对账提速与并发.md)。
 部分下单失败、单单重试成功的排查与脱敏诊断说明见
 [docs/SSS-下单失败与重试排查.md](docs/SSS-下单失败与重试排查.md)；诊断日志可在应用内
