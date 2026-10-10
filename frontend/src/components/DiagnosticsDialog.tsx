@@ -31,7 +31,18 @@ import {
   diagnosticsDownloadName,
   diagnosticsTailNote,
   formatBytes,
+  resolveExportBridge,
+  type NativeExportBridge,
 } from '@/lib/sssDiagnostics'
+
+/** 原生导出结果回调（Kotlin 侧 evaluateJavascript 调用；字段与状态名与原生约定一致）。 */
+interface NativeExportResult {
+  state?: string
+  name?: string
+  error?: string
+}
+
+const nativeExportHandlerKey = '__yikouExportResult'
 
 function formatTime(mtime: number): string {
   const value = Number(mtime)
@@ -54,6 +65,32 @@ export function DiagnosticsDialog({ open, onOpenChange }: {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
+  // APK（Android WebView）里由 Kotlin 注入 window.YikouExport：保存走系统「另存为」
+  // （自己选文件夹），分享走系统分享面板；电脑浏览器没有它，退回网页下载。
+  const [nativeBridge] = useState<NativeExportBridge | null>(() => {
+    if (typeof window === 'undefined') return null
+    return resolveExportBridge(window)
+  })
+
+  useEffect(() => {
+    if (!nativeBridge) return
+    const target = window as unknown as Record<string, unknown>
+    target[nativeExportHandlerKey] = (payload: NativeExportResult | null) => {
+      const state = String(payload?.state || '')
+      const name = String(payload?.name || '')
+      if (state === 'saved') setNotice(name ? `已保存：${name}` : '已保存')
+      else if (state === 'shared') setNotice('已打开分享面板')
+      else if (state === 'cancelled') setNotice('已取消保存')
+      else if (state === 'failed') setNotice(`导出失败：${String(payload?.error || '未知原因')}`)
+    }
+    return () => {
+      try {
+        delete target[nativeExportHandlerKey]
+      } catch {
+        target[nativeExportHandlerKey] = undefined
+      }
+    }
+  }, [nativeBridge])
 
   const load = useCallback(async (name?: string) => {
     if (!isApiReady()) {
@@ -168,6 +205,12 @@ export function DiagnosticsDialog({ open, onOpenChange }: {
             ))}
           </div>
         )}
+        {nativeBridge && (
+          <p className="text-[11px] text-muted-foreground">
+            「保存到文件夹…」会打开系统对话框，可自己选择任意文件夹；「分享」可直接发微信。
+            原生导出的是磁盘上的完整文件（不受上方预览的截断限制）。
+          </p>
+        )}
         {content && (
           <>
             {read?.truncated && (
@@ -186,9 +229,29 @@ export function DiagnosticsDialog({ open, onOpenChange }: {
           <Button variant="ghost" className="h-9 text-xs" disabled={!content} onClick={() => void copyAll()}>
             复制全部
           </Button>
-          <Button className="h-9 rounded-[6px] text-xs" disabled={!content} onClick={saveFile}>
-            保存 .jsonl
-          </Button>
+          {nativeBridge ? (
+            <>
+              <Button
+                variant="ghost"
+                className="h-9 text-xs"
+                disabled={!selected}
+                onClick={() => selected && nativeBridge.shareDiagnostics(selected)}
+              >
+                分享
+              </Button>
+              <Button
+                className="h-9 rounded-[6px] text-xs"
+                disabled={!selected}
+                onClick={() => selected && nativeBridge.saveDiagnostics(selected)}
+              >
+                保存到文件夹…
+              </Button>
+            </>
+          ) : (
+            <Button className="h-9 rounded-[6px] text-xs" disabled={!content} onClick={saveFile}>
+              保存 .jsonl
+            </Button>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>

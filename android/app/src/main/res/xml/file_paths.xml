@@ -3,4 +3,6 @@
     <!-- AppUpdater 下载的 APK 安装包。 -->
     <cache-path name="updates" path="updates/" />
     <files-path name="diagnostics" path="diagnostics/" />
+    <!-- 闪时送提交诊断日志（「更多 → 闪时送诊断日志 → 分享」用）。 -->
+    <files-path name="sss_diagnostics" path="config/sss-diagnostics/" />
 </paths>

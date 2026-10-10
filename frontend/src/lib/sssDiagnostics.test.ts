@@ -15,6 +15,7 @@ import {
   diagnosticsFileName,
   diagnosticsTailNote,
   formatBytes,
+  resolveExportBridge,
 } from './sssDiagnostics.ts'
 
 test('formatBytes 覆盖 B/KB/MB 与非法值', () => {
@@ -48,4 +49,17 @@ test('diagnosticsTailNote 只在截断时给提示', () => {
   const note = diagnosticsTailNote(true)
   assert.match(note, /末尾/)
   assert.match(note, new RegExp(formatBytes(SSS_DIAGNOSTICS_READ_LIMIT).replace('.', '\\.')))
+})
+
+test('resolveExportBridge 只认完整的原生桥，残缺/缺失都回退网页下载', () => {
+  const full = { saveDiagnostics: () => {}, shareDiagnostics: () => {} }
+  assert.equal(resolveExportBridge({ YikouExport: full }), full)
+  // 缺方法（旧版本 APK 只注入一半）→ 视为没有原生桥，走网页下载兜底。
+  assert.equal(resolveExportBridge({ YikouExport: { saveDiagnostics: () => {} } }), null)
+  assert.equal(resolveExportBridge({ YikouExport: { shareDiagnostics: () => {} } }), null)
+  assert.equal(resolveExportBridge({ YikouExport: {} }), null)
+  assert.equal(resolveExportBridge({ YikouExport: 'yes' }), null)
+  assert.equal(resolveExportBridge({}), null)
+  assert.equal(resolveExportBridge(null), null)
+  assert.equal(resolveExportBridge(undefined), null)
 })
