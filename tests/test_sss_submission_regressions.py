@@ -415,7 +415,7 @@ def test_unknown_error_details_never_echo_private_values(message):
 
 
 # ----------------------------------------------------------------------
-# 提交节流（平台对同一账号的建单受理上限约 1 单 / 2.1 秒，超速会被快速驳回）
+# 提交节流：间隔只来自配置，运行期不因任何响应特征（含 Java 内部异常）改变
 # ----------------------------------------------------------------------
 def test_min_interval_spaces_post_starts():
     """配置提交最小间隔后，相邻两次 POST 的起点至少间隔该值。"""
@@ -450,33 +450,40 @@ def test_zero_interval_keeps_immediate_dispatch_without_penalty():
     assert not any("自动放宽" in message for message in logs)
 
 
-def test_platform_fast_reject_widens_the_submit_interval():
-    """平台快速驳回（IndexOutOfBounds）后自动放宽间隔，且分类不变。"""
+def test_java_internal_error_keeps_interval_fixed_and_never_resends():
+    """平台的建单内部异常只代表“结果待对账”，不是受理超速的证据：
+
+    返回 IndexOutOfBoundsException 时间隔必须保持配置值、不自动放宽；分类仍是
+    “结果未知”，且每个任务只发一次 POST（绝不自动重发）。
+    """
     tasks = _many_tasks(4)
     starts = []
     logs = []
+    posts = []
 
     def submit(body):
         starts.append(time.perf_counter())
+        posts.append(body)
         return {"success": False, "message": INTERNAL_ERROR}
 
     result = sss_submission._submit_tasks_concurrent(
         tasks, submit, Event(), logs.append, max_workers=4, min_interval_s=0.15)
     gaps = [later - earlier for earlier, later in zip(starts, starts[1:])]
     assert len(result.uncertain) == 4 and not result.succeeded
-    # 首次驳回即放宽到 0.225 秒，第二次再放宽：最后一个间隔应明显大于最初间隔。
-    assert gaps[-1] >= 0.3, gaps
-    assert gaps[-1] > gaps[0]
-    assert any("自动放宽" in message for message in logs)
+    assert len(posts) == 4  # 每个任务恰好一次，内部异常不触发任何补发
+    assert all(gap <= 0.4 for gap in gaps), gaps  # 未被放宽到 0.3 秒以上
+    assert result.attempts == 4 and result.dispatched == {t["identifier"] for t in tasks}
+    assert not any("自动放宽" in message for message in logs)
 
 
-def test_pacer_penalty_stops_at_its_ceiling():
-    pacer = sss_submission._SubmitPacer(4.0)
+def test_pacer_interval_is_fixed_by_config():
+    """节流器只在配置值上等待，没有任何“放宽/收紧”入口。"""
+    pacer = sss_submission._SubmitPacer(2.5)
     assert pacer.wait() is True
-    assert pacer.penalize() == pytest.approx(6.0)
-    assert pacer.penalize() == pytest.approx(9.0)
-    assert pacer.penalize() == pytest.approx(10.0)  # 13.5 → 夹到上限
-    assert pacer.penalize() is None  # 已到上限，不再放宽
+    assert pacer.interval == pytest.approx(2.5)
+    assert pacer.wait() is True
+    assert pacer.interval == pytest.approx(2.5)
+    assert not hasattr(pacer, "penalize")
 
 
 def test_pacer_aborts_waiting_on_stop_or_halt():
@@ -491,20 +498,10 @@ def test_pacer_aborts_waiting_on_stop_or_halt():
 def test_disabled_pacer_never_waits_or_aborts():
     """关闭节流时不引入任何新的等待/中止语义（保持原有行为）。"""
     pacer = sss_submission._SubmitPacer(0.0)
-    assert pacer.penalize() is None
     stopped = Event()
     stopped.set()
     assert pacer.wait(stopped) is True
-
-
-def test_rate_reject_signature_only_matches_the_over_rate_error():
-    assert sss_submission._is_rate_reject_response(
-        {"success": False, "message": INTERNAL_ERROR}) is True
-    assert sss_submission._is_rate_reject_response(
-        {"success": False, "message": "地址无效"}) is False
-    assert sss_submission._is_rate_reject_response(
-        {"success": False, "message": "java.lang.RuntimeException: 其他异常"}) is False
-    assert sss_submission._is_rate_reject_response(None) is False
+    assert pacer.interval == 0.0
 
 
 def test_submission_diagnostic_records_the_active_interval():

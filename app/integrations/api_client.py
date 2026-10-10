@@ -59,6 +59,46 @@ _INTERNAL_ERROR_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: 只认识这些明确的追踪/节点标识响应头；其余响应头、Cookie、token、正文一律不读不存。
+_SERVER_REQUEST_ID_HEADERS = ("X-Request-ID", "X-Correlation-ID", "X-Trace-ID")
+_SERVER_NODE_ID_HEADERS = ("X-Backend-ID", "X-Node-ID")
+#: 长度与字符严格校验：1-64 位，允许字母/数字与 ``. _ : -``，且必须以字母数字开头。
+#: 只有能通过校验的值才会进诊断记录，避免把任意响应头内容写进日志。
+_SERVER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
+
+
+def _valid_server_id(value: Any) -> str:
+    """白名单响应头的候选标识：只接受合法字符串，其它对象一律忽略。
+
+    非字符串（含 ``__str__`` 会抛异常的对象）在这里直接丢弃，诊断元数据绝不能
+    影响请求本身。
+    """
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    return text if _SERVER_ID_RE.fullmatch(text) else ""
+
+
+def _server_identity(headers: Any) -> dict[str, str]:
+    """从白名单响应头提取 ``server_request_id`` / ``server_node_id``。
+
+    只读上面列出的几个头，按顺序取第一个合法值；响应头缺失、结构异常或取值
+    不合法时静默返回空字典——诊断元数据永远不能影响提交结果。
+    """
+    found: dict[str, str] = {}
+    for key, names in (("server_request_id", _SERVER_REQUEST_ID_HEADERS),
+                       ("server_node_id", _SERVER_NODE_ID_HEADERS)):
+        for name in names:
+            try:
+                candidate = headers.get(name) if headers is not None else None
+            except Exception:
+                break
+            value = _valid_server_id(candidate)
+            if value:
+                found[key] = value
+                break
+    return found
+
 
 def is_internal_error_payload(payload: Any) -> bool:
     """技术异常即使包装为 success=false，也不能证明非幂等请求没有副作用。"""
@@ -567,12 +607,16 @@ class SssApiClient:
         # 401 有明确的恢复路径，即便反向代理返回 HTML 也必须先让上层统一
         # 重登；否则会被误分类成“状态不确定”，既不能恢复又容易误导日志。
         diagnostics["http_status"] = resp.status_code
+        # 白名单追踪/节点标识只做“有就记、严格校验”的附加信息，不参与分类。
+        diagnostics.update(_server_identity(getattr(resp, "headers", None)))
         if resp.status_code == 401:
             raise ApiError("闪时送登录态已失效（接口 401），请重新登录",
                            diagnostics=diagnostics)
 
         # 对非幂等 POST 来说，限流/服务端错误同样无法证明服务端没有落库。
         # 不解析成普通业务失败，交给上层按订单列表对账后再决定是否补发。
+        # HTTP 429 一律归为“结果未知”：不重发原 POST，也不依据 Retry-After
+        # 缩短/调整任何节奏（本层没有会重放 POST 的重试装饰器，见 _new_session）。
         if method.upper() == "POST" and (resp.status_code == 429 or resp.status_code >= 500):
             raise SssTransportError(f"接口 {path} 返回 HTTP {resp.status_code}",
                                     diagnostics=diagnostics)

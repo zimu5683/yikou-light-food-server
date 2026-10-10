@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from threading import Lock, local
 from typing import Any, Callable
@@ -28,9 +29,6 @@ from app.ordering.constants import (
     _PREFILTER_ZERO_RETRY_DELAY_S,
     _PROGRESS_EVERY_N,
     _RECONCILE_POLL_ATTEMPTS,
-    _SUBMIT_FAST_REJECT_MAX_S,
-    _SUBMIT_INTERVAL_PENALTY_FACTOR,
-    _SUBMIT_INTERVAL_PENALTY_MAX_S,
 )
 from app.ordering.models import (
     _AuthExpired, _BalanceDepleted, _Reconciliation,
@@ -190,8 +188,8 @@ def _emit_round_summary(callback: Callable[[str], Any] | None,
 
     吞吐 = 单数 / 墙钟，每单均时 = 服务端建单耗时。并发调高后若平台在建单上
     排队，每单均时会被推高而吞吐不变——这时应当把并发调低（或放宽读取超时），
-    而不是继续加路数。启用提交节流时补一句当前的最小间隔，便于与平台受理
-    节奏（约 1 单 / 2.1 秒）对照。
+    而不是继续加路数。启用提交节流时补一句当前生效的最小间隔（该值只来自配置，
+    不随平台内部异常变化），便于和日志里的发送节奏对照。
     """
     if not latencies:
         return
@@ -216,35 +214,28 @@ def _emit_round_summary(callback: Callable[[str], Any] | None,
     _emit(callback, message)
 
 
-def _is_rate_reject_response(response: Any) -> bool:
-    """平台「受理超速」特征的快速驳回：内部异常为 IndexOutOfBounds（空列表取 0）。
-
-    2026-10-09 实测（见 docs/SSS-下单失败与重试排查.md）：超过平台受理节奏
-    （约 1 单 / 2.1 秒）的建单请求在约 0.3-1 秒内返回
-    ``java.lang.IndexOutOfBoundsException: Index: 0, Size: 0``，且仍会消耗一个
-    平台订单序列号（幽灵单）。该判定只用于提交节奏的自适应放宽
-    （``_SubmitPacer.penalize``），不参与任何结果分类、记录或重发语义。
-    """
-    if not isinstance(response, dict) or not is_internal_error_payload(response):
-        return False
-    message = str(response.get("message") or response.get("msg") or "")
-    return "IndexOutOfBounds" in message
+#: 每轮精简结果的单字符标记：✔ 成功、✖ 技术异常/结果未知、⚠ 平台明确拒绝、
+#: A 登录失效、B 余额不足。只有真正发出过 POST 的尝试才会进入这个列表。
+_SEND_MARKERS = {
+    "success": "✔", "uncertain": "✖", "failure": "⚠", "auth": "A", "balance": "B",
+}
+_SEND_MARKER_LEGEND = ("✔ 成功响应；✖ 技术异常/结果待对账；⚠ 平台明确拒绝；"
+                       "A 登录失效；B 余额不足")
 
 
 class _SubmitPacer:
-    """提交节流：令相邻两次 POST 的起点至少间隔 ``interval`` 秒。
+    """提交节流：令相邻两次 POST 的起点至少间隔配置的 ``interval`` 秒。
 
-    平台对同一账号的建单受理上限约 1 单 / 2.1 秒（2026-10-09 实测）。4 路滚动
-    补位下，被快速驳回的车道 0.36 秒就能补发下一单，实际发送节奏会被推到约
-    1.37 单/秒，远超平台上限，于是每轮约 2/3 的请求被驳回。这里在 POST 之前统一
-    排队，让发送起点按最小间隔错开；出现平台的快速驳回特征时自动放宽间隔
-    （``penalize``）。节流只影响节奏，不改变任何结果分类与重发语义。
+    间隔**只来自配置**（``sss_submit_min_interval_s``，出厂 2.5 秒，0 = 关闭节流），
+    运行期不因任何响应特征自动放宽或收紧：平台的建单内部异常（如
+    ``IndexOutOfBoundsException``）只代表“结果待对账”，既不是受理超速的证据，
+    也不能被当成“没有落单”，节奏因此只由配置固定。节流只错开发送起点，不改变
+    任何结果分类与重发语义。
     """
 
     def __init__(self, interval_s: float) -> None:
         self._lock = Lock()
         self._interval = max(0.0, float(interval_s or 0.0))
-        self._ceiling = max(_SUBMIT_INTERVAL_PENALTY_MAX_S, self._interval)
         self._next_allowed = 0.0  # time.perf_counter 时间基准
 
     def wait(self, stop_event: Any = None,
@@ -274,20 +265,20 @@ class _SubmitPacer:
                 delay = min(self._next_allowed - now, 0.25)
             time.sleep(delay)
 
-    def penalize(self) -> float | None:
-        """平台快速驳回后放宽间隔；返回放宽后的值，未启用/已到上限时返回 None。"""
-        with self._lock:
-            if self._interval <= 0.0 or self._interval >= self._ceiling:
-                return None
-            self._interval = min(self._ceiling,
-                                 self._interval * _SUBMIT_INTERVAL_PENALTY_FACTOR)
-            return self._interval
-
     @property
     def interval(self) -> float:
         """当前生效的最小间隔（秒）。"""
         with self._lock:
             return self._interval
+
+
+def _round_counts_message(result: _SubmitResult) -> str:
+    """本轮提交的精确计数：实际发起、成功响应、技术异常、明确拒绝、未发送。"""
+    return (f"本轮统计：实际发起 {result.attempts} 次 POST"
+            f"（{len(result.dispatched)} 单）；成功响应 {len(result.succeeded)}，"
+            f"技术异常 {len(result.uncertain)}，明确拒绝 {result.explicit_rejections}，"
+            f"登录失效 {len(result.auth)}，余额不足 {len(result.balance)}，"
+            f"未发送 {len(result.not_sent)}")
 
 
 def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
@@ -297,17 +288,29 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
                              max_workers: int = 4,
                              on_stop: Callable[[], None] | None = None,
                              read_timeout_s: float | None = None,
-                             min_interval_s: float = 0.0) -> _SubmitResult:
+                             min_interval_s: float = 0.0,
+                             round_no: int = 1) -> _SubmitResult:
     """有界并发提交，停止、401、余额不足后不再派发新任务。
 
     同一轮最多保留 ``max_workers`` 个在途 POST。请求超时或断链只记录为
     ``uncertain``，由调用方查询订单列表确认，绝不在此处自动重发。
 
     ``min_interval_s`` > 0 时启用全局提交节流（见 `_SubmitPacer`）：相邻两次
-    POST 的起点至少间隔该值，以贴合平台对同一账号的建单受理上限（约 1 单 /
-    2.1 秒）；出现平台快速驳回特征时自动放宽间隔。0 = 关闭节流。
+    POST 的起点至少间隔该值，0 = 关闭节流。间隔只来自配置且在运行期固定，不会
+    因为平台返回内部异常（``IndexOutOfBoundsException`` 等）自动放宽。
 
-    结束后输出一行本轮汇总（见 `_emit_round_summary`）。
+    ``round_no`` 是批次内的提交轮次（独立调用默认 1），只进入诊断记录。
+    ``send_seq`` 是**本地派发起点**序号（同一轮内从 1 开始，由派发临界区内的
+    计数决定）：它不代表响应完成顺序，也不代表服务端到达顺序；停止等待与未派发
+    的任务不占序号。``attempts`` / ``dispatched`` 同样只统计真实调用 ``submit``
+    的起点，未派发与本地准备失败都不计——派发临界区内不含任何网络请求。
+
+    停止 / 401 / 余额不足在全部准备完成、进入派发临界区之前做最终确认：已经中止
+    时按「未发送」处理，不发出 POST、不占序号、不计调用次数；本地准备失败同理，
+    并只按异常类型提示，不输出报文或异常正文。
+
+    结束后输出一行本轮汇总（`_emit_round_summary`）、一行精确计数和一行按
+    ``send_seq`` 排列的成功/异常标记。
     """
     result = _SubmitResult()
     workers = max(1, int(max_workers))
@@ -316,26 +319,58 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
     except (TypeError, ValueError):
         pacing = 0.0
     pacer = _SubmitPacer(pacing)
+    if isinstance(round_no, bool) or not isinstance(round_no, int) or round_no < 1:
+        round_no = 1
     iterator = iter(tasks)
     in_flight: dict[Any, dict[str, Any]] = {}
     stop_closed = False
     latencies: list[float] = []
     diagnostic_records: dict[str, dict[str, Any]] = {}
+    # 派发序号/计数只在这一小段加锁（微秒级），网络请求绝不进入锁内，
+    # 并发路数仍然有界且互不串行。
+    dispatch_lock = Lock()
+    dispatch_state: dict[str, Any] = {"seq": 0, "previous_start": None}
+    seq_by_identifier: dict[str, int] = {}
+    round_marks: dict[int, str] = {}
 
     def halted() -> bool:
         return bool(stop_event.is_set() or result.auth_error or result.balance_error)
 
     def run_one(task: dict[str, Any]) -> tuple[str, str, str]:
+        identifier = str(task["identifier"])
         if stop_event.is_set():
-            return task["identifier"], "stopped", ""
+            return identifier, "stopped", ""
+        # 纯准备（可能耗时或抛异常）放在节流等待之前：它不占发送槽位（否则准备
+        # 阻塞会让相邻两次 POST 的实际起点挤在一起），失败时也只是一次「未发送」。
+        try:
+            request_digest = payload_digest(task["payload"])
+            attempt_id = uuid.uuid4().hex[:16]
+        except Exception as exc:
+            # 本地准备失败：请求没有发出，绝不带出报文或异常正文（可能含凭据）。
+            _emit(callback, f"提交准备失败（{type(exc).__name__}）：{identifier} 未发送，"
+                            "站内对账后可按未发送任务补发；不记为已发送未知")
+            return identifier, "stopped", ""
         if not pacer.wait(stop_event, halted):
             # 节流等待期间收到停止/中止：请求确实没有发出，按「未发送」处理
-            # （重登后仍属于可补发的明确未发送任务）。
-            return task["identifier"], "stopped", ""
+            # （重登后仍属于可补发的明确未发送任务），也不占用派发序号。
+            return identifier, "stopped", ""
         interval_at_send = pacer.interval
-        started = time.perf_counter()
-        started_at = time.time()
-        request_digest = payload_digest(task["payload"])
+        # 所有准备完成、进入派发临界区之前的最终中止确认（stop / 401 / 余额不足）。
+        if halted():
+            return identifier, "stopped", ""
+        with dispatch_lock:
+            started = time.perf_counter()
+            started_at = time.time()
+            dispatch_state["seq"] += 1
+            send_seq = dispatch_state["seq"]
+            previous_start = dispatch_state["previous_start"]
+            dispatch_state["previous_start"] = started
+            seq_by_identifier[identifier] = send_seq
+            result.attempts += 1
+            result.dispatched.add(identifier)
+            # 序号与起点同区取得，间隔直接作差（不夹紧，避免掩盖异常值）。
+            actual_interval_s = (None if previous_start is None
+                                 else started - previous_start)
         response: Any = None
         transport: dict[str, Any] = {}
         try:
@@ -358,22 +393,24 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
         else:
             state, detail = "success", ""
         elapsed = time.perf_counter() - started
-        if (state == "uncertain" and elapsed <= _SUBMIT_FAST_REJECT_MAX_S
-                and _is_rate_reject_response(response)):
-            widened = pacer.penalize()
-            if widened is not None:
-                _emit(callback, "平台快速驳回（疑似建单受理超速）；"
-                                f"提交最小间隔自动放宽到 {widened:g} 秒"
-                                "（结果分类与重发语义不变）")
         # list.append 在 CPython 下是原子的；这里只做统计，不参与任何判定。
         latencies.append(elapsed)
-        record = submission_diagnostic(
-            task, response, started_at=started_at, elapsed_s=elapsed, state=state,
-            payload_hash=request_digest, transport=transport)
-        record["min_interval_s"] = round(interval_at_send, 3)
-        diagnostic_records[task["identifier"]] = record
-        _trace(f"POST {task['identifier']}: {elapsed:.2f}s -> {state}")
-        return task["identifier"], state, detail
+        try:
+            record: dict[str, Any] | None = submission_diagnostic(
+                task, response, started_at=started_at, elapsed_s=elapsed, state=state,
+                payload_hash=request_digest, transport=transport, send_seq=send_seq,
+                round_no=round_no, attempt_id=attempt_id,
+                actual_interval_s=actual_interval_s)
+            record["min_interval_s"] = round(interval_at_send, 3)
+        except Exception as exc:
+            # 诊断只是旁路：构造失败不得改变已经取得的分类，也不触发任何重发。
+            record = None
+            _emit(callback, f"提交诊断构造失败（{type(exc).__name__}）："
+                            "该次提交仍按已取得的响应分类，不会因此重发")
+        if record is not None:
+            diagnostic_records[identifier] = record
+        _trace(f"POST {identifier}: {elapsed:.2f}s -> {state}")
+        return identifier, state, detail
 
     started_at = time.perf_counter()
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -402,6 +439,10 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
                     identifier, state, detail = future.result()
                 except Exception as exc:  # pragma: no cover - run_one already contains errors
                     identifier, state, detail = task["identifier"], "uncertain", str(exc)
+                seq = seq_by_identifier.get(str(identifier))
+                if seq is not None:
+                    # 完成顺序可能倒置；精简结果一律按派发时的 send_seq 排列。
+                    round_marks[seq] = state
                 diagnostic = diagnostic_records.pop(identifier, None)
                 if diagnostic is not None:
                     diagnostic["workers"] = workers
@@ -418,6 +459,7 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
                         _emit(callback, f"本轮收到成功响应 {len(result.succeeded)}/{len(tasks)} 单")
                 elif state == "failure":
                     result.failures.append((identifier, detail))
+                    result.explicit_rejections += 1
                 elif state == "uncertain":
                     result.uncertain.append((identifier, detail))
                 elif state == "stopped":
@@ -438,6 +480,16 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
         result.stopped = bool(result.stopped or stop_event.is_set())
     _emit_round_summary(callback, latencies, started_at, read_timeout_s,
                         pacer.interval)
+    if result.attempts or result.not_sent:
+        _emit(callback, _round_counts_message(result))
+    if round_marks:
+        marks = " ".join(f"{seq}{_SEND_MARKERS.get(round_marks[seq], '?')}"
+                         for seq in sorted(round_marks))
+        _emit(callback, f"本轮发送顺序（send_seq:结果）：{marks}（{_SEND_MARKER_LEGEND}）")
+    if result.uncertain:
+        _emit(callback, f"本轮 {len(result.uncertain)} 次请求未获可确认结果"
+                        "（例如平台建单内部异常）：结果待站内对账确认，"
+                        "不代表订单未创建，本批不会自动重发")
     if latencies:
         _emit(callback, f"脱敏提交诊断日志：{diagnostic_log_path()}")
     return result
@@ -556,7 +608,13 @@ def _run_reconciled_submission(
     ``uncertain_sink`` 在每次出现“已发送未知”时落一条本地记录；写入失败会
     立即停止后续 POST。``uncertain_clear`` 在只读对账确认相关订单后删除记录。
     ``outcome`` 为可选增量结果容器，供调用方生成 status/next_action，不影响
-    原有两元组返回契约。
+    原有两元组返回契约；其中 ``outcome["submission_stats"]`` 是提交层给 runner
+    的计数契约（``target_total`` 由 runner 按本批目标总数补齐）。
+
+    计数与“当前最终状态”严格分开：站内对账确认只会清理当前状态集合，不会清掉
+    ``success_responses`` / ``technical_errors`` 等历史响应次数；初始或最终对账
+    未知时 ``preconfirmed`` / ``newly_confirmed`` / ``confirmed`` / ``unconfirmed``
+    用 ``None``，不用 0 冒充未知。
     """
     batch_started_at = time.time()
     batch_window_start = batch_started_at - _BATCH_CLOCK_SKEW_S
@@ -578,6 +636,46 @@ def _run_reconciled_submission(
     balance_ids: set[str] = set()
     success_ids: set[str] = set()
     journal_ids: set[str] = set()
+    #: 真实调用计数。与“当前最终状态”分离：站内对账确认只清当前状态，
+    #: 绝不清这些历史响应次数（成功但暂不可见、随后被确认的依然计入）。
+    stats_counts: dict[str, int] = {
+        "attempts": 0, "success_responses": 0, "technical_errors": 0,
+        "explicit_rejections": 0, "auth_rejections": 0, "balance_rejections": 0,
+    }
+    #: 真实发起过 POST 的任务（含重登补发与人工重试），不随对账清理。
+    attempted_ids: set[str] = set()
+    target_ids: set[str] = set(task_by_id)
+    #: 初始对账给出的“缺失任务”集合 = not_sent 的分母；初始对账未知时保持
+    #: None，此时按全部目标任务计（不拿未知当已有）。
+    initial_missing_ids: set[str] | None = None
+    preconfirmed_count: int | None = None
+    final_counts: dict[str, int | None] = {
+        "confirmed": None, "unconfirmed": None, "newly_confirmed": None,
+    }
+    final_reconciled = False
+
+    def _sync_stats() -> None:
+        """写入 ``outcome["submission_stats"]``：只有真实调用/集合推导的计数。
+
+        ``target_total`` 不在其中（由 runner 补齐）；所有计数都来自实际 POST 的
+        起点与对账集合，绝不从进度里程碑推测。
+        """
+        scope = target_ids if initial_missing_ids is None else initial_missing_ids
+        state["submission_stats"] = {
+            "preconfirmed": preconfirmed_count,
+            "submitted": len(attempted_ids),
+            "attempts": stats_counts["attempts"],
+            "success_responses": stats_counts["success_responses"],
+            "technical_errors": stats_counts["technical_errors"],
+            "explicit_rejections": stats_counts["explicit_rejections"],
+            "auth_rejections": stats_counts["auth_rejections"],
+            "balance_rejections": stats_counts["balance_rejections"],
+            "not_sent": len(scope - attempted_ids),
+            "newly_confirmed": final_counts["newly_confirmed"],
+            "confirmed": final_counts["confirmed"],
+            "unconfirmed": final_counts["unconfirmed"],
+            "reconciled": final_reconciled,
+        }
 
     def _sync_outcome() -> None:
         state["uncertain"] = sorted(uncertain_ids)
@@ -591,8 +689,35 @@ def _run_reconciled_submission(
         state["balance_ids"] = sorted(balance_ids)
         state["journal_pending"] = sorted(journal_ids)
         state["failure_count"] = len(failure_ids)
+        _sync_stats()
+
+    def _record_final(reconciliation: _Reconciliation | None,
+                      reconciled: bool) -> None:
+        """记录最终对账结论并同步 outcome；对账未完成时数量字段一律为 None。"""
+        nonlocal final_reconciled
+        final_reconciled = bool(reconciled and reconciliation is not None)
+        if not final_reconciled:
+            final_counts.update({"confirmed": None, "unconfirmed": None,
+                                 "newly_confirmed": None})
+        else:
+            confirmed = len(reconciliation.confirmed)
+            final_counts["confirmed"] = confirmed
+            final_counts["unconfirmed"] = len(reconciliation.missing)
+            final_counts["newly_confirmed"] = (
+                None if preconfirmed_count is None
+                else max(0, confirmed - preconfirmed_count))
+        _sync_outcome()
 
     def _absorb(round_result: _SubmitResult) -> None:
+        # 先累加真实调用计数：后面即使被站内对账确认清掉当前状态，
+        # 这些历史响应次数也保持不变。
+        stats_counts["attempts"] += round_result.attempts
+        stats_counts["success_responses"] += len(round_result.succeeded)
+        stats_counts["technical_errors"] += len(round_result.uncertain)
+        stats_counts["explicit_rejections"] += round_result.explicit_rejections
+        stats_counts["auth_rejections"] += len(round_result.auth)
+        stats_counts["balance_rejections"] += len(round_result.balance)
+        attempted_ids.update(round_result.dispatched)
         for identifier, detail in round_result.failures:
             failure_ids.add(identifier)
             state["errors"][identifier] = detail
@@ -744,23 +869,30 @@ def _run_reconciled_submission(
     if initial is None:
         stop_event.set()
         state["reconcile_failed"] = True
-        _sync_outcome()
+        _record_final(None, False)
         return None, False
+    # 初始对账成功：已有数量与“待提交的缺失任务”范围从此已知；对账失败时保持
+    # None，submission_stats 里的对应字段也随之诚实为 null。
+    preconfirmed_count = len(initial.confirmed)
+    initial_missing_ids = {str(task.get("identifier")) for task in initial.missing}
     if initial.duplicate_count:
         _emit(callback, "站内记录数超过 Excel 目标，已停止且不会自动取消或补发")
         stop_event.set()
-        _sync_outcome()
+        _record_final(initial, True)
         return initial, True
     if not initial.missing:
         _emit(callback, "Excel 订单均已在站内确认，本次不发送任何下单请求")
-        _sync_outcome()
+        _record_final(initial, True)
         return initial, True
 
     preconfirmed = set(initial.confirmed)
     current = list(initial.missing)
     balance_error = ""
+    round_no = 0
 
     def run_round(round_tasks: list[dict[str, Any]], workers: int) -> _SubmitResult:
+        nonlocal round_no
+        round_no += 1
         result = _SubmitResult()
         if not _prepare_round_journal(round_tasks):
             result.stopped = True
@@ -770,7 +902,8 @@ def _run_reconciled_submission(
             result = _submit_tasks_concurrent(round_tasks, submit, stop_event,
                                               callback, workers, on_stop=close,
                                               read_timeout_s=read_timeout_s,
-                                              min_interval_s=submit_min_interval_s)
+                                              min_interval_s=submit_min_interval_s,
+                                              round_no=round_no)
         finally:
             close()
         _absorb(result)
@@ -799,13 +932,14 @@ def _run_reconciled_submission(
         if after_login is None:
             stop_event.set()
             state["reconcile_failed"] = True
-            _sync_outcome()
+            _record_final(None, False)
             return None, False
         if after_login.duplicate_count:
             _emit(callback, "重登后发现站内重复，已停止且不会自动取消或补发")
             stop_event.set()
-            _sync_outcome()
-            return _merge_reconciliation(preconfirmed, after_login), True
+            merged = _merge_reconciliation(preconfirmed, after_login)
+            _record_final(merged, True)
+            return merged, True
         # 重登后对账确认的订单也要计入最终 confirmed，否则 created 数会少算。
         preconfirmed.update(after_login.confirmed)
         _resolve_confirmed_uncertain(after_login)
@@ -851,17 +985,17 @@ def _run_reconciled_submission(
     if final_current is None:
         stop_event.set()
         state["reconcile_failed"] = True
-        _sync_outcome()
+        _record_final(None, False)
         return None, False
     final = _merge_reconciliation(preconfirmed, final_current)
     if final.duplicate_count:
         _emit(callback, "收尾对账发现站内重复，已停止且不会自动取消")
         stop_event.set()
-        _sync_outcome()
+        _record_final(final, True)
         return final, True
     _resolve_confirmed_uncertain(final)
     if stop_event.is_set() or balance_error or state.get("journal_error"):
-        _sync_outcome()
+        _record_final(final, True)
         return final, True
 
     # 对账后仍缺失的单才允许用户决策。超时/已返回成功的单绝不重发，
@@ -870,12 +1004,14 @@ def _run_reconciled_submission(
         identifier = str(task.get("identifier"))
         if identifier in uncertain_ids:
             _emit(callback, f"订单未确认：{identifier}：POST 发送结果未知；"
-                            "可再运行一次重试（重跑前会先做站内对账，"
-                            "已存在的订单不会重复提交；本批不自动重发）")
+                            "本批不自动重发，继续只读复查站内列表；"
+                            "若复查后仍缺失，可由用户主动再运行一次"
+                            "（再运行会先做站内对账，但列表延迟时仍可能重复下单）")
             continue
         if identifier in success_ids:
             _emit(callback, f"订单未确认：{identifier}：POST 已返回成功但站内尚未查到；"
-                            "可直接再运行一次（重跑前会先做站内对账；本批不自动重发）")
+                            "先按列表延迟处理：继续只读复查，本批不自动重发；"
+                            "必要时可由用户主动再运行（已返回成功的单重发有重复风险）")
             continue
         error = state["errors"].get(identifier, "站内未查询到对应订单")
         _emit(callback, f"订单未确认：{identifier}：{error}")
@@ -897,13 +1033,14 @@ def _run_reconciled_submission(
         if before_retry is None:
             stop_event.set()
             state["reconcile_failed"] = True
-            _sync_outcome()
+            _record_final(None, False)
             return None, False
         if before_retry.duplicate_count:
             _emit(callback, "重试前发现站内重复，已停止且不会自动取消")
             stop_event.set()
-            _sync_outcome()
-            return _merge_reconciliation(preconfirmed, before_retry), True
+            merged = _merge_reconciliation(preconfirmed, before_retry)
+            _record_final(merged, True)
+            return merged, True
         if identifier not in {str(item.get("identifier")) for item in before_retry.missing}:
             _emit(callback, f"{identifier} 已在站内确认，跳过重试")
             final = _merge_reconciliation(preconfirmed, before_retry)
@@ -927,16 +1064,17 @@ def _run_reconciled_submission(
         if final_current is None:
             stop_event.set()
             state["reconcile_failed"] = True
-            _sync_outcome()
+            _record_final(None, False)
             return None, False
         if final_current.duplicate_count:
             _emit(callback, "重试后发现站内重复，已停止且不会自动取消")
             stop_event.set()
-            _sync_outcome()
-            return _merge_reconciliation(preconfirmed, final_current), True
+            merged = _merge_reconciliation(preconfirmed, final_current)
+            _record_final(merged, True)
+            return merged, True
         final = _merge_reconciliation(preconfirmed, final_current)
         _resolve_confirmed_uncertain(final)
         if stop_event.is_set():
             break
-    _sync_outcome()
+    _record_final(final, True)
     return final, True

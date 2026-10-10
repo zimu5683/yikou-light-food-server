@@ -88,10 +88,12 @@ def resolve_create_workers(config: Any) -> int:
 def resolve_submit_min_interval_s(config: Any) -> float:
     """本批提交的最小间隔（秒）：取配置值并夹到 ``[0, 60]``；0 = 关闭节流。
 
-    平台对同一账号的建单受理上限约 1 单 / 2.1 秒（2026-10-09 实测，见
-    docs/SSS-下单失败与重试排查.md）；拿不到配置（缺字段或取值不可解析）时按
-    出厂默认（2.5 秒）保守节流——宁可按节奏慢发，也不要全速连发触发平台的
-    快速驳回（内部异常 + 消耗平台订单序列号）。
+    间隔**只来自配置**且运行期固定：平台返回的建单内部异常
+    （``IndexOutOfBoundsException`` 等）既不是“受理超速”的证据，也不能被当成
+    “没有落单”，因此不据此自动放宽或收紧（当晚实测已推翻“受理上限约 1 单 /
+    2.1 秒”的推断，见 docs/SSS-下单失败与重试排查.md 的修正段）。拿不到配置
+    （缺字段或取值不可解析）时按出厂默认（2.5 秒）保守节流——它只错开发送起点、
+    把快速失败的兜圈速度限制在可预期范围内，不改变结果分类与重发语义。
     """
     try:
         interval = float(getattr(config, "sss_submit_min_interval_s",
@@ -101,6 +103,106 @@ def resolve_submit_min_interval_s(config: Any) -> float:
     if interval != interval:  # NaN
         interval = _DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S
     return max(0.0, min(_SSS_SUBMIT_MIN_INTERVAL_CEILING_S, interval))
+
+
+def _count_text(value: Any, unit: str = "") -> str:
+    """计数的显示文本；``None``（没读取到/对账未完成）写「待核对」，绝不写成 0。"""
+    if value is None:
+        return "待核对"
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return "待核对"
+    return f"{number} {unit}".strip()
+
+
+def _format_submission_stats(stats: dict[str, Any]) -> str:
+    """把 ``summary.submission`` 渲染成一行精确计数（结束日志与 Bridge 消息共用）。
+
+    只呈现真实计数：响应成功/技术异常/明确拒绝/未发送/本轮新增站内确认都与
+    「最终确认」分开列，站内数量未读取到时写「待核对」，不写成 0。``created``
+    只代表站内确认总数，**不说成“新建”**：总确认 = 提交前已有 + 本轮新增。
+    """
+    parts = [
+        f"目标 {_count_text(stats.get('target_total'), '单')}",
+        f"提交前已有 {_count_text(stats.get('preconfirmed'), '单')}",
+        f"本轮提交 {_count_text(stats.get('submitted'), '单')}"
+        f"（{_count_text(stats.get('attempts'), '次')} POST）",
+        f"成功响应 {_count_text(stats.get('success_responses'), '次')}",
+        f"技术异常（结果未知）{_count_text(stats.get('technical_errors'), '次')}",
+        f"明确拒绝 {_count_text(stats.get('explicit_rejections'), '次')}",
+    ]
+    for key, label in (("auth_rejections", "登录失效"),
+                       ("balance_rejections", "余额不足")):
+        value = stats.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            parts.append(f"{label} {value} 次")
+    parts.extend([
+        f"未发送 {_count_text(stats.get('not_sent'), '单')}",
+        f"本轮新增站内确认 {_count_text(stats.get('newly_confirmed'), '单')}",
+        f"总确认 {_count_text(stats.get('confirmed'))}"
+        f"/{_count_text(stats.get('target_total'))}",
+        f"未确认 {_count_text(stats.get('unconfirmed'), '单')}",
+    ])
+    return "；".join(parts)
+
+
+def _confirmed_clause(stats: dict[str, Any] | None, legacy: str) -> str:
+    """确认口径短句：``站内确认 51/99（提交前已有 26，本轮新增 25）``。
+
+    未知（对账未完成）时写「站内确认 待核对/N（未完成对账）」，不退化成 0。
+    """
+    if stats is None:
+        return legacy
+    confirmed = stats.get("confirmed")
+    if confirmed is None:
+        return (f"站内确认 待核对/{_count_text(stats.get('target_total'))}"
+                "（未完成对账）")
+    text = (f"站内确认 {_count_text(confirmed)}"
+            f"/{_count_text(stats.get('target_total'))}")
+    preconfirmed = stats.get("preconfirmed")
+    newly = stats.get("newly_confirmed")
+    if preconfirmed is not None or newly is not None:
+        text += (f"（提交前已有 {_count_text(preconfirmed)}，"
+                 f"本轮新增 {_count_text(newly)}）")
+    return text
+
+
+def _pending_clause(stats: dict[str, Any] | None, legacy_missing: int) -> str:
+    """未确认数量短句；对账没完成时写「未确认数量待核对」，不按目标总数冒充。"""
+    if stats is None:
+        return f"{legacy_missing} 单未确认"
+    value = stats.get("unconfirmed")
+    return ("未确认数量待核对" if value is None
+            else f"{_count_text(value)} 单未确认")
+
+
+def _submission_stats_skeleton(target_total: int, **overrides: Any) -> dict[str, Any]:
+    """没进入「提交 + 对账」流程的运行（无单/干跑/预检/余额闸门/并发锁）的计数。
+
+    一条 POST 都没发：提交与响应计数诚实为 0；站内数量没有读取到，因此
+    ``preconfirmed`` / ``newly_confirmed`` / ``confirmed`` / ``unconfirmed`` 用
+    ``None``（未知），不冒充 0。``not_sent`` 与提交层同口径：初始对账未知时按
+    全部目标任务计（这些任务始终没有 POST）。
+    """
+    stats: dict[str, Any] = {
+        "target_total": int(target_total),
+        "preconfirmed": None,
+        "submitted": 0,
+        "attempts": 0,
+        "success_responses": 0,
+        "technical_errors": 0,
+        "explicit_rejections": 0,
+        "auth_rejections": 0,
+        "balance_rejections": 0,
+        "not_sent": int(target_total),
+        "newly_confirmed": None,
+        "confirmed": None,
+        "unconfirmed": None,
+        "reconciled": False,
+    }
+    stats.update(overrides)
+    return stats
 
 
 def _exclusive_sss_job(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -203,7 +305,8 @@ def run_sss_job(config: Any, stop_event: Any,
         else:
             _emit(progress_callback, "闪时送 Excel 中没有任何订单")
         return _finish({"processed": 0, "created": 0}, status="no_orders",
-                       next_action="没有需要下单的订单，无需操作")
+                       next_action="没有需要下单的订单，无需操作",
+                       submission=_submission_stats_skeleton(0))
     _emit(progress_callback,
           f"读取订单表耗时 {(time.perf_counter() - load_start):.1f} 秒，共 {total} 单")
     if password is None:
@@ -243,7 +346,8 @@ def run_sss_job(config: Any, stop_event: Any,
             batch_id=batch_id, idempotency_field=idempotency_field, now=now)
         preview = _run_dry_run(tasks, progress_callback)
         return _finish(preview, status="dry_run", confirmed=0,
-                       unconfirmed=len(tasks), next_action="干跑未发送任何 POST；确认报文后再正式运行")
+                       unconfirmed=len(tasks), next_action="干跑未发送任何 POST；确认报文后再正式运行",
+                       submission=_submission_stats_skeleton(len(tasks)))
 
     account = str(getattr(config, "sss_account", "") or "")
     if not account:
@@ -339,7 +443,8 @@ def run_sss_job(config: Any, stop_event: Any,
                 "semantics": "batch-submission-lock",
             }, status="blocked_concurrent", unconfirmed=len(tasks), stopped=True,
                next_action="另一进程正在处理同一批次或跨进程锁不可用；未发送任何 POST，"
-                           "请等待锁释放后重试，严禁并行重跑本批")
+                           "请等待锁释放后重试，严禁并行重跑本批",
+               submission=_submission_stats_skeleton(len(tasks)))
         # 持锁后先把旧/镜像 journal 的 unresolved 合并进权威共享状态，再做
         # 只读对账；迁移或镜像失败一律 fail-closed。
         #
@@ -349,7 +454,7 @@ def run_sss_job(config: Any, stop_event: Any,
         # 平台/账号字段缺失）一律保守阻断；不同规范 origin 的平台不误伤。
         # 该扫描只读：不迁移、不改写、不删除旧记录，也不依据 DNS 等价合并身份。
         # 3.6.19 起扫描结果只提示、不再阻断本批（「人工核对后才能重跑」的流程已下线；
-        # 重跑前的站内对账仍会跳过已存在的订单，不会重复提交）。
+        # 再运行会先做站内对账、只补仍缺失项，但平台列表延迟时仍可能重复下单）。
         try:
             cross_scope = cross_scope_unresolved_records(
                 authoritative_journal, config=config, account=account,
@@ -442,12 +547,27 @@ def run_sss_job(config: Any, stop_event: Any,
                 "estimate": estimate,
                 "semantics": "pre-submit-balance-guard",
             }, status=balance_status, unconfirmed=len(tasks), stopped=True,
-               next_action=next_action)
+               next_action=next_action,
+               submission=_submission_stats_skeleton(len(tasks)))
 
         if bool(getattr(config, "sss_preflight", False)):
             preflight_status, preflight = _preflight_tasks(
                 tasks, client.get_json, progress_callback)
             preflight_confirmed = len(preflight.confirmed) if preflight else 0
+            # 预检是只读对账、一条 POST 都没发：站内数量在对账成功时来自真实
+            # 匹配（本轮新增站内确认 = 0，因为没有任何提交），对账失败则一律
+            # 未知，不按 0 或目标总数冒充。
+            preflight_stats = _submission_stats_skeleton(
+                len(tasks),
+                preconfirmed=preflight_confirmed if preflight is not None else None,
+                not_sent=(len(tasks) - preflight_confirmed
+                          if preflight is not None else len(tasks)),
+                newly_confirmed=0 if preflight is not None else None,
+                confirmed=preflight_confirmed if preflight is not None else None,
+                unconfirmed=(len(tasks) - preflight_confirmed
+                             if preflight is not None else None),
+                reconciled=preflight is not None,
+            )
             return _finish({
                 "processed": len(tasks),
                 "created": preflight_confirmed,
@@ -465,7 +585,8 @@ def run_sss_job(config: Any, stop_event: Any,
                failed=0 if preflight is not None else len(tasks),
                next_action=("预检只读模式，未提交新订单；确认后再正式运行"
                             if preflight_status == "preflight_ok"
-                            else "预检未通过或对账不确定，未提交任何 POST；先处理日志风险"))
+                            else "预检未通过或对账不确定，未提交任何 POST；先处理日志风险"),
+               submission=preflight_stats)
 
         _emit(progress_callback,
               f"开始下单：共 {len(tasks)} 单，并发 {max_workers} 路，读取超时 {read_timeout_s:g}s"
@@ -513,9 +634,19 @@ def run_sss_job(config: Any, stop_event: Any,
         )
         created = len(final.confirmed) if final is not None else 0
         processed = len(tasks)
+        # 本轮提交计数只认提交层从**真实调用与对账集合**得到的 submission_stats；
+        # runner 只补 target_total（本批目标单数）。绝不从进度里程碑/日志推算。
+        raw_stats = outcome.get("submission_stats")
+        submission_stats = ({**raw_stats, "target_total": processed}
+                            if isinstance(raw_stats, dict) else None)
+        if submission_stats is not None:
+            _emit(progress_callback,
+                  "本轮提交统计：" + _format_submission_stats(submission_stats))
+        confirmed_clause = _confirmed_clause(submission_stats,
+                                             f"确认 {created}/{processed}")
         _emit(progress_callback,
               f"下单与对账耗时 {(time.perf_counter() - submit_start):.1f} 秒，"
-              f"确认 {created}/{processed}")
+              f"{confirmed_clause}")
         try:
             end_total, end_frozen = query_balance(client.get_json)
         except _AuthExpired:
@@ -542,20 +673,21 @@ def run_sss_job(config: Any, stop_event: Any,
         reconcile_failed = bool(outcome.get("reconcile_failed")) or not reconciled
         if journal_error:
             status = "failed"
-            next_action = (f"{journal_error}；本批已停止提交。修复后可直接再运行一次："
-                           "重跑前会先做站内对账，已存在的订单不会重复提交")
+            next_action = (f"{journal_error}；本批已停止提交。修复后可直接再运行一次"
+                           "核对并补单：先站内对账、只补仍缺失项；"
+                           "平台列表延迟时仍可能重复下单")
         elif reconcile_failed or final is None:
             status = "failed"
-            next_action = ("站内对账失败，无法确认创建数量；可直接再运行一次："
-                           "重跑前会先做站内对账，已存在的订单不会重复提交")
+            next_action = ("站内对账失败，无法确认创建数量；可直接再运行一次核对并补单："
+                           "先站内对账、只补仍缺失项；平台列表延迟时仍可能重复下单")
         elif stopped:
             status = "stopped"
-            next_action = ("任务已停止；未确认单可直接再运行一次重试："
-                           "重跑前会先做站内对账，已存在的订单不会重复提交")
+            next_action = ("任务已停止；未确认单可直接再运行一次核对并补单："
+                           "先站内对账、只补仍缺失项；平台列表延迟时仍可能重复下单")
         elif uncertain_ids or (final is not None and final.missing):
             status = "unconfirmed"
-            next_action = ("存在未确认或“已发送未知”的订单；可直接再运行一次补单："
-                           "重跑前会先做站内对账，已存在的订单不会重复提交；"
+            next_action = ("存在未确认或“已发送未知”的订单；可直接再运行一次核对并补单："
+                           "先站内对账、只补仍缺失项；平台列表延迟时仍可能重复下单；"
                            "本批不会自动重发")
         else:
             status = "confirmed"
@@ -564,20 +696,20 @@ def run_sss_job(config: Any, stop_event: Any,
 
         if status == "failed":
             _emit(progress_callback,
-                  f"闪时送任务失败：确认 {created}/{processed}，"
+                  f"闪时送任务失败：{confirmed_clause}，"
                   f"{next_action}")
         elif status == "stopped":
             _emit(progress_callback,
                   f"闪时送任务已停止：{'已完成站内对账' if reconciled else '站内对账失败'}，"
-                  f"确认 {created}/{processed}")
+                  f"{confirmed_clause}")
         elif status == "confirmed":
             _emit(progress_callback,
-                  f"闪时送下单完成：确认 {created}/{processed}，"
+                  f"闪时送下单完成：{confirmed_clause}，"
                   f"总耗时 {(time.perf_counter() - job_start):.1f} 秒")
         else:
             _emit(progress_callback,
-                  f"闪时送任务未确认：确认 {created}/{processed}，"
-                  f"{processed - created} 单未确认；{next_action}")
+                  f"闪时送任务未确认：{confirmed_clause}，"
+                  f"{_pending_clause(submission_stats, processed - created)}；{next_action}")
 
         result: dict[str, Any] = {
             "processed": processed,
@@ -600,6 +732,7 @@ def run_sss_job(config: Any, stop_event: Any,
             uncertain=len(uncertain_ids), explicit_failures=len(failure_ids),
             not_sent=len(not_sent_ids), success_responses=len(success_response_ids),
             reconciled=reconciled,
+            **({"submission": submission_stats} if submission_stats is not None else {}),
         )
     finally:
         if _batch_guard is not None:

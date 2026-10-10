@@ -55,6 +55,10 @@ from app.ordering.sss import (
     expected_delivery_date,
     run_sss_job,
 )
+from app.ordering.runner import (
+    _confirmed_clause as _sss_confirmed_clause,
+    _format_submission_stats as _sss_submission_counts,
+)
 from app.ordering.diagnostics import diagnostic_dir
 from app.ordering.cloud_import import ImportRefused, prepare_day_orders
 from app.api.operation import OperationCoordinator
@@ -1132,6 +1136,19 @@ class Bridge:
         except Exception as exc:
             self._task_error(str(exc))
 
+    @staticmethod
+    def _sss_submission_of(result: dict[str, Any]) -> dict[str, Any] | None:
+        """取 runner 的 ``summary.submission`` 计数（旧 runner/旧 mock 结果没有 → None）。
+
+        计数一律来自提交层的真实调用与对账集合：缺失时界面退回旧文案，绝不把
+        缺字段当成 0（未知就是未知）。
+        """
+        summary = result.get("summary")
+        if not isinstance(summary, dict):
+            return None
+        submission = summary.get("submission")
+        return submission if isinstance(submission, dict) else None
+
     def _run_sss(self, config: AppConfig, password: str) -> None:
         try:
             result = run_sss_job(config, self._stop_event, lambda msg: self.log(msg),
@@ -1141,30 +1158,37 @@ class Bridge:
             status = result.get("status")
             source_label = ("本地 Excel" if result.get("source") == "excel"
                             else "云端当天名单")
+            submission = self._sss_submission_of(result)
+            # 精确计数：提交前已有 / 本轮提交与尝试 / 响应成功 / 技术异常（结果未知）
+            # / 明确拒绝 / 未发送 / 本轮新增站内确认 / 总确认与目标 / 未确认。
+            # 旧结果没有该字段时保持原文案（不臆造 0）。
+            counts = (f"；本轮提交统计：{_sss_submission_counts(submission)}"
+                      if submission is not None else "")
             if status == "dry_run":
                 message = (f"闪时送干跑完成：已组装 {result.get('previewed', 0)} 单"
-                           f"（名单来源：{source_label}），未创建真实订单")
+                           f"（名单来源：{source_label}），未创建真实订单" + counts)
             elif status == "no_orders":
                 meals = (result.get("import") or {}).get("meals") or {}
                 detail = "；".join(
                     f"{name}不下单（{info.get('reason') or '没有当天列'}）"
                     if info.get("skipped") else f"{name} {info.get('orders', 0)} 人"
                     for name, info in meals.items())
-                message = "闪时送没有需要下单的订单" + (f"：{detail}" if detail else "")
+                message = ("闪时送没有需要下单的订单"
+                           + (f"：{detail}" if detail else "") + counts)
             elif status == "insufficient_balance":
                 message = (f"闪时送已安全停止：余额不足，本批未提交，"
-                           f"预计 {result.get('estimate', '?')} 元")
+                           f"预计 {result.get('estimate', '?')} 元" + counts)
             elif status == "balance_unknown":
-                message = "闪时送已安全停止：余额未知，本批未提交"
+                message = "闪时送已安全停止：余额未知，本批未提交" + counts
             elif status == "preflight_ok":
                 message = (f"闪时送预检完成：已有站内匹配 {result.get('created', 0)} 单，"
-                           "未提交新订单")
+                           "未提交新订单" + counts)
             elif status in {"preflight_uncertain", "duplicate_detected"}:
-                message = "闪时送预检停止：未提交新订单，请先处理日志中的风险"
+                message = "闪时送预检停止：未提交新订单，请先处理日志中的风险" + counts
             elif status in {"failed", "error"}:
-                message = ("闪时送任务失败：本批结果未成功确认；请查看日志并核对，"
-                           "修复后可直接再运行一次（重跑前会先做站内对账，"
-                           "已存在的订单不会重复提交）")
+                message = ("闪时送任务失败：本批结果未成功确认" + counts
+                           + "；请查看日志并核对，修复后可直接再运行一次核对并补单"
+                             "（会先做站内对账、只补仍缺失项；平台列表延迟时仍可能重复下单）")
             elif status == "blocked_concurrent":
                 # R6-9：并发阻断不是“站内对账失败”。runner 在发送任何 POST 之前
                 # 就因批次级跨进程锁拿不到而退出，用户要做的只是等待后刷新。
@@ -1174,28 +1198,40 @@ class Bridge:
                 message = ("闪时送任务被阻断：本批未发送任何请求；"
                            "请按运行日志里的下一步处理后再运行")
             elif status in {"unconfirmed", "uncertain"}:
-                message = ("闪时送任务结果未确认：存在未确认或已发送未知订单；"
-                           "可直接再运行一次补单（重跑前会先做站内对账，"
-                           "已存在的订单不会重复提交；本批不会自动重发）")
+                # 有精确计数就直接列计数；旧结果（没有 submission）保留原文案。
+                lead = ("闪时送任务结果未确认" + counts if counts
+                        else "闪时送任务结果未确认：存在未确认或已发送未知订单")
+                message = (lead + "；可直接再运行一次核对并补单"
+                           "（会先做站内对账、只补仍缺失项；平台列表延迟时仍可能重复下单；"
+                           "本批不会自动重发）")
             elif result.get("stopped"):
                 reconciliation = "已完成站内对账" if result.get("reconciled") else "站内对账失败"
                 message = (f"闪时送任务已停止：{reconciliation}，"
-                           f"已确认 {result.get('created', '?')}/{result.get('processed', '?')} 单"
-                           + ("" if result.get("reconciled")
-                              else "；对账未完成，请先查看日志确认"))
+                           + _sss_confirmed_clause(
+                               submission,
+                               f"已确认 {result.get('created', '?')}/{result.get('processed', '?')} 单"
+                               + ("" if result.get("reconciled")
+                                  else "；对账未完成，请先查看日志确认"))
+                           + counts)
             elif result.get("uncertain") or not result.get("reconciled"):
                 result["partial"] = True
                 message = ("闪时送任务结束：站内对账失败，无法确认已创建数量；"
-                           "请先查看日志，恢复对账后再运行")
+                           "请先查看日志，恢复对账后再运行" + counts)
             elif result.get("partial"):
                 created = result.get("created", "?")
                 processed = result.get("processed", "?")
                 missing = processed - created if isinstance(processed, int) and isinstance(created, int) else "?"
                 message = (f"闪时送任务部分完成：已确认 {created}/{processed} 单，"
-                           f"{missing} 单未完成")
+                           f"{missing} 单未完成" + counts)
             else:
-                message = (f"闪时送下单完成：已创建 {result.get('created', '?')} 单，"
-                           f"处理 {result.get('processed', '?')} 项")
+                # 总确认是「提交前已有 + 本轮新增」：created 字段不能说成“本轮新建”。
+                # 旧结果（没有 submission）也按站内确认口径，不写“已创建 N 单”。
+                message = ("闪时送下单完成："
+                           + _sss_confirmed_clause(
+                               submission,
+                               f"站内确认 {result.get('created', '?')}/"
+                               f"{result.get('processed', '?')} 单")
+                           + counts)
             self._finish_task(message, result)
         except Exception as exc:
             self._task_error(str(exc))
@@ -1323,22 +1359,25 @@ class Bridge:
             # R6-9：并发阻断发生在任何 POST 之前，不需要“只读核对”那套动作。
             return "另一个任务正在运行，请等待后刷新"
         if result.get("uncertain") and status != "success":
-            # 无显式 next_action 的旧 runner 结果：落到“可再运行补单”语义
-            # （3.6.19 起跨运行阻断已下线，运行前的只读对账负责去重）。
-            return "可再运行一次补单（重跑前会先做站内对账，已存在的订单不会重复提交）"
+            # 无显式 next_action 的旧 runner 结果：落到“可再运行核对并补单”语义
+            # （3.6.19 起跨运行阻断已下线，运行前的只读对账负责去重；但平台列表
+            # 有延迟，不能承诺不可见订单零重复）。
+            return ("可再运行一次核对并补单（会先做站内对账、只补仍缺失项；"
+                    "平台列表延迟时仍可能重复下单）")
+        _resume = "会先做站内对账、只补仍缺失项；平台列表延迟时仍可能重复下单"
         defaults = {
             "success": "",
             "partial": "只处理未完成项；核对失败单号后再处理，不要手工追加",
-            "stopped": "查看日志确认结果；可再运行一次补单（已存在的订单不会重复提交）",
-            "error": "查看日志并核对结果；修复后可直接再运行（重跑前会先做站内对账）",
-            "uncertain": "可再运行一次补单（重跑前会先做站内对账，已存在的订单不会重复提交）",
+            "stopped": f"查看日志确认结果；可再运行一次核对并补单（{_resume}）",
+            "error": f"查看日志并核对结果；修复后可直接再运行（{_resume}）",
+            "uncertain": f"可再运行一次核对并补单（{_resume}）",
             "blocked_concurrent": "另一个任务正在运行，请等待后刷新",
             "blocked_uncertain": "被阻断：请按运行日志里的提示处理后再运行",
             "dry_run": "干跑未发送任何 POST；确认报文后再正式运行",
             "preflight_ok": "预检只读模式，未提交新订单；确认后再正式运行",
             "no_orders": "没有需要处理的订单，无需操作",
-            "insufficient_balance": "余额不足，本批未提交；充值后可直接再运行（重跑前会先做站内对账）",
-            "balance_unknown": "余额未知，本批未提交；确认余额后可直接再运行（重跑前会先做站内对账）",
+            "insufficient_balance": f"余额不足，本批未提交；充值后可直接再运行（{_resume}）",
+            "balance_unknown": f"余额未知，本批未提交；确认余额后可直接再运行（{_resume}）",
         }
         return defaults.get(status, "核对任务结果后再决定下一步")
 

@@ -26,6 +26,12 @@ class _SubmitResult:
     auth_error: str = ""
     balance_error: str = ""
     stopped: bool = False
+    #: 只做计数，不参与任何状态集合与重试判定：本轮真实调用 ``submit`` 的次数，
+    #: 以及本轮真正发起过 POST 的任务（停止等待/未派发一律不计）。
+    attempts: int = 0
+    dispatched: set[str] = field(default_factory=set)
+    #: 平台可识别的参数校验拒绝次数（``failures`` 的子集，单独计数以免被推断）。
+    explicit_rejections: int = 0
 
 @dataclass
 class _Reconciliation:

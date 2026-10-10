@@ -152,8 +152,11 @@ def test_legacy_uncertain_flag_without_status_stays_needs_review(tmp_path):
     assert payload["partial"] is True
     assert payload["ok"] is False
     assert payload["uncertain"] is True
-    # 3.6.19 起跨运行阻断已下线：兜底文案必须是“可再运行补单”，不能出现“不要重跑本批”。
-    assert "已存在的订单不会重复提交" in payload["next_action"]
+    # 3.6.19 起跨运行阻断已下线：兜底文案必须是“可再运行核对并补单”，
+    # 且不能承诺不可见订单零重复（平台列表有延迟）。
+    assert "核对并补单" in payload["next_action"]
+    assert "仍可能重复下单" in payload["next_action"]
+    assert "已存在的订单不会重复提交" not in payload["next_action"]
     assert "重跑本批" not in payload["next_action"]
 
 
@@ -454,3 +457,130 @@ def test_run_sss_blocked_concurrent_message_chain(tmp_path, monkeypatch):
     assert payload["summary"]["bridge_status"] == "blocked_concurrent"
     assert payload["next_action"].startswith("另一进程正")
     assert bridge.operation_status(operation_id)["status"] == "blocked_concurrent"
+
+
+# ----------------------------------------------------------------------
+# 闪时送本轮提交统计（summary.submission）：
+# * 必须传播到 operation.summary 与消息里（逐项精确计数）；
+# * 「总确认 = 提交前已有 + 本轮新增」，created 不能说成“本轮新建”；
+# * 旧 runner/旧结果没有该字段时，文案与语义保持原样（不臆造 0）。
+# ----------------------------------------------------------------------
+SSS_SUBMISSION = {
+    "target_total": 99, "preconfirmed": 26, "submitted": 73, "attempts": 73,
+    "success_responses": 25, "technical_errors": 48, "explicit_rejections": 0,
+    "auth_rejections": 0, "balance_rejections": 0, "not_sent": 0,
+    "newly_confirmed": 25, "confirmed": 51, "unconfirmed": 48, "reconciled": True,
+}
+
+
+def _sss_live_result(**overrides):
+    """现场量级：已有 26 + 本轮新增 25 = 总确认 51，未确认 48。"""
+    result = {
+        "status": "unconfirmed", "processed": 99, "created": 51, "stopped": False,
+        "partial": False, "reconciled": True, "uncertain": True, "source": "excel",
+        "next_action": ("存在未确认或“已发送未知”的订单；可直接再运行一次核对并补单："
+                        "先站内对账、只补仍缺失项；平台列表延迟时仍可能重复下单；"
+                        "本批不会自动重发"),
+        "summary": {"status": "unconfirmed", "confirmed": 51, "unconfirmed": 48,
+                    "submission": dict(SSS_SUBMISSION)},
+    }
+    result.update(overrides)
+    return result
+
+
+def test_run_sss_message_carries_exact_counts_and_propagates_submission(tmp_path, monkeypatch):
+    bridge, operation_id = _bridge_with_operation(tmp_path)
+    monkeypatch.setattr(bridge_module, "run_sss_job", lambda *a, **k: _sss_live_result())
+
+    bridge._run_sss(bridge._config, "pw")
+
+    operation = bridge.operation_status(operation_id)
+    assert operation["status"] != "success"
+    assert operation["summary"]["submission"]["technical_errors"] == 48
+    assert operation["summary"]["submission"]["confirmed"] == 51
+    assert operation["summary"]["submission"]["newly_confirmed"] == 25
+    events = _task_events(bridge)
+    assert not any(_is_success_type_task_done(event) for event in events), events
+    errors = [event for event in events if event["event"] == "task:error"]
+    assert errors, events
+    payload = errors[0]["payload"]
+    assert payload["ok"] is False and payload["real_order"] is False
+    message = payload["message"]
+    for fragment in ("提交前已有 26 单", "本轮提交 73 单（73 次 POST）",
+                     "成功响应 25 次", "技术异常（结果未知）48 次",
+                     "明确拒绝 0 次", "未发送 0 单",
+                     "本轮新增站内确认 25 单", "总确认 51/99", "未确认 48 单"):
+        assert fragment in message, message
+    # 51 = 提交前已有 26 + 本轮新增 25：不能说成“本轮新建 51”。
+    assert "新建" not in message
+    assert "已创建 51" not in message
+    assert payload["next_action"].startswith("存在未确认")
+
+
+def test_run_sss_confirmed_message_separates_preexisting_from_newly_confirmed(tmp_path, monkeypatch):
+    bridge, operation_id = _bridge_with_operation(tmp_path)
+    result = _sss_live_result(
+        status="confirmed", uncertain=False, next_action="",
+        summary={"status": "confirmed", "confirmed": 99, "unconfirmed": 0,
+                 "submission": {**SSS_SUBMISSION, "confirmed": 99,
+                                "unconfirmed": 0, "newly_confirmed": 73}})
+    monkeypatch.setattr(bridge_module, "run_sss_job", lambda *a, **k: result)
+
+    bridge._run_sss(bridge._config, "pw")
+
+    operation = bridge.operation_status(operation_id)
+    assert operation["status"] == "success"
+    done = [event for event in _task_events(bridge) if event["event"] == "task:done"]
+    assert done and _is_success_type_task_done(done[0])
+    message = done[0]["payload"]["message"]
+    assert "站内确认 99/99（提交前已有 26，本轮新增 73）" in message
+    assert "总确认 99/99" in message and "未确认 0 单" in message
+    assert "新建" not in message and "已创建 99" not in message
+
+
+def test_run_sss_legacy_result_without_submission_keeps_the_old_wording(tmp_path, monkeypatch):
+    """旧 runner/旧 mock 结果没有 summary.submission：文案原样，不臆造 0。"""
+    bridge, operation_id = _bridge_with_operation(tmp_path)
+    monkeypatch.setattr(bridge_module, "run_sss_job", lambda *a, **k: {
+        "processed": 3, "created": 2, "stopped": True, "reconciled": True,
+    })
+
+    bridge._run_sss(bridge._config, "pw")
+
+    done = [event for event in _task_events(bridge) if event["event"] == "task:done"]
+    assert done, _task_events(bridge)
+    assert done[0]["payload"]["message"] == "闪时送任务已停止：已完成站内对账，已确认 2/3 单"
+    # 旧结果没有 submission：既不显示 0，也不造一个假字典。
+    assert "submission" not in done[0]["payload"]["summary"]
+
+
+def test_run_sss_dry_run_message_reports_zero_posts_and_unknown_station(tmp_path, monkeypatch):
+    """干跑/模拟也给精确计数：0 次 POST、站内数量未知（待核对），不冒充新建。"""
+    bridge, operation_id = _bridge_with_operation(tmp_path)
+    monkeypatch.setattr(bridge_module, "run_sss_job", lambda *a, **k: {
+        "status": "dry_run", "processed": 3, "previewed": 3, "created": 0,
+        "submitted": 0, "source": "excel", "reconciled": False,
+        "next_action": "干跑未发送任何 POST；确认报文后再正式运行",
+        "summary": {"status": "dry_run", "submission": {
+            "target_total": 3, "preconfirmed": None, "submitted": 0, "attempts": 0,
+            "success_responses": 0, "technical_errors": 0, "explicit_rejections": 0,
+            "auth_rejections": 0, "balance_rejections": 0, "not_sent": 3,
+            "newly_confirmed": None, "confirmed": None, "unconfirmed": None,
+            "reconciled": False}},
+    })
+
+    bridge._run_sss(bridge._config, "pw")
+
+    done = [event for event in _task_events(bridge) if event["event"] == "task:done"]
+    assert done, _task_events(bridge)
+    payload = done[0]["payload"]
+    assert payload["ok"] is False and payload["real_order"] is False
+    message = payload["message"]
+    assert "未创建真实订单" in message
+    assert "本轮提交 0 单（0 次 POST）" in message
+    assert "未发送 3 单" in message
+    assert "提交前已有 待核对" in message
+    assert "总确认 待核对/3" in message
+    assert "新建" not in message
+    assert operation_id  # 互斥槽位仍由 _finish_task 正常释放
+    assert bridge.operation_status(operation_id)["status"] == "dry_run"
