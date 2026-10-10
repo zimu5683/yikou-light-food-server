@@ -1162,28 +1162,31 @@ class Bridge:
             elif status in {"preflight_uncertain", "duplicate_detected"}:
                 message = "闪时送预检停止：未提交新订单，请先处理日志中的风险"
             elif status in {"failed", "error"}:
-                message = ("闪时送任务失败：本批结果未成功确认，请查看日志并只读核对，"
-                           "严禁重跑或补发")
+                message = ("闪时送任务失败：本批结果未成功确认；请查看日志并核对，"
+                           "修复后可直接再运行一次（重跑前会先做站内对账，"
+                           "已存在的订单不会重复提交）")
             elif status == "blocked_concurrent":
                 # R6-9：并发阻断不是“站内对账失败”。runner 在发送任何 POST 之前
                 # 就因批次级跨进程锁拿不到而退出，用户要做的只是等待后刷新。
                 message = ("另一个任务正在运行，请等待后刷新"
                            "（本次未发送任何下单请求）")
             elif status == "blocked_uncertain":
-                message = ("闪时送任务被阻断：存在未解决的不确定记录，"
-                           "请先只读核对站内订单与本地记录；未确认前不要重跑或补发")
+                message = ("闪时送任务被阻断：本批未发送任何请求；"
+                           "请按运行日志里的下一步处理后再运行")
             elif status in {"unconfirmed", "uncertain"}:
-                message = ("闪时送任务结果未确认：存在未确认或已发送未知订单，"
-                           "请仅做只读核对，不要重试或重跑本批")
+                message = ("闪时送任务结果未确认：存在未确认或已发送未知订单；"
+                           "可直接再运行一次补单（重跑前会先做站内对账，"
+                           "已存在的订单不会重复提交；本批不会自动重发）")
             elif result.get("stopped"):
                 reconciliation = "已完成站内对账" if result.get("reconciled") else "站内对账失败"
                 message = (f"闪时送任务已停止：{reconciliation}，"
                            f"已确认 {result.get('created', '?')}/{result.get('processed', '?')} 单"
-                           + ("" if result.get("reconciled") else "，请勿手动重复提交"))
+                           + ("" if result.get("reconciled")
+                              else "；对账未完成，请先查看日志确认"))
             elif result.get("uncertain") or not result.get("reconciled"):
                 result["partial"] = True
-                message = ("闪时送任务结束：站内对账失败，无法确认已创建数量，"
-                           "请勿手动重复提交")
+                message = ("闪时送任务结束：站内对账失败，无法确认已创建数量；"
+                           "请先查看日志，恢复对账后再运行")
             elif result.get("partial"):
                 created = result.get("created", "?")
                 processed = result.get("processed", "?")
@@ -1320,21 +1323,22 @@ class Bridge:
             # R6-9：并发阻断发生在任何 POST 之前，不需要“只读核对”那套动作。
             return "另一个任务正在运行，请等待后刷新"
         if result.get("uncertain") and status != "success":
-            # 无显式 next_action 的旧 runner 结果也必须落到“只读核对”语义。
-            return "只读核对，不要重试或重跑本批"
+            # 无显式 next_action 的旧 runner 结果：落到“可再运行补单”语义
+            # （3.6.19 起跨运行阻断已下线，运行前的只读对账负责去重）。
+            return "可再运行一次补单（重跑前会先做站内对账，已存在的订单不会重复提交）"
         defaults = {
             "success": "",
             "partial": "只处理未完成项；核对失败单号后再处理，不要手工追加",
-            "stopped": "查看日志并核对结果；不要整批重跑",
-            "error": "查看日志并核对结果；修复后重试，不要重复提交",
-            "uncertain": "只读核对，不要重试或重跑本批",
+            "stopped": "查看日志确认结果；可再运行一次补单（已存在的订单不会重复提交）",
+            "error": "查看日志并核对结果；修复后可直接再运行（重跑前会先做站内对账）",
+            "uncertain": "可再运行一次补单（重跑前会先做站内对账，已存在的订单不会重复提交）",
             "blocked_concurrent": "另一个任务正在运行，请等待后刷新",
-            "blocked_uncertain": "先只读核对站内订单与本地记录；未确认前不要重跑或补发",
+            "blocked_uncertain": "被阻断：请按运行日志里的提示处理后再运行",
             "dry_run": "干跑未发送任何 POST；确认报文后再正式运行",
             "preflight_ok": "预检只读模式，未提交新订单；确认后再正式运行",
             "no_orders": "没有需要处理的订单，无需操作",
-            "insufficient_balance": "余额不足，本批未提交；充值后先只读核对再运行",
-            "balance_unknown": "余额未知，本批未提交；确认余额后先只读核对再运行",
+            "insufficient_balance": "余额不足，本批未提交；充值后可直接再运行（重跑前会先做站内对账）",
+            "balance_unknown": "余额未知，本批未提交；确认余额后可直接再运行（重跑前会先做站内对账）",
         }
         return defaults.get(status, "核对任务结果后再决定下一步")
 
@@ -1344,8 +1348,8 @@ class Bridge:
         text = str(message or "").strip()
         labels = {
             "error": "任务失败",
-            "uncertain": "任务结果不确定，需人工核对",
-            "blocked_uncertain": "任务被阻断，需人工核对",
+            "uncertain": "任务结果不确定",
+            "blocked_uncertain": "任务被阻断",
             "blocked_concurrent": "另一个任务正在运行，请等待后刷新",
             "dry_run": "干跑完成（未真实下单）",
             "preflight_ok": "预检完成（未提交新订单）",

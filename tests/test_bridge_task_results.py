@@ -152,7 +152,9 @@ def test_legacy_uncertain_flag_without_status_stays_needs_review(tmp_path):
     assert payload["partial"] is True
     assert payload["ok"] is False
     assert payload["uncertain"] is True
-    assert "只读核对" in payload["next_action"]
+    # 3.6.19 起跨运行阻断已下线：兜底文案必须是“可再运行补单”，不能出现“不要重跑本批”。
+    assert "已存在的订单不会重复提交" in payload["next_action"]
+    assert "重跑本批" not in payload["next_action"]
 
 
 def test_blocked_uncertain_keeps_blocked_review_stopped_semantics(tmp_path):

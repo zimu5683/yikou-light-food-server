@@ -349,5 +349,6 @@ def test_bridge_reports_reconciliation_failure_as_uncertain(tmp_path, monkeypatc
     events = bridge.drain_events()["events"]
     done = next(event for event in events if event["event"] == "task:done")
     assert "站内对账失败" in done["payload"]["message"]
-    assert "请勿手动重复提交" in done["payload"]["message"]
+    # 3.6.21：对账失败时不再说“请勿重复提交”，改为提示恢复对账后再运行。
+    assert "恢复对账后再运行" in done["payload"]["message"]
     assert bridge.status == "partial"

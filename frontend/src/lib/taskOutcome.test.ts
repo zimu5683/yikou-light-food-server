@@ -46,11 +46,11 @@ test('模拟/预检/无单/余额不足有明确非成功的文案', () => {
 test('结果不确定时 next_action 会带进提示', () => {
   const view = taskOutcomeView({
     status: 'uncertain', ok: false, success: false, uncertain: true,
-    message: '站内对账失败', next_action: '只读核对，不要重试或重跑本批',
+    message: '站内对账失败', next_action: '可再运行一次补单（已存在的订单不会重复提交）',
   })
   assert.equal(view.isSuccess, false)
   assert.equal(view.needsReview, true)
-  assert.match(view.message, /只读核对，不要重试/)
+  assert.match(view.message, /可再运行一次补单/)
 })
 
 test('R6-9：blocked_concurrent 不落入阻断/失败/对账分支，也不需要核对', () => {

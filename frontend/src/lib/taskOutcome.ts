@@ -73,7 +73,7 @@ export function taskOutcomeView(payload: TaskOutcomeLike): TaskOutcomeView {
     return {
       level: 'warning', toast: 'warning',
       title: '结果不确定 · 待核对',
-      message: withNext(message || '任务结果不确定，需要人工核对；不要直接重试或重跑本批。'),
+      message: withNext(message || '任务结果不确定；可再运行一次补单（重跑前会先做站内对账，已存在的不会重复提交）。'),
       needsReview: true, isSuccess: false, statusKey: 'uncertain',
     }
   }
@@ -91,7 +91,7 @@ export function taskOutcomeView(payload: TaskOutcomeLike): TaskOutcomeView {
     return {
       level: 'error', toast: 'error',
       title: '任务被阻断 · 待核对',
-      message: withNext(message || '任务被阻断，需在闪时送结果区「未决记录」面板查看未决记录并只读核对站内订单；未确认前不要重发。'),
+      message: withNext(message || '任务被阻断；请按运行日志里的下一步处理后重试。'),
       needsReview: true, isSuccess: false, statusKey: 'blocked_uncertain',
     }
   }

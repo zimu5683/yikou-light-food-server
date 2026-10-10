@@ -181,7 +181,7 @@ const UNCERTAIN_OPERATION_MUTATIONS = [
     file: OPERATION_STATUS,
     name: '权威 uncertain 渲染成“已完成 / success”',
     find: `    case 'uncertain':
-      return resultView(modeLabel, 'uncertain', \`\${modeLabel}结果不确定 · 待核对\`, '无法确认执行结果；请先只读核对云端与日志，不要直接重试或重跑本批。', 'warning', true, nextAction, reason, common)`,
+      return resultView(modeLabel, 'uncertain', \`\${modeLabel}结果不确定 · 待核对\`, '未能确认全部结果；可再运行一次补单（重跑前会先做站内对账，已存在的订单不会重复提交）。', 'warning', true, nextAction, reason, common)`,
     replace: `    case 'uncertain':
       return resultView(modeLabel, 'success', \`\${modeLabel}已完成\`, '任务已正常结束，可查看结果与日志。', 'success', false, nextAction, reason, common)`,
   },
@@ -194,14 +194,14 @@ const SCENARIOS = [
     mutations: UNCERTAIN_OPERATION_MUTATIONS,
     mustFail: [
       'FE-1 uncertain 权威状态渲染“结果不确定 · 待核对”（真实 DOM）',
-      'FE-1 uncertain 权威状态渲染“不要重试/重跑”防重复提示',
+      'FE-1 uncertain 权威状态渲染“可再运行补单”防重复提示',
       'FE-1 uncertain 权威状态区不出现“已完成/成功”完成文案',
       'FE-1 uncertain 整页不出现“已完成/上传完成”等误导性完成文案',
       'FE-1 uncertain 流程条“结果”步骤不显示成功勾选（仍是待核对步骤）',
       'FE-1 uncertain 日志面板展开后仍然显示不确定状态（不显示已完成）',
-      'FE-1 uncertain 390x844 窄屏：显示“结果不确定 · 待核对 + 不要重试/重跑”且无完成文案/无横向溢出',
-      'FE-1 uncertain 800x450 横屏：显示“结果不确定 · 待核对 + 不要重试/重跑”且无完成文案/无横向溢出',
-      'FE-1 uncertain 360x800 更窄：显示“结果不确定 · 待核对 + 不要重试/重跑”且无完成文案/无横向溢出',
+      'FE-1 uncertain 390x844 窄屏：显示“结果不确定 · 待核对 + 可再运行补单”且无完成文案/无横向溢出',
+      'FE-1 uncertain 800x450 横屏：显示“结果不确定 · 待核对 + 可再运行补单”且无完成文案/无横向溢出',
+      'FE-1 uncertain 360x800 更窄：显示“结果不确定 · 待核对 + 可再运行补单”且无完成文案/无横向溢出',
       'FE-1 uncertain 断线恢复后回到“结果不确定 · 待核对”，且不会自动重传',
       'FE-1 uncertain 云文档页签同样渲染“结果不确定 · 待核对”',
       'FE-1 uncertain 刷新后权威状态仍是“结果不确定 · 待核对”',
@@ -443,7 +443,8 @@ const SCENARIOS = [
       '批2 待核对 · 订单 @360x800：状态只在头部一处、说明完整、无横向溢出',
     ],
     // uncertain 的两格是**控制组**，不是漏测：批2 矩阵在 390x800 取样，而 uncertain
-    // 的说明只有 33 个汉字（「无法确认执行结果；请先只读核对云端与日志，不要直接重试或重跑本批。」），
+    // 的说明较短（3.6.21 起为「未能确认全部结果；可再运行一次补单（重跑前会先做站内对账，
+    // 已存在的订单不会重复提交）。」，会折行但不裁切），
     // 390px 下本来就放得下 —— 注入 truncate 不产生可见裁切，所以这两格对该变异天然不敏感。
     // 3.6.14 第一次把变异门禁接进 CI 时，正是因为把它们列进 mustFail 才报 12/13。
     mustStillPass: [

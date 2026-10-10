@@ -2520,8 +2520,8 @@ async function main() {
       JSON.stringify(uncertainSurface),
     )
     record(
-      'FE-1 uncertain 权威状态渲染“不要重试/重跑”防重复提示',
-      Boolean(uncertainSurface) && /不要.{0,4}(重试|重跑)/.test(uncertainSurface.surfaceText),
+      'FE-1 uncertain 权威状态渲染“可再运行补单”防重复提示',
+      Boolean(uncertainSurface) && /再运行一次补单|不会重复提交/.test(uncertainSurface.surfaceText),
       JSON.stringify(uncertainSurface?.surfaceText || ''),
     )
     const uncertainPageText = await cdp.eval('document.body.innerText')
@@ -2595,9 +2595,9 @@ async function main() {
         }).map((el) => (el.textContent || '').replace(/\\s+/g, ' ').trim()),
       })`)
       record(
-        `FE-1 uncertain ${label}：显示“结果不确定 · 待核对 + 不要重试/重跑”且无完成文案/无横向溢出`,
+        `FE-1 uncertain ${label}：显示“结果不确定 · 待核对 + 可再运行补单”且无完成文案/无横向溢出`,
         Boolean(surface) && surface.label.includes('结果不确定') && surface.label.includes('待核对')
-          && /不要.{0,4}(重试|重跑)/.test(surface.surfaceText)
+          && /再运行一次补单|不会重复提交/.test(surface.surfaceText)
           && misleadingCompletion.every((word) => !layout.text.includes(word))
           && layout.sw <= layout.iw + 1
           && !layout.buttons.some((text) => oneClickRerun.test(text)),
