@@ -41,6 +41,20 @@
   本机通过。
 - 安卓 Kotlin 改动由 CI 编译出包验证（本机无 Android SDK）。
 
+### 发布补记：CI 验证、出包与发布结果
+
+- main 推送（`dd576eb`）后 CI 全绿：Tests **1547 passed**（Python 3.11 与 3.13 各一遍，
+  含 `ruff check app tests scripts`「All checks passed!」、前端构建/lint/测试/锚点与
+  headless Chrome 浏览器门禁、Workspace hygiene），Android APK（main）出包成功
+  （Kotlin 原生导出改动编译通过）。相关 run：Tests 38009082288、Android APK（main）
+  38009082204。
+- tag `v3.6.21` 触发的发布流水线（run 38010905291）成功：**Release v3.6.21 已发布**
+  （https://github.com/zimu5683/yikou-light-food-server/releases/tag/v3.6.21），
+  APK `yikou-light-food-3.6.21-arm64.apk` **19,818,005 字节**，sha256
+  `afcb8b10…daa299`（资产内 `.sha256` 与出包日志一致）。
+- 本机网络对 `github.com:443` 继续间歇性握手失败：`git push` 在重试内完成
+  （main 第 1 次、tag 第 11 次成功）。仅影响推送通道，不改动仓库内容。
+
 ## 3.6.20
 
 一次「出厂并发回落到串行 + 诊断日志放开管理员门槛」的版本；未改提交/对账逻辑本身。
