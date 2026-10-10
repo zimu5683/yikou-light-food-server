@@ -56,6 +56,11 @@ node scripts/mutation-check.mjs                 # 全部变异场景
   事件（走命中测试）点右上角按钮能立即开合、连续叠多条提示仍可退出、提示条不压日志头部
   搜索/工具入口与底栏主动作、窄屏+搜索展开与运行中长状态的最坏情况、横屏、刘海安全区、
   模态弹窗仍拦住背后的按钮、桌面提示条仍在右下角。
+  批 3 覆盖闪时送**本轮提交统计卡片与「核对并补单」**：99/26/73/25/48 主样例逐项数值
+  （目标/已有/提交/尝试/成功/异常/拒绝/未发送/新增确认/最终确认/未确认）、确认页按
+  当前账号与当前名单说明「先对账、只补缺失项」且勾选前不可提交、取消不启动、双击只
+  提交一次、对账失败按待核对（不显示 0）、全部确认无需补单、模拟/预检不提供补单、
+  断线被发送闸门实际拦住、390x844 窄屏不溢出。
   加 `CAPTURE_MOBILE_TASK=1` 会额外产出手机任务页三页签截图与同屏重复计数
   （批 2 清单取证，产物是截图目录里的 mobile-task-matrix JSON），正常跑检查时不进入该段。
 - `scripts/mutation-check.mjs`：把 `frontend/` 复制到临时目录（`node_modules` 走符号链接），在副本里
@@ -63,7 +68,9 @@ node scripts/mutation-check.mjs                 # 全部变异场景
   日志相关变异：`SCENARIO=log-fab-not-wired`（按钮不再开合）、`SCENARIO=log-close-stuck-closing`
   （关闭收尾不落终态）、`SCENARIO=log-duplicate-expand`（可展开退回按长度判断 / 展开追加全文 /
   搜索不揭示隐藏命中 —— 三条都必须让 7f 的对应断言变成 FAIL）、`SCENARIO=toast-covers-log-fab`
-  （提示条退回贴顶，必须让第 8 节的真实点击断言变成 FAIL）。
+  （提示条退回贴顶，必须让第 8 节的真实点击断言变成 FAIL）、
+  `SCENARIO=sss-submission-card-removed`（统计卡片不再渲染，批 3 的卡片断言必须整体
+  变成 FAIL 而补单入口/确认页/断线闸门等控制组仍 PASS）。
 - FE-1（R6-8：uncertain 不得被渲染成“已完成”）的缺口、断言清单与三段式证据，见
   `scripts/browser-interaction-check.mjs` 的「5g FE-1 uncertain 权威状态」场景，以及
   `scripts/mutation-check.mjs` 的 `uncertain-operation-as-success` 变异。
