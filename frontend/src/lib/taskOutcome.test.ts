@@ -99,3 +99,72 @@ test('F5：task:error 缺少 result_status 时也不能把非失败状态硬编�
   const noStatus = taskOutcomeView({ status: pick({}), ok: false })
   assert.equal(noStatus.title, '任务失败')
 })
+
+test('闪时送本轮统计：成功响应是聚合次数；技术异常不叫确定失败；都不自动重发', () => {
+  const summary = {
+    submission: {
+      target_total: 99, preconfirmed: 26, submitted: 73, attempts: 73,
+      success_responses: 25, technical_errors: 48, explicit_rejections: 0,
+      auth_rejections: 0, balance_rejections: 0, not_sent: 0,
+      newly_confirmed: 25, confirmed: 51, unconfirmed: 48, reconciled: true,
+    },
+  }
+  const view = taskOutcomeView({
+    status: 'uncertain', result_status: 'uncertain', ok: false, success: false,
+    uncertain: true, needs_review: true,
+    message: '闪时送任务未确认：确认 51/99',
+    summary,
+  } as never)
+  assert.equal(view.isSuccess, false)
+  assert.equal(view.needsReview, true)
+  assert.match(view.message, /共收到 25 次成功响应/)
+  assert.match(view.message, /无法判断其中多少只是/)
+  assert.match(view.message, /不要因为看不到就自动重发/)
+  assert.match(view.message, /技术异常/)
+  assert.ok(!view.message.includes('已完成'))
+  assert.ok(!view.message.includes('可能暂未显示'))
+
+  // ok=true/success=true 但站内仍有未确认：不能弹绿色成功。
+  const dirtySuccess = taskOutcomeView({
+    status: 'success', result_status: 'success', ok: true, success: true, real_order: true,
+    message: '闪时送下单完成：确认 51/99',
+    summary,
+  } as never)
+  assert.equal(dirtySuccess.isSuccess, false)
+  assert.equal(dirtySuccess.toast, 'warning')
+  assert.match(dirtySuccess.title, /未确认|待核对/)
+  assert.ok(!dirtySuccess.message.includes('任务已完成'))
+
+  // 全部对账确认（没有未确认项）时不追加任何吓人的提示，绿色成功保留。
+  const clean = taskOutcomeView({
+    status: 'success', result_status: 'success', ok: true, success: true, real_order: true,
+    message: '闪时送下单完成：确认 26/26',
+    summary: {
+      submission: {
+        target_total: 26, preconfirmed: 26, submitted: 0, attempts: 0,
+        success_responses: 0, technical_errors: 0, not_sent: 0,
+        newly_confirmed: 0, confirmed: 26, unconfirmed: 0, reconciled: true,
+      },
+    },
+  } as never)
+  assert.equal(clean.isSuccess, true)
+  assert.equal(clean.toast, 'success')
+  assert.ok(!clean.message.includes('技术异常'))
+  assert.ok(!clean.message.includes('成功响应'))
+
+  // 模拟执行即使带 submission（未确认=全部）也不是“未确认下单”。
+  const dry = taskOutcomeView({
+    status: 'dry_run', result_status: 'dry_run', ok: false, success: false, real_order: false,
+    message: '干跑完成（未真实下单）',
+    summary: {
+      status: 'dry_run', result: { dry_run: true },
+      submission: { target_total: 26, submitted: 0, attempts: 0, unconfirmed: 26, reconciled: false },
+    },
+  } as never)
+  assert.equal(dry.title, '模拟执行完成（未创建订单）')
+  assert.equal(dry.isSuccess, false)
+
+  // 没有 submission 的旧后端结果：文案完全不变。
+  const legacy = taskOutcomeView({ status: 'uncertain', uncertain: true, message: '站内对账失败' } as never)
+  assert.equal(legacy.message, '站内对账失败')
+})

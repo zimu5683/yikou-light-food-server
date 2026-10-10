@@ -34,6 +34,7 @@ const RESULT_COUNTS = 'src/lib/resultCounts.ts'
 const WPS_FAILURE = 'src/lib/wpsFailure.ts'
 const SINGLE_FLIGHT = 'src/lib/singleFlight.ts'
 const OPERATION_STATUS = 'src/lib/operationStatus.ts'
+const SSS_SUBMISSION = 'src/lib/sssSubmission.ts'
 const MAIN_ENTRY = 'src/main.tsx'
 const APP_ENTRY = 'src/App.tsx'
 const LOG_CONSOLE = 'src/components/LogConsole.tsx'
@@ -184,6 +185,23 @@ const UNCERTAIN_OPERATION_MUTATIONS = [
       return resultView(modeLabel, 'uncertain', \`\${modeLabel}结果不确定 · 待核对\`, '未能确认全部结果；可再运行一次补单（重跑前会先做站内对账，已存在的订单不会重复提交）。', 'warning', true, nextAction, reason, common)`,
     replace: `    case 'uncertain':
       return resultView(modeLabel, 'success', \`\${modeLabel}已完成\`, '任务已正常结束，可查看结果与日志。', 'success', false, nextAction, reason, common)`,
+  },
+]
+
+/**
+ * 变异（批3）：本轮提交统计卡片整条渲染链路的反证。
+ *
+ * `pickSssSubmission` 不再带出 `submission`（卡片永远不渲染）后，批3 的卡片断言
+ * （逐项数值、headline、窄屏不溢出、运行中暂定、对账失败待核对、全部确认无需补单、
+ * 模拟/预检只读卡片、乱序列表仍取 sss）必须全部变成 FAIL；而「补单主动作」「确认页」
+ * 「双击只提交一次」「断线闸门」等控制组必须仍然 PASS —— 证明这些断言不是空转。
+ */
+const SSS_SUBMISSION_CARD_MUTATIONS = [
+  {
+    file: SSS_SUBMISSION,
+    name: 'pickSssSubmission 永远不带出 submission（统计卡片不再渲染）',
+    find: `    submission: operationSubmission(operation),`,
+    replace: `    submission: null,`,
   },
 ]
 
@@ -476,6 +494,34 @@ const SCENARIOS = [
       '批2 页签来回切换不丢草稿（订单数量 3 + 闪时送商品名都还在）',
       '批2 ready · order：权威状态只在任务工作台头部一处（页签内无重复状态块）',
       '布局无横向溢出 360x800',
+    ],
+  },
+  {
+    name: 'sss-submission-card-removed',
+    description: '让闪时送「本轮提交与站内确认」统计卡片不再渲染（pickSssSubmission 不带出 submission）',
+    mutations: SSS_SUBMISSION_CARD_MUTATIONS,
+    mustFail: [
+      '批3 结果卡片：99/26/73/25/48 主样例逐项对应具体数值（目标 99 · 已有 26 · 提交 73 · 成功 25 · 异常 48 · 新增 25 → 确认 51 · 未确认 48）',
+      '批3 结果卡片：未确认 48 项 → headline=unconfirmed，且与“成功响应暂不可见/技术异常”分开说明',
+      '批3 结果卡片手机窄屏不溢出（390x844，卡片宽度不超过视口）',
+      '批3 success + 进度 20：权威状态点明仍有未确认，不冒充最终完成',
+      '批3 运行中：进度 20 只算暂定（headline=running），主动作禁用且不是补单',
+      '批3 对账失败：确认/未确认按待核对（不显示 0），响应次数不被清除',
+      '批3 已全部站内确认：headline=confirmed 且明示无需补单，主动作回到「开始正式下单」',
+      '批3 模拟执行：不提供补单（卡片照旧展示上一轮真实统计）',
+      '批3 上一轮是模拟执行：卡片明说未发送下单请求且不提示补单，主动作回到「开始正式下单」',
+      '批3 上一轮是预检（Bridge 归一化成 uncertain）：卡片=只读未提交，不提供补单',
+      '批3 顶层是其它模式但列表里有未确认的 sss 运行：卡片与补单仍来自 sss（不被顶掉）',
+    ],
+    // 控制组：这些断言与卡片渲染无关，变异后必须仍然 PASS（页面没有崩）。
+    mustStillPass: [
+      '布局无横向溢出 360x800',
+      '批3 主动作：真实 SSS 未确认项 → 「核对并补单」（连接正常/无互斥/正式下单）',
+      '批3 确认页：未勾选明确确认句前不可提交，且没有发出任何 start_sss',
+      '批3 双击补单确认只发起一次 start_sss（不重复提交）',
+      '批3 断线：主动作禁用并被发送闸门实际拦住（0 次 start_sss，不是只换文字）',
+      '批3 其它模式（云上传）成功：不改闪时送主动作，也不渲染统计卡片',
+      '批3 旧后端（无 submission）：不渲染统计卡片，主动作仍是补单语义（未确认状态）',
     ],
   },
   ...PAGE_ERROR_SCENARIOS,

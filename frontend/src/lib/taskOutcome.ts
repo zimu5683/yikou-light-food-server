@@ -6,6 +6,14 @@
  * uncertain/partial/failed/blocked 必须显示“待核对/未完成”，模拟/预检必须明确未下单。
  * 纯逻辑模块，Node 测试可直接覆盖。
  */
+import {
+  parseSssSubmission,
+  sssRunKindFromSummary,
+  sssSubmissionAllConfirmed,
+  sssSubmissionHeadline,
+  sssSubmissionNote,
+} from './sssSubmission.ts'
+
 export type TaskOutcomeLevel = 'success' | 'info' | 'warning' | 'error'
 export type TaskToastKind = 'success' | 'info' | 'warning' | 'error'
 
@@ -39,6 +47,8 @@ export interface TaskOutcomeLike {
   needs_review?: boolean
   next_action?: string
   reason?: string
+  /** operation/task 结果 summary（含闪时送 `submission` 计数时给一句可见性提示）。 */
+  summary?: Record<string, unknown>
 }
 
 export interface TaskOutcomeView {
@@ -57,6 +67,9 @@ function isPlainSuccess(payload: TaskOutcomeLike): boolean {
   if (payload.stopped || payload.partial || payload.uncertain || payload.blocked) return false
   // needs_review 是「还要人核对」的硬标记：带着它就不能显示成功（Verifier D2）。
   if (payload.needs_review) return false
+  // 有站内对账口径时：只有全部确认且计数自洽才允许绿色成功（未确认/未知/矛盾一律待核对）。
+  const submission = parseSssSubmission(payload.summary?.submission)
+  if (submission && !sssSubmissionAllConfirmed(submission)) return false
   const status = String(payload.status || payload.result_status || '').toLowerCase()
   return status === '' || status === 'success'
 }
@@ -64,9 +77,14 @@ function isPlainSuccess(payload: TaskOutcomeLike): boolean {
 export function taskOutcomeView(payload: TaskOutcomeLike): TaskOutcomeView {
   const status = String(payload.result_status || payload.status || '').toLowerCase()
   const message = (payload.message || payload.next_action || payload.reason || '').trim()
+  const submission = parseSssSubmission(payload.summary?.submission)
+  // 闪时送：把本轮计数里「成功但站内暂不可见」与「内部异常未确认」分开讲清楚，
+  // 并明确不会自动重发（不改变任何状态判定，只补一句提示）。
+  const submissionNote = submission ? sssSubmissionNote(submission) : ''
   const withNext = (text: string): string => {
-    if (!payload.next_action || text.includes(payload.next_action)) return text
-    return `${text} ${payload.next_action}`
+    const withNote = submissionNote && !text.includes(submissionNote) ? `${text} ${submissionNote}` : text
+    if (!payload.next_action || withNote.includes(payload.next_action)) return withNote
+    return `${withNote} ${payload.next_action}`
   }
 
   if (payload.uncertain || status === 'uncertain') {
@@ -158,6 +176,20 @@ export function taskOutcomeView(payload: TaskOutcomeLike): TaskOutcomeView {
       title: '已完成（无变化）',
       message: withNext(message || '任务执行完成，服务端未产生变更。'),
       needsReview: false, isSuccess: false, statusKey: 'noop',
+    }
+  }
+  // 闪时送正式运行的站内对账口径：ok/success 也不能盖过“还有未确认/待核对”。
+  // 只认 summary.submission（SSS 契约字段），模拟/预检/余额闸门由上面的分支先处理。
+  const submissionView = submission
+    ? sssSubmissionHeadline(submission, { kind: sssRunKindFromSummary(payload.summary) })
+    : null
+  if (submissionView
+    && (submissionView.key === 'unconfirmed' || submissionView.key === 'pending' || submissionView.key === 'unknown')) {
+    return {
+      level: 'warning', toast: 'warning',
+      title: '站内对账仍有未确认 · 待核对',
+      message: withNext(message || submissionView.detail),
+      needsReview: true, isSuccess: false, statusKey: 'uncertain',
     }
   }
   if (isPlainSuccess(payload)) {

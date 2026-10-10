@@ -47,6 +47,18 @@ import { passwordResetVersion } from '@/lib/passwordDraft'
 import { classifyRequestError } from '@/lib/requestError'
 import { previewLocalKey } from '@/lib/preview'
 import { saveStateView } from '@/lib/saveState'
+import {
+  pickSssSubmission,
+  sssFollowUpAction,
+  sssPrimaryLabel,
+  sssSendGuard,
+  sssSubmissionHeadline,
+  sssSubmissionNotes,
+  sssSubmissionRows,
+  type SssHeadline,
+  type SssRunKind,
+  type SssSubmissionSummary,
+} from '@/lib/sssSubmission'
 import { cn } from '@/lib/utils'
 
 const TAB_ORDER: TaskMode[] = ['order', 'cloud', 'sss']
@@ -417,6 +429,7 @@ type SssExecutionMode = 'dry_run' | 'preflight' | 'live'
 function SssForm() {
   const {
     config, passwords, startSss, workerAlive, operationActive, operationView, isAdmin, passwordReset,
+    connection, recovery, operations, operation,
   } = useApp()
   const sssResetVersion = passwordResetVersion(passwordReset, 'sss')
   const [url, setUrl] = useState(config?.sss_url ?? '')
@@ -447,6 +460,7 @@ function SssForm() {
   const [dayKey, setDayKey] = useState('')
   const [dayLoading, setDayLoading] = useState(false)
   const [dayError, setDayError] = useState('')
+  const startingRef = useRef(false)
 
   const commonAddress = config?.sss_common_address ?? ''
   const useFixedAddress = config?.sss_use_fixed_address ?? true
@@ -561,6 +575,11 @@ function SssForm() {
   }
 
   async function performStart() {
+    // 双击/连点只提交一次：按钮 disabled 要等 React 重渲染，同步连点仍可能进来两次。
+    if (startingRef.current) return
+    // 派发前再查一次发送闸门：确认弹窗可能是断线前打开的。
+    if (sssSendGuard({ connection, recovery, operationActive }).blocked) return
+    startingRef.current = true
     setBusy(true)
     try {
       const payload: SssFormPayload = {
@@ -579,20 +598,35 @@ function SssForm() {
       }
       setConfirmOpen(false)
     } finally {
+      startingRef.current = false
       setBusy(false)
     }
   }
 
+  // 最近一次闪时送运行的本轮统计与主动作：
+  // 只看 mode==='sss' 的权威 operation/operations，其它模式的陈旧状态不参与。
+  const submissionPick = pickSssSubmission({ operation, operations })
+  const submission = submissionPick.submission
+  const headline = submission
+    ? sssSubmissionHeadline(submission, { running: submissionPick.running, kind: submissionPick.kind })
+    : null
+  const followUp = sssFollowUpAction({
+    operation, operations, connection, recovery, operationActive, executionMode,
+  })
+  // 真实下单一律先过发送闸门：断线/正在核对权威状态时不发请求（只读读名单不受影响）。
+  const sendGuard = sssSendGuard({ connection, recovery, operationActive })
+  const sendBlocked = sendGuard.blocked && !needsDayPreview
+
   const modeLabel = executionMode === 'live' ? '正式下单' : executionMode === 'preflight' ? '预检' : '模拟执行'
-  const primaryLabel = operationActive
-    ? '已有操作进行中'
-    : needsDayPreview
-      ? (dayLoading ? '正在读取云端名单…' : '先读取云端名单')
-      : executionMode === 'live'
-        ? '开始正式下单'
-        : executionMode === 'preflight'
-          ? '开始预检'
-          : '开始模拟执行'
+  const primaryLabel = sssPrimaryLabel({
+    operationActive, needsDayPreview, dayLoading, executionMode, followUp,
+    sendBlocked, sendBlockReason: sendGuard.reason,
+  })
+  // 「结果」步骤：存在未确认/待核对或已可补单时不能画成完成；unsure 一律 warning。
+  const resultWarning = followUp.reconcile || Boolean(
+    headline && !submissionPick.running && headline.key !== 'confirmed' && headline.key !== 'dry-run'
+    && headline.key !== 'preflight' && headline.key !== 'guarded',
+  )
   const flow = [
     { key: 'prepare', label: '准备', state: 'done' as const },
     {
@@ -607,7 +641,11 @@ function SssForm() {
     {
       key: 'result', label: '结果',
       // 只保留「结果这一步处于什么状态」这一独有信息；重复的说明文本已删除（批 2）。
-      state: operationView.key === 'error' ? 'error' as const : operationView.needsReview ? 'warning' as const : operationView.key === 'success' ? 'done' as const : 'todo' as const,
+      state: operationView.key === 'error'
+        ? 'error' as const
+        : resultWarning || operationView.needsReview
+          ? 'warning' as const
+          : operationView.key === 'success' ? 'done' as const : 'todo' as const,
     },
   ]
 
@@ -617,6 +655,15 @@ function SssForm() {
         {/* 闲置态不渲染流程条：只有真正在跑、或有待核对/失败需要看进度时才占屏幕。 */}
         {(workerAlive || operationActive || operationView.needsReview || operationView.key === 'error') && (
           <FlowStrip steps={flow} label="闪时送执行流程" />
+        )}
+
+        {headline && submission && (
+          <SssSubmissionCard
+            headline={headline}
+            kind={submissionPick.kind}
+            summary={submission}
+            running={submissionPick.running}
+          />
         )}
 
         {isAdmin && (
@@ -705,7 +752,7 @@ function SssForm() {
       <BottomDock
         status={<SaveStatus state={saveState} onRetry={retry} />}
         primaryLabel={primaryLabel}
-        primaryDisabled={operationActive || dayLoading}
+        primaryDisabled={operationActive || dayLoading || sendBlocked}
         primaryBusy={busy}
         onPrimary={validateAndConfirm}
         workerAlive={workerAlive}
@@ -715,24 +762,47 @@ function SssForm() {
       <ConfirmActionDialog
         open={confirmOpen}
         onOpenChange={setConfirmOpen}
-        title={`确认${modeLabel}`}
-        description={executionMode === 'live'
-          ? '这是真实下单操作：服务端会创建订单并可能扣款或占用余额，请再次核对账号、名单来源与文件。'
-          : executionMode === 'preflight'
-            ? '预检会登录平台并检查，但不会创建订单；如发现风险会安全停止。'
-            : '模拟执行只组装并预览报文，不会创建真实订单。'}
+        title={followUp.reconcile ? '确认核对并补单' : `确认${modeLabel}`}
+        description={(
+          <>
+            {sendGuard.blocked && (
+              <p role="alert" className="mb-2 rounded-md border border-warning/45 bg-warning/10 px-2.5 py-2 text-[11px]">
+                {sendGuard.reason}，暂不能提交；页面会继续查询权威状态，恢复后再确认。
+              </p>
+            )}
+            {followUp.reconcile ? (
+              <>
+                这是真实下单操作：将按<b>当前账号</b>、送达日期与<b>当前名单</b>（不是上一批的冻结快照）
+                先做一次站内对账，再只补仍然缺失的订单，可能产生费用或被占用余额。
+                平台订单列表有延迟，列表里暂时看不到的订单仍可能被判为缺失而重复提交，因此
+                <b>不保证绝对零重复</b>；本次不会在后台自动补单。
+              </>
+            ) : executionMode === 'live'
+              ? '这是真实下单操作：服务端会创建订单并可能扣款或占用余额，请再次核对账号、名单来源与文件。'
+              : executionMode === 'preflight'
+                ? '预检会登录平台并检查，但不会创建订单；如发现风险会安全停止。'
+                : '模拟执行只组装并预览报文，不会创建真实订单。'}
+          </>
+        )}
         details={<StartSummary items={[
-          ['执行方式', modeLabel],
+          ['执行方式', followUp.reconcile ? `${modeLabel}（先对账再补缺失项）` : modeLabel],
           ['名单来源', orderSource === 'wps' ? `云端当天名单${dayPreview?.target_date ? `（${dayPreview.target_date}）` : ''}` : '本地 Excel'],
           ['账号', account || '使用服务端预设'],
           ['本地文件', excel || (orderSource === 'wps' ? '云端模式可不选' : '使用已配置路径')],
+          ...(followUp.reconcile && submission ? [
+            ['上次运行未确认', submission.unconfirmed === null ? '待核对/未知' : `${submission.unconfirmed} 单`] as [string, string],
+          ] : []),
         ]} />}
-        acknowledge={executionMode === 'live'
-          ? '我确认执行真实下单，并已核对账号、名单与执行方式'
-          : executionMode === 'preflight'
-            ? '我确认执行预检，不会创建真实订单'
-            : '我确认执行模拟，不会创建真实订单'}
-        confirmLabel={executionMode === 'live' ? '确认正式下单' : executionMode === 'preflight' ? '开始预检' : '开始模拟'}
+        acknowledge={followUp.reconcile
+          ? '我确认按当前账号与当前名单先对账再补单，并了解可能产生费用、列表延迟可能造成重复'
+          : executionMode === 'live'
+            ? '我确认执行真实下单，并已核对账号、名单与执行方式'
+            : executionMode === 'preflight'
+              ? '我确认执行预检，不会创建真实订单'
+              : '我确认执行模拟，不会创建真实订单'}
+        confirmLabel={followUp.reconcile
+          ? '确认对账并补单'
+          : executionMode === 'live' ? '确认正式下单' : executionMode === 'preflight' ? '开始预检' : '开始模拟'}
         busy={busy}
         danger={executionMode === 'live'}
         onConfirm={performStart}
@@ -748,6 +818,71 @@ function SssForm() {
         />
       )}
     </div>
+  )
+}
+
+/**
+ * 本轮提交统计卡片（`summary.submission`）。
+ *
+ * 只展示服务端给出的计数：未知用「待核对/未知」，不在缺字段时显示 0；
+ * 响应次数（历史）与站内确认（最终状态）分开列，异常不写成“确定创建失败”。
+ * 根节点带 `data-sss-submission*` 机器可读属性（标题类型 / 运行中）。
+ */
+function SssSubmissionCard({
+  headline,
+  kind,
+  summary,
+  running,
+}: {
+  headline: SssHeadline
+  kind: SssRunKind
+  summary: SssSubmissionSummary
+  running: boolean
+}) {
+  const rows = sssSubmissionRows(summary)
+  const notes = sssSubmissionNotes(summary, { kind })
+  return (
+    <section
+      data-sss-submission="true"
+      data-sss-submission-headline={headline.key}
+      data-sss-submission-running={running ? 'true' : 'false'}
+      aria-label="闪时送本轮提交统计"
+      className="mb-3 rounded-lg border bg-card px-3 py-2.5"
+    >
+      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">
+        <span className="font-medium text-foreground">本轮提交与站内确认</span>
+        <span
+          data-sss-submission-title="true"
+          className={cn(
+            'break-all font-medium',
+            headline.tone === 'success' && 'text-success',
+            headline.tone === 'warning' && 'text-warning',
+            headline.tone === 'info' && 'text-primary',
+            headline.tone === 'neutral' && 'text-muted-foreground',
+          )}
+        >
+          {headline.title}
+        </span>
+      </div>
+      <p className="mt-1 break-all text-[10px] leading-snug text-muted-foreground">{headline.detail}</p>
+      <dl className="mt-2 grid gap-x-3 gap-y-1 text-[11px] sm:grid-cols-2">
+        {rows.map((row) => (
+          <div key={row.key} className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-baseline gap-x-2">
+            <dt className="min-w-0 text-muted-foreground">{row.label}</dt>
+            <dd className={cn(
+              'tabular shrink-0 text-right font-medium',
+              row.tone === 'success' && 'text-success',
+              row.tone === 'warning' && 'text-warning',
+              row.tone === 'danger' && 'text-destructive',
+              row.tone === 'neutral' && 'text-foreground',
+            )}>{row.value}</dd>
+          </div>
+        ))}
+      </dl>
+      {notes.map((note) => (
+        <p key={note} className="mt-1.5 break-all text-[10px] leading-snug text-muted-foreground">{note}</p>
+      ))}
+    </section>
   )
 }
 

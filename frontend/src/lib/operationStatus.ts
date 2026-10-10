@@ -10,6 +10,7 @@
  * uncertain/partial/failed/blocked 绝不能显示成功。
  */
 import type { OperationInfo, StatusState } from './bridge.ts'
+import { parseSssSubmission, sssRunKind, sssSubmissionPending, type SssSubmissionSummary } from './sssSubmission.ts'
 
 export type ConnectionState = 'connecting' | 'connected' | 'disconnected'
 export type RecoveryState = 'idle' | 'checking' | 'recovered' | 'unavailable'
@@ -206,6 +207,21 @@ function connectionView(key: 'connecting' | 'checking' | 'recovery_unavailable')
   }
 }
 
+/**
+ * 闪时送本轮统计里“还不算最终”的信号（只读 `summary.submission`）。
+ *
+ * - `null` = 没有 submission 字典，或这次不是真实下单（模拟/预检/余额闸门）→ 保持原口径；
+ * - 有字典时：未确认未知、未确认 > 0、对账未完成、计数矛盾都属“未确认还在”，
+ *   上游不得把这种已完成渲染成最终完成（`success` + 进度 20 也一样）。
+ */
+function sssCarryover(operation: OperationInfo): SssSubmissionSummary | null {
+  if (String(operation.mode || '') !== 'sss') return null
+  if (sssRunKind(operation) !== 'live') return null
+  const summary = operation.summary
+  if (!summary || typeof summary !== 'object') return null
+  return parseSssSubmission((summary as Record<string, unknown>).submission)
+}
+
 function resultView(
   modeLabel: string,
   key: OperationView['key'],
@@ -252,8 +268,19 @@ function viewOfOperation(operation: OperationInfo): OperationView {
   switch (status) {
     case 'idle':
       return resultView(modeLabel, 'idle', '就绪', '没有正在执行的任务。', 'neutral', false, nextAction, reason, common)
-    case 'success':
+    case 'success': {
+      // 闪时送：状态 success 也可能仍有未确认项（响应失败 ≠ 未创建，列表有延迟）。
+      // 此时不能只说“已完成”，必须点出未确认并按待核对着色；进度/成功都不代表最终。
+      const carry = sssCarryover(operation)
+      if (carry && sssSubmissionPending(carry)) {
+        // 计数自洽才敢引用具体数字；否则只给“待核对”。
+        const pending = carry.consistent && carry.unconfirmed !== null && carry.unconfirmed > 0
+          ? `仍有 ${carry.unconfirmed} 项未确认`
+          : '未确认数待核对'
+        return resultView(modeLabel, 'success', `${modeLabel}已完成 · ${pending}`, '任务已结束，但站内对账仍有未确认项；可在闪时送页「核对并补单」：先对账，仍缺失的会真实提交。', 'warning', true, nextAction, reason, common)
+      }
       return resultView(modeLabel, 'success', `${modeLabel}已完成`, '任务已正常结束，可查看结果与日志。', 'success', false, nextAction, reason, common)
+    }
     case 'noop':
       return resultView(modeLabel, 'noop', `${modeLabel}已完成（无变化）`, '服务端未产生变更。', 'success', false, nextAction, reason, common)
     case 'partial':

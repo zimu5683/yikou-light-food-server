@@ -172,6 +172,14 @@ const EXPECTED_PAGE_ERRORS = [
     max: 1,
     reason: '「恢复处置网络失败」用死端口重定向模拟结果未知（验证阻断保持且不自动重试）。',
   },
+  {
+    scenario: /批3/,
+    kind: 'resourceError',
+    url: /\/api\/operation_status_unreachable$/,
+    content: /ERR_CONNECTION_REFUSED/,
+    max: 1,
+    reason: '「批3 断线」同样把 operation_status 重定向到无人监听的端口（验证连接未确认时不提供补单、不自动重发），必然产生 1 条连接被拒；该场景断言本身就要求这次请求失败。',
+  },
 ]
 
 /** 按白名单切分：命中的算预期，其余一律未预期（并会打印脱敏后的原文）。 */
@@ -276,11 +284,15 @@ const mock = {
   resolveAddressCalls: 0,
   isAdmin: true,
   operationStatus: null,
+  /** 覆盖合成配置的字段（例如把闪时送执行方式从默认「模拟」切到「正式下单」）。 */
+  configOverride: null,
   /** FE-1：让 operation_status 网络失败，用于复核「断线 → 重新连接 → 恢复」流程。 */
   operationStatusNetwork: false,
   /** 危险执行入口计数（FE-1：uncertain 下必须为 0，且刷新不得自动重传）。 */
   startOrderCalls: 0,
   startSssCalls: 0,
+  /** 批 3：记录 start_sss 的载荷，用于证明补单用的是**当前表单**而不是上批快照。 */
+  startSssPayloads: [],
   stopTaskCalls: 0,
   wpsUploadCalls: 0,
   wpsUploadActive: 0,
@@ -451,7 +463,8 @@ function createMockServer() {
           version: 'mock-1', status: 'ready', event_producer_id: 'mock-producer',
           is_admin: mock.isAdmin, platform: 'web', can_self_update: false,
           operation: mock.operationStatus || idleOperation(), operations: [],
-          config: syntheticConfig(), passwords: { order: '', sss: '' },
+          config: { ...syntheticConfig(), ...(mock.configOverride || {}) },
+          passwords: { order: '', sss: '' },
         })
       case 'drain_events': {
         const events = mock.logEvents.splice(0, mock.logEvents.length)
@@ -599,6 +612,7 @@ function createMockServer() {
         return json(res, { ok: true })
       case 'start_sss':
         mock.startSssCalls += 1
+        mock.startSssPayloads.push(firstArg || {})
         return json(res, { ok: true })
       case 'wps_upload': {
         mock.wpsUploadCalls += 1
@@ -4815,6 +4829,456 @@ async function main() {
       afterOff === 'unchecked' && afterOn === 'checked' && passwordAfter === 'draft-keep-me',
       JSON.stringify({ afterOff, afterOn, passwordAfter }),
     )
+
+    // ---------- 批 3：闪时送本轮统计（summary.submission）与「核对并补单」 ----------
+    // 主样例（与现场一致）：目标 99 单 · 提交前已有 26 单 · 本轮提交 73 单（73 次 POST）·
+    // 响应成功 25 · 技术异常 48 · 对账后新增 25 单确认 → 最终确认 51、未确认 48。
+    // 数据只认权威 operation / operations 里 mode=sss 的 summary.submission：
+    // 其它模式的陈旧状态既不能改卡片，也不能改主动作。
+    enterScenario('批3 闪时送对账与补单')
+    mock.configOverride = { sss_dry_run: false, sss_preflight: false }
+    const SSS_SUBMISSION_99 = {
+      target_total: 99, preconfirmed: 26, submitted: 73, attempts: 73,
+      success_responses: 25, technical_errors: 48, explicit_rejections: 0,
+      auth_rejections: 0, balance_rejections: 0, not_sent: 0,
+      newly_confirmed: 25, confirmed: 51, unconfirmed: 48, reconciled: true,
+    }
+    /** 最近一次闪时送正式运行的权威 operation（默认：未确认 48 单）。 */
+    const sssAuthority = (overrides = {}) => ({
+      ...idleOperation(), status: 'uncertain', active: false, phase: 'finished', mode: 'sss',
+      operation_id: 'op-b3-sss', reason: '', next_action: '',
+      summary: {
+        status: 'unconfirmed', semantics: 'at-least-once+reconciliation', submission: SSS_SUBMISSION_99,
+      },
+      started_at: '2026-09-20T09:00:00', finished_at: '2026-09-20T09:05:00',
+      ...overrides,
+    })
+
+    /** 结果卡片真实渲染面（机器可读属性 + 逐行 标签→数值 + 可见文本）。 */
+    const sssCardJs = `(() => {
+      const card = document.querySelector('[data-sss-submission="true"]')
+      if (!card) return null
+      const r = card.getBoundingClientRect()
+      return {
+        text: (card.innerText || '').replace(/\\s+/g, ' ').trim(),
+        headline: card.getAttribute('data-sss-submission-headline'),
+        running: card.getAttribute('data-sss-submission-running'),
+        title: (card.querySelector('[data-sss-submission-title]')?.textContent || '').trim(),
+        rows: [...card.querySelectorAll('div')]
+          .filter((el) => el.querySelector(':scope > dt') && el.querySelector(':scope > dd'))
+          .map((el) => [
+            (el.querySelector(':scope > dt')?.textContent || '').trim(),
+            (el.querySelector(':scope > dd')?.textContent || '').trim(),
+          ]),
+        visible: r.width > 0 && r.height > 0,
+      }
+    })()`
+
+    /** 切到闪时送页签（默认页签是订单处理），并等连接类的临时状态收敛。 */
+    async function openSssTab() {
+      await cdp.eval(clickByTextJs('button', '闪时送下单'))
+      await new Promise((r) => setTimeout(r, 350))
+      await cdp.waitFor(`(() => {
+        const el = [...document.querySelectorAll('button.btn-serif-primary')].find((node) => node.getBoundingClientRect().width > 0)
+        if (!el) return false
+        const text = (el.textContent || '').replace(/\\s+/g, ' ').trim()
+        return !text.includes('正在连接') && !text.includes('正在核对')
+      })()`, 8000)
+    }
+    /** 名单预览是主动作的前置（保持既有语义）：需要时先点一次只读读取。 */
+    async function readDayPreviewIfNeeded() {
+      const label = (await cdp.eval(primaryDockButtonJs))?.label || ''
+      if (!label.includes('读取云端名单')) return label
+      await cdp.eval(clickByTextJs('button', label))
+      await cdp.waitFor(`(() => {
+        const el = [...document.querySelectorAll('button.btn-serif-primary')].find((node) => node.getBoundingClientRect().width > 0)
+        return Boolean(el) && !(el.textContent || '').includes('读取云端名单')
+      })()`, 5000)
+      await new Promise((r) => setTimeout(r, 300))
+      return (await cdp.eval(primaryDockButtonJs))?.label || ''
+    }
+    /**
+     * 批3 的刷新：写密码草稿 / 切换执行方式都会触发配置自动保存，未保存草稿会注册
+     * beforeunload，此时直接刷新会被 Chrome 记为 intervention logError（R8「页面无
+     * 未预期异常」门禁会失败）。先等草稿落盘——判据是 beforeunload 不再拦截——再刷新，
+     * 与 8.5「等它落盘再刷新」同一个目的，这里用行为判据更直接。
+     */
+    async function reloadB3() {
+      await cdp.waitFor(`(() => {
+        const event = new Event('beforeunload', { cancelable: true })
+        window.dispatchEvent(event)
+        return event.defaultPrevented === false
+      })()`, 6000)
+      await reloadApp(cdp)
+    }
+    /** 管理员凭据在高级设置里：展开后写入密码草稿（不提交、不触网）。 */
+    async function setSssPasswordDraft(value) {
+      const visible = await cdp.eval(`(() => { const el = document.querySelector('#sss-password'); return Boolean(el) && el.getBoundingClientRect().width > 0 })()`)
+      if (!visible) {
+        await cdp.eval(clickByTextJs('button', '闪时送网址、账号与文件路径'))
+        await new Promise((r) => setTimeout(r, 300))
+      }
+      const setResult = await cdp.eval(setInputJs('#sss-password', value))
+      assert.ok(setResult?.ok === true, `无法写入 sss-password：${JSON.stringify(setResult)}`)
+    }
+    async function switchSssExecutionMode(label) {
+      assert.ok(await cdp.eval(clickByTextJs('button', label)), `找不到执行方式 ${label}`)
+      await new Promise((r) => setTimeout(r, 300))
+      return readDayPreviewIfNeeded()
+    }
+
+    // A) 权威 uncertain + 完整计数：卡片逐项可读，主动作改为「核对并补单」。
+    mock.operationStatus = sssAuthority()
+    mock.startSssCalls = 0
+    mock.startSssPayloads = []
+    await cdp.viewport(390, 844)
+    await reloadB3()
+    await openSssTab()
+    const firstPrimary = await readDayPreviewIfNeeded()
+    const cardA = await cdp.eval(sssCardJs)
+    // 逐行断言「标签 → 具体数值」，而不是只查一组数字出现过。
+    const expectedRowsA = [
+      ['提交前已有站内确认', '26 单'],
+      ['本轮实际提交（不同任务）', '73 单'],
+      ['本轮 POST 调用次数（含重登/人工重试）', '73 次'],
+      ['响应成功', '25 次'],
+      ['技术异常 · 结果未知（未自动重发）', '48 次'],
+      ['明确拒绝', '0 次'],
+      ['未发送（始终没有 POST）', '0 单'],
+      ['本轮新增站内确认（对账差异）', '25 单'],
+      ['最终站内确认 / 目标', '51 / 99 单'],
+      ['未确认', '48 单'],
+    ]
+    record(
+      '批3 结果卡片：99/26/73/25/48 主样例逐项对应具体数值（目标 99 · 已有 26 · 提交 73 · 成功 25 · 异常 48 · 新增 25 → 确认 51 · 未确认 48）',
+      Boolean(cardA) && cardA.visible
+        && JSON.stringify(cardA.rows) === JSON.stringify(expectedRowsA),
+      JSON.stringify({ rows: cardA?.rows }),
+    )
+    record(
+      '批3 结果卡片：未确认 48 项 → headline=unconfirmed，且与“成功响应暂不可见/技术异常”分开说明',
+      cardA?.headline === 'unconfirmed' && cardA.running === 'false'
+        && cardA.title.includes('仍有 48 项未确认')
+        && cardA.text.includes('尚未显示在站内列表')
+        && cardA.text.includes('不代表订单确定创建失败')
+        && cardA.text.includes('「核对并补单」不是只读操作'),
+      JSON.stringify({ headline: cardA?.headline, title: cardA?.title, running: cardA?.running }),
+    )
+    record(
+      '批3 主动作：真实 SSS 未确认项 → 「核对并补单」（连接正常/无互斥/正式下单）',
+      firstPrimary === '核对并补单',
+      JSON.stringify({ firstPrimary }),
+    )
+    const sssPanelText = await cdp.eval('document.body.innerText')
+    record(
+      '批3 uncertain 权威状态不出现“已完成”等完成文案（卡片也是待核对口径）',
+      !sssPanelText.includes('已完成') && !sssPanelText.includes('上传完成'),
+      nearText(sssPanelText, '本轮提交与站内确认', 160),
+    )
+    const cardOverflow = await cdp.eval(`({
+      sw: document.documentElement.scrollWidth,
+      iw: window.innerWidth,
+      cardWidth: document.querySelector('[data-sss-submission="true"]')?.getBoundingClientRect().width ?? 0,
+    })`)
+    record(
+      '批3 结果卡片手机窄屏不溢出（390x844，卡片宽度不超过视口）',
+      cardOverflow.sw <= cardOverflow.iw + 1 && cardOverflow.cardWidth > 0 && cardOverflow.cardWidth <= cardOverflow.iw,
+      JSON.stringify(cardOverflow),
+    )
+
+    // A2) 确认页：按当前账号/当前名单先对账再补缺失项，可能费用与列表延迟都写明；
+    //     未勾选确认句不可提交；取消不启动；双击只发一次 start_sss。
+    // 表单校验是补单的前置（保持既有语义）：先补上管理员凭据草稿，否则确认页不会打开。
+    await setSssPasswordDraft('draft-b3-sss')
+    assert.ok(await cdp.eval(clickByTextJs('button', '核对并补单')), '点不到核对并补单主按钮')
+    await new Promise((r) => setTimeout(r, 450))
+    const dlgA = await cdp.eval(openDialogProbeJs)
+    const confirmBtn = (dlgA?.buttons || []).find((item) => item.label === '确认对账并补单') || null
+    record(
+      '批3 确认页：说明按当前账号/当前名单先对账再补缺失项，可能产生费用',
+      dlgA?.text?.includes('当前账号') === true && dlgA.text.includes('当前名单')
+        && dlgA.text.includes('先做一次站内对账') && dlgA.text.includes('只补仍然缺失的订单')
+        && dlgA.text.includes('可能产生费用') && dlgA.text.includes('不是上一批的冻结快照'),
+      JSON.stringify({ text: dlgA?.text?.slice(0, 260) }),
+    )
+    record(
+      '批3 确认页：列表延迟可能造成重复，不宣称绝对零重复',
+      dlgA?.text?.includes('平台订单列表有延迟') === true
+        && dlgA.text.includes('不保证绝对零重复'),
+      JSON.stringify({ text: dlgA?.text?.slice(0, 260) }),
+    )
+    record(
+      '批3 确认页：未勾选明确确认句前不可提交，且没有发出任何 start_sss',
+      Boolean(confirmBtn) && confirmBtn.disabled === true && mock.startSssCalls === 0,
+      JSON.stringify({ confirmBtn, startSssCalls: mock.startSssCalls }),
+    )
+    assert.ok(await cdp.eval(clickDialogButtonJs('返回检查')), '找不到返回检查按钮')
+    await new Promise((r) => setTimeout(r, 300))
+    record(
+      '批3 取消补单：关闭确认页不会发出 start_sss（也不后台自动补单）',
+      mock.startSssCalls === 0 && (await cdp.eval(primaryDockButtonJs))?.label === '核对并补单',
+      JSON.stringify({ startSssCalls: mock.startSssCalls }),
+    )
+
+    assert.ok(await cdp.eval(clickByTextJs('button', '核对并补单')), '第二次点不到核对并补单')
+    await new Promise((r) => setTimeout(r, 400))
+    const ackCheckedB3 = await cdp.eval(clickDialogCheckboxJs)
+    await new Promise((r) => setTimeout(r, 250))
+    const burstB3 = await cdp.eval(burstDialogButtonJs('确认对账并补单', 3))
+    await cdp.waitFor('document.body.innerText.includes("确认核对并补单") === false', 4000)
+    await new Promise((r) => setTimeout(r, 400))
+    record(
+      '批3 双击补单确认只发起一次 start_sss（不重复提交）',
+      ackCheckedB3 === true && burstB3?.ok === true && mock.startSssCalls === 1,
+      JSON.stringify({ ackCheckedB3, burst: burstB3, startSssCalls: mock.startSssCalls }),
+    )
+    const sssPayload = mock.startSssPayloads[0] || {}
+    record(
+      '批3 补单载荷用当前表单（不是上一批冻结快照）：正式下单 + 当前名单来源',
+      mock.startSssPayloads.length === 1 && sssPayload.dry_run === false
+        && sssPayload.preflight === false && sssPayload.order_source === 'wps',
+      JSON.stringify({ keys: Object.keys(sssPayload), dry_run: sssPayload.dry_run, source: sssPayload.order_source }),
+    )
+
+    // B) success + 进度 20：不冒充最终完成（进度与“成功”都不是最终结果）。
+    mock.operationStatus = sssAuthority({
+      status: 'success',
+      summary: {
+        status: 'success', semantics: 'at-least-once+reconciliation', progress: 20,
+        submission: { ...SSS_SUBMISSION_99, submitted: 20, attempts: 20, success_responses: 16, technical_errors: 4, newly_confirmed: 16, confirmed: 42, unconfirmed: 57 },
+      },
+    })
+    mock.startSssCalls = 0
+    await reloadB3()
+    await openSssTab()
+    await readDayPreviewIfNeeded()
+    const cardB = await cdp.eval(sssCardJs)
+    const headerB = await cdp.eval(`(() => {
+      const h1 = [...document.querySelectorAll('h1')].find((el) => (el.textContent || '').includes('任务工作台'))
+      const pill = h1?.parentElement?.parentElement?.lastElementChild
+      return (pill?.textContent || '').trim()
+    })()`)
+    record(
+      '批3 success + 进度 20：权威状态点明仍有未确认，不冒充最终完成',
+      headerB.includes('已完成') && headerB.includes('未确认')
+        && cardB?.headline === 'unconfirmed' && cardB.title.includes('57 项未确认')
+        && cardB.text.includes('42 / 99 单'),
+      JSON.stringify({ headerB, headline: cardB?.headline, title: cardB?.title }),
+    )
+    record(
+      '批3 success + 进度 20：主动作仍是「核对并补单」而不是重新开跑',
+      (await cdp.eval(primaryDockButtonJs))?.label === '核对并补单',
+      JSON.stringify(await cdp.eval(primaryDockButtonJs)),
+    )
+
+    // C) 运行中的计数只是暂定：卡片标明「暂定」，主动作不可点（有互斥任务）。
+    mock.operationStatus = sssAuthority({
+      status: 'running', active: true, phase: 'running',
+      summary: { status: 'running', progress: 20, submission: { ...SSS_SUBMISSION_99, submitted: 20, attempts: 20, success_responses: 16, technical_errors: 4, newly_confirmed: 16, confirmed: 42, unconfirmed: 57 } },
+    })
+    mock.startSssCalls = 0
+    await reloadB3()
+    // 运行中手机端会自动展开日志层：先收起，再看底栏主动作（与批 2 同一处理）。
+    if (await cdp.eval(`(() => { const s = document.getElementById('phone-log-sheet'); return Boolean(s) && !s.hasAttribute('inert') })()`)) {
+      await cdp.eval(logFabClickJs)
+      await cdp.waitFor(`document.getElementById('phone-log-sheet')?.hasAttribute('inert') === true`, 3000)
+    }
+    await openSssTab()
+    const runningPrimary = await cdp.eval(primaryDockButtonJs)
+    const cardC = await cdp.eval(sssCardJs)
+    record(
+      '批3 运行中：进度 20 只算暂定（headline=running），主动作禁用且不是补单',
+      cardC?.headline === 'running' && cardC.running === 'true'
+        && runningPrimary?.label === '已有操作进行中' && runningPrimary.disabled === true
+        && mock.startSssCalls === 0,
+      JSON.stringify({ cardC, runningPrimary, startSssCalls: mock.startSssCalls }),
+    )
+
+    // D) 对账失败（reconciled=false）：确认数按待核对，响应次数作为历史保留。
+    mock.operationStatus = sssAuthority({
+      summary: {
+        status: 'failed', semantics: 'at-least-once+reconciliation',
+        submission: { ...SSS_SUBMISSION_99, confirmed: null, unconfirmed: null, newly_confirmed: null, reconciled: false },
+      },
+    })
+    await reloadB3()
+    await openSssTab()
+    await readDayPreviewIfNeeded()
+    const cardD = await cdp.eval(sssCardJs)
+    const unknownRowsD = await cdp.eval(`(() => {
+      const card = document.querySelector('[data-sss-submission="true"]')
+      return card ? ((card.innerText || '').split('待核对/未知').length - 1) : -1
+    })()`)
+    record(
+      '批3 对账失败：确认/未确认按待核对（不显示 0），响应次数不被清除',
+      cardD?.headline === 'pending'
+        && cardD.text.includes('25 次') && cardD.text.includes('48 次')
+        // 确认集合相关的三行（最终确认/新增确认/未确认）都是 null → 三行「待核对/未知」，绝不出 0。
+        && unknownRowsD >= 3,
+      JSON.stringify({ headline: cardD?.headline, unknownRowsD, text: cardD?.text?.slice(0, 260) }),
+    )
+    record(
+      '批3 对账失败：仍提供「核对并补单」（先对账再补，而不是按 0 处理）',
+      (await cdp.eval(primaryDockButtonJs))?.label === '核对并补单',
+      JSON.stringify(await cdp.eval(primaryDockButtonJs)),
+    )
+
+    // E) 已存在全部确认：明确无需补单，主动作回到正常开始。
+    mock.operationStatus = sssAuthority({
+      status: 'success',
+      summary: {
+        status: 'confirmed', semantics: 'at-least-once+reconciliation',
+        submission: {
+          target_total: 26, preconfirmed: 26, submitted: 0, attempts: 0,
+          success_responses: 0, technical_errors: 0, explicit_rejections: 0,
+          auth_rejections: 0, balance_rejections: 0, not_sent: 0,
+          newly_confirmed: 0, confirmed: 26, unconfirmed: 0, reconciled: true,
+        },
+      },
+    })
+    await reloadB3()
+    await openSssTab()
+    await readDayPreviewIfNeeded()
+    const cardE = await cdp.eval(sssCardJs)
+    const primaryE = await cdp.eval(primaryDockButtonJs)
+    record(
+      '批3 已全部站内确认：headline=confirmed 且明示无需补单，主动作回到「开始正式下单」',
+      cardE?.headline === 'confirmed' && cardE.title.includes('无需补单')
+        && primaryE?.label === '开始正式下单' && primaryE.disabled === false,
+      JSON.stringify({ headline: cardE?.headline, title: cardE?.title, primaryE }),
+    )
+
+    // F) 预检/模拟不触发补单（即使上一轮仍有未确认项）。
+    mock.operationStatus = sssAuthority()
+    await reloadB3()
+    await openSssTab()
+    const dryLabel = await switchSssExecutionMode('模拟执行')
+    const dryCard = await cdp.eval(sssCardJs)
+    record(
+      '批3 模拟执行：不提供补单（卡片照旧展示上一轮真实统计）',
+      dryLabel === '开始模拟执行' && dryCard?.headline === 'unconfirmed',
+      JSON.stringify({ dryLabel, headline: dryCard?.headline }),
+    )
+    const preflightLabel = await switchSssExecutionMode('预检')
+    record(
+      '批3 预检：不提供补单',
+      preflightLabel === '开始预检',
+      JSON.stringify({ preflightLabel }),
+    )
+    const liveLabel = await switchSssExecutionMode('正式下单')
+    record(
+      '批3 切回正式下单：重新提供「核对并补单」',
+      liveLabel === '核对并补单',
+      JSON.stringify({ liveLabel }),
+    )
+
+    // F2) 上一轮本身是模拟/预检：卡片只说明未提交，不得提示补单。
+    const pretendDry = sssAuthority({
+      status: 'dry_run',
+      summary: {
+        status: 'dry_run', result: { dry_run: true },
+        submission: { ...SSS_SUBMISSION_99, submitted: 0, attempts: 0, success_responses: 0, technical_errors: 0, newly_confirmed: null, confirmed: null, unconfirmed: null, reconciled: false },
+      },
+    })
+    mock.operationStatus = pretendDry
+    await reloadB3()
+    await openSssTab()
+    await readDayPreviewIfNeeded()
+    const dryRunCard = await cdp.eval(sssCardJs)
+    record(
+      '批3 上一轮是模拟执行：卡片明说未发送下单请求且不提示补单，主动作回到「开始正式下单」',
+      dryRunCard?.headline === 'dry-run'
+        && dryRunCard.text.includes('没有提交任何下单请求')
+        && !dryRunCard.text.includes('核对并补单')
+        && (await cdp.eval(primaryDockButtonJs))?.label === '开始正式下单',
+      JSON.stringify({ headline: dryRunCard?.headline, text: dryRunCard?.text?.slice(0, 200) }),
+    )
+    const pretendPreflight = sssAuthority({
+      status: 'uncertain',
+      summary: {
+        status: 'preflight_uncertain', result: { semantics: 'preflight-only' },
+        submission: { ...SSS_SUBMISSION_99, submitted: 0, attempts: 0, success_responses: 0, technical_errors: 0, newly_confirmed: null, confirmed: null, unconfirmed: null, reconciled: false },
+      },
+    })
+    mock.operationStatus = pretendPreflight
+    await reloadB3()
+    await openSssTab()
+    await readDayPreviewIfNeeded()
+    const preflightCard = await cdp.eval(sssCardJs)
+    record(
+      '批3 上一轮是预检（Bridge 归一化成 uncertain）：卡片=只读未提交，不提供补单',
+      preflightCard?.headline === 'preflight' && preflightCard.text.includes('未提交新订单')
+        && (await cdp.eval(primaryDockButtonJs))?.label === '开始正式下单',
+      JSON.stringify({ headline: preflightCard?.headline, text: preflightCard?.text?.slice(0, 200) }),
+    )
+
+    // G) 断线：主动作被发送闸门实际拦住（不只是换个文字）。
+    mock.operationStatusNetwork = true
+    await reloadB3()
+    await openSssTab()
+    const offlineBanner = await cdp.waitFor('document.body.innerText.includes("重新连接")', 25000)
+    // 只读读取名单不受闸门影响：先读完名单，主动作才变成“发送”动作。
+    await readDayPreviewIfNeeded()
+    const offlinePrimary = await cdp.eval(primaryDockButtonJs)
+    mock.startSssCalls = 0
+    // 即使脚本硬点一下，闸门也必须让请求发不出去。
+    await cdp.eval(clickByTextJs('button', offlinePrimary?.label || ''))
+    await new Promise((r) => setTimeout(r, 300))
+    record(
+      '批3 断线：主动作禁用并被发送闸门实际拦住（0 次 start_sss，不是只换文字）',
+      offlineBanner === true && offlinePrimary?.disabled === true
+        && offlinePrimary.label.includes('连接') && offlinePrimary.label !== '核对并补单'
+        && mock.startSssCalls === 0,
+      JSON.stringify({ offlinePrimary, startSssCalls: mock.startSssCalls }),
+    )
+    mock.operationStatusNetwork = false
+
+    // H) 其它模式的陈旧状态不改按钮：只有 sss 运行才驱动补单。
+    const wpsOnly = {
+      ...idleOperation(), status: 'success', active: false, phase: 'finished', mode: 'wps_upload',
+      operation_id: 'op-b3-wps', summary: { status: 'success' },
+    }
+    mock.operationStatus = wpsOnly
+    await reloadB3()
+    await openSssTab()
+    const wpsLabel = await readDayPreviewIfNeeded()
+    const wpsCard = await cdp.eval(sssCardJs)
+    record(
+      '批3 其它模式（云上传）成功：不改闪时送主动作，也不渲染统计卡片',
+      wpsLabel === '开始正式下单' && wpsCard === null,
+      JSON.stringify({ wpsLabel, card: wpsCard }),
+    )
+    // 列表里带着上一次 sss 运行 + 顶层是别的模式：仍按 sss 的结果提供补单。
+    mock.operationStatus = { ...wpsOnly, operations: [sssAuthority()] }
+    await reloadB3()
+    await openSssTab()
+    const mixedLabel = await readDayPreviewIfNeeded()
+    const mixedCard = await cdp.eval(sssCardJs)
+    record(
+      '批3 顶层是其它模式但列表里有未确认的 sss 运行：卡片与补单仍来自 sss（不被顶掉）',
+      mixedLabel === '核对并补单' && mixedCard?.headline === 'unconfirmed',
+      JSON.stringify({ mixedLabel, headline: mixedCard?.headline }),
+    )
+
+    // I) 正常加载：没有 submission 的旧结果不渲染卡片（既有语义不变）。
+    mock.operationStatus = { ...idleOperation(), status: 'uncertain', active: false, mode: 'sss', summary: { status: 'uncertain' } }
+    await reloadB3()
+    await openSssTab()
+    const legacyCard = await cdp.eval(sssCardJs)
+    const legacyPrimary = await readDayPreviewIfNeeded()
+    record(
+      '批3 旧后端（无 submission）：不渲染统计卡片，主动作仍是补单语义（未确认状态）',
+      legacyCard === null && legacyPrimary === '核对并补单',
+      JSON.stringify({ legacyCard, legacyPrimary }),
+    )
+
+    // 复位：不能把本节的 mock 状态泄漏给后面的 R8 收尾。
+    mock.operationStatus = null
+    mock.operationStatusNetwork = false
+    mock.configOverride = null
+    mock.startSssPayloads = []
+    await cdp.viewport(390, 844)
+    await reloadB3()
 
     // ---------- R8：页面异常采集收尾（未预期异常 → 退出码非 0） ----------
     const { expected: expectedPageErrors, unexpected: unexpectedPageErrors } = classifyPageErrors()

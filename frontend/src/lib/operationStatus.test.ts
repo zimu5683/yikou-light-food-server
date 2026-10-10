@@ -128,3 +128,68 @@ test('R6 §9：新增只读入口 mode 有中文名', () => {
   // 未登记的 mode 仍回退原文，不显示 undefined。
   assert.equal(operationModeLabel('brand_new_mode'), 'brand_new_mode')
 })
+
+test('闪时送 success 但仍有未确认项：不冒充最终完成（进度/成功都不是最终）', () => {
+  const view = operationViewFromAuthority(operation({
+    status: 'success', mode: 'sss', active: false,
+    summary: {
+      submission: {
+        target_total: 99, preconfirmed: 26, submitted: 20, attempts: 20,
+        success_responses: 16, technical_errors: 4, explicit_rejections: 0,
+        auth_rejections: 0, balance_rejections: 0, not_sent: 0,
+        newly_confirmed: 16, confirmed: 42, unconfirmed: 57, reconciled: true,
+        progress: 20,
+      },
+    },
+  }), 'connected')
+  assert.equal(view.key, 'success')
+  assert.match(view.label, /已完成/)
+  assert.match(view.label, /未确认/)
+  assert.equal(view.tone, 'warning')
+  assert.equal(view.needsReview, true)
+  // 不能把进度 20 说成最终结果。
+  assert.doesNotMatch(view.label, /20/)
+
+  // 未确认数未知（对账失败）同样不冒充最终完成。
+  const pending = operationViewFromAuthority(operation({
+    status: 'success', mode: 'sss', active: false,
+    summary: { status: 'failed', submission: { confirmed: null, unconfirmed: null, reconciled: false } },
+  }), 'connected')
+  assert.equal(pending.tone, 'warning')
+  assert.match(pending.label, /待核对/)
+
+  // 计数矛盾（集合分区对不上）也不能给成功口径。
+  const inconsistent = operationViewFromAuthority(operation({
+    status: 'success', mode: 'sss', active: false,
+    summary: { status: 'success', submission: { target_total: 98, confirmed: 51, unconfirmed: 48, reconciled: true } },
+  }), 'connected')
+  assert.equal(inconsistent.tone, 'warning')
+  assert.match(inconsistent.label, /待核对/)
+
+  // 模拟/预检不是“未确认下单”，不套用未确认文案。
+  const dry = operationViewFromAuthority(operation({
+    status: 'dry_run', mode: 'sss', active: false,
+    summary: { status: 'dry_run', result: { dry_run: true }, submission: { target_total: 26, unconfirmed: 26 } },
+  }), 'connected')
+  assert.equal(dry.key, 'dry_run')
+  assert.match(dry.label, /未创建订单/)
+
+  // 全部站内确认：保持正常的成功口径。
+  const done = operationViewFromAuthority(operation({
+    status: 'success', mode: 'sss', active: false,
+    summary: {
+      submission: {
+        target_total: 26, preconfirmed: 26, submitted: 0, attempts: 0,
+        success_responses: 0, technical_errors: 0, not_sent: 0,
+        newly_confirmed: 0, confirmed: 26, unconfirmed: 0, reconciled: true,
+      },
+    },
+  }), 'connected')
+  assert.equal(done.tone, 'success')
+  assert.equal(done.needsReview, false)
+
+  // 其它模式（无 submission）不受影响。
+  const order = operationViewFromAuthority(operation({ status: 'success', mode: 'order' }), 'connected')
+  assert.equal(order.tone, 'success')
+  assert.equal(order.label, '订单处理已完成')
+})
