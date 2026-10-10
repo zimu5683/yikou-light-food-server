@@ -75,6 +75,22 @@
   `uncertain-operation-as-success` 均按预期通过。
 - 未发送真实订单，不承诺平台成功率变化。
 
+### 发布补记：CI 验证、出包与发布结果
+
+- main 首次推送（`c0ad0a6`）后 CI 失败：Tests 与 Android APK 各 3 条断言红，全部集中在
+  本次新增的 `tests/test_sss_runner_summary.py`——站内记录用本机时间写 `created_at`，
+  而对账按平台口径（UTC+8）解析无时区时间，CI（UTC 机器）上记录被算成 8 小时前、被
+  收尾对账的批次时间窗整批排除（本机 +08 复现不出来）。修复 `cea0689`（显式北京时间；
+  另验证 `TZ=UTC` / `Asia/Shanghai` / `America/New_York` 三档）后重推。
+- main 推送（`cea0689`）后 CI 全绿：Tests（run 38018173005）**1590 passed**
+  （Python 3.11 与 3.13 各一遍，含 `ruff check app tests scripts`、前端构建 / lint /
+  测试 / 锚点与 headless Chrome 浏览器门禁（批 3 断言全绿、R8 unexpected=0）、
+  Workspace hygiene）；Android APK（main，run 38018172964）出包成功。
+- tag `v3.6.22` 触发的发布流水线（run 38018760395）成功：**Release v3.6.22 已发布**
+  （https://github.com/zimu5683/yikou-light-food-server/releases/tag/v3.6.22），
+  APK `yikou-light-food-3.6.22-arm64.apk` **19,833,401 字节**，sha256
+  `43af4f48…dcf27c`（资产内 `.sha256` 与出包日志一致）。
+
 ## 3.6.21
 
 一次「诊断日志导出补完 + 收尾文案收口」的版本：安卓端新增系统「另存为」（可自选
