@@ -32,6 +32,8 @@ STORE_ID = 211053
 STORE_NAME = "一口轻食"
 ADDRESS = {"lnt": 119.728224, "lat": 30.256632, "areaCode": "330110",
            "addressDetail": "浙江农林大学东湖校区"}
+#: 平台时间口径：站内列表的时间字段是无时区的北京时间字符串。
+_BEIJING = dt.timezone(dt.timedelta(hours=8))
 
 
 @pytest.fixture(autouse=True)
@@ -80,7 +82,13 @@ def _tasks(rows):
 
 
 def _station_record(task):
-    """站内列表记录：字段与真实商品列表一致，指纹才能与任务对上。"""
+    """站内列表记录：字段与真实商品列表一致，指纹才能与任务对上。
+
+    ``created_at`` 必须按平台口径写成**北京时间**（无时区字符串）：对账把无时区的
+    创建时间按 UTC+8 解析（`reconcile._record_created_timestamp`），CI 机器跑在 UTC，
+    若直接用本机 `datetime.now()`，记录会被算成 8 小时前，收尾对账的批次时间窗
+    会把它整批排除（本地 +08 机器上则看不出问题）。
+    """
     payload = task["payload"]
     return {
         "id": task["identifier"], "orderSn": "SN-1",
@@ -91,7 +99,7 @@ def _station_record(task):
         "goodsDetail": payload["goodsDetail"],
         "receiveAddress": dict(payload["receiveAddress"]),
         "user": {"mobile": task["account"]},
-        "created_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "created_at": dt.datetime.now(_BEIJING).strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 
