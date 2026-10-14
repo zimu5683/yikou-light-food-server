@@ -61,6 +61,22 @@
 - 新增 `docs/桌面端对齐-落地说明-2026-10-14.md`（逐项落点、刻意取舍、验证方式）；
 - 同步 `README.md`、`docs/WPS-SYNC-RULES.md`、`docs/SSS-下单失败与重试排查.md`。
 
+### 发布补记：CI 验证、出包与发布结果
+
+- PR #1（`feat/desktop-parity-port`）全部门禁通过后以 rebase 合入 main：python 3.11/3.13、
+  Android APK、前端（lint / 测试 237 / 锚点）、headless Chrome 浏览器门禁 **276/276**、
+  变异门禁 **14/14**（56 分钟）、Workspace hygiene。期间修了两处**测试门禁自身**的问题
+  （`af29eeb` 浏览器门禁同步卡片新标签；`24e9730` 变异场景把 uncertain 两格移入 mustFail
+  ——3.6.21 起该说明文案变长，390px 下注入 truncate 必然裁切，它们本就是敏感格）。
+- main 推送（`fc52d74`）后 CI 全绿：Tests（run 38557321081）**1626 passed**（Python 3.11
+  与 3.13 各一遍，含 `ruff check app tests scripts`、前端构建 / lint / 测试 / 锚点与
+  headless Chrome 浏览器门禁、Workspace hygiene）；Android APK（main，run 38557321004）
+  出包成功。
+- tag `v3.6.23` 触发的发布流水线（run 38560061491）成功：**Release v3.6.23 已发布**
+  （https://github.com/zimu5683/yikou-light-food-server/releases/tag/v3.6.23），
+  APK `yikou-light-food-3.6.23-arm64.apk` **19,857,581 字节**，sha256
+  `e1a8374a…9468ec4a`（资产内 `.sha256` 与出包日志一致）。
+
 ### 验证
 
 - 本机：`python -m pytest -q` **1626 passed**（基线 1590）；`ruff check app tests scripts`
