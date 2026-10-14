@@ -75,7 +75,8 @@
 - tag `v3.6.23` 触发的发布流水线（run 38560061491）成功：**Release v3.6.23 已发布**
   （https://github.com/zimu5683/yikou-light-food-server/releases/tag/v3.6.23），
   APK `yikou-light-food-3.6.23-arm64.apk` **19,857,581 字节**，sha256
-  `e1a8374a…9468ec4a`（资产内 `.sha256` 与出包日志一致）。
+  `e1a8374a…9468ec4a`（资产内 `.sha256`、出包日志与本地实下载重算 sha256 三者一致；
+  实下载包内 AndroidManifest `versionName=3.6.23`，流水线使用正式 release keystore 构建）。
 
 ### 验证
 
