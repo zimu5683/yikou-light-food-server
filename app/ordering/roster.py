@@ -24,7 +24,8 @@ from app.wps.sync import (
     date_region,
     effective_tables,
     find_target_column,
-    scan_bounds,
+    read_grid_chunked,
+    scan_region,
 )
 
 
@@ -147,9 +148,18 @@ def read_cloud_meal(cli: Any, *, file_id: str, table: str, meal: str,
             "已拒绝下单；可改用「本地 Excel」名单来源人工下单。")
     info = infos[0]
     worksheet_id = int(info.get("sheetId") or 1)
-    row_to, col_to = scan_bounds(info)
+    # 读**整张表**：单次读取的格数预算会把宽表静默截断，范围外标了当天 1 的人
+    # 会被漏掉（名单漏单）。读不全（used range 超上限）时按拒绝语义拒单，绝不
+    # 拿残缺快照当"当天名单"。
+    row_to, col_to, unreadable = scan_region(info)
+    if unreadable:
+        raise ImportRefused(
+            f"云端表「{table}」读不全：{unreadable}"
+            "已拒绝下单，避免漏掉当天要送的人；"
+            "请先清理云端表尾的残留格式/内容后重试，"
+            "或把「名单来源」切到「本地 Excel」人工确认名单。")
     try:
-        grid = cli.read_grid(file_id, worksheet_id, 0, row_to, 0, col_to)
+        grid = read_grid_chunked(cli, file_id, worksheet_id, 0, row_to, 0, col_to)
     except WpsCloudError as exc:
         raise _cloud_error(table, exc) from exc
 

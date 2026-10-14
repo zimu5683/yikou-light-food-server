@@ -278,7 +278,7 @@ export function sssSubmissionRows(summary: SssSubmissionSummary): SssRow[] {
     },
     {
       key: 'technicalErrors',
-      label: '技术异常 · 结果未知（未自动重发）',
+      label: '技术异常 · 结果未知（同单已重试）',
       value: countText(summary.technicalErrors, '次'),
       tone: (summary.technicalErrors ?? 0) > 0 ? 'warning' : 'neutral',
     },
@@ -355,7 +355,8 @@ export function sssSubmissionNotes(
   }
   if ((summary.technicalErrors ?? 0) > 0) {
     notes.push(
-      `技术异常（${summary.technicalErrors} 次）是内部错误导致的“结果未知”，`
+      `技术异常（${summary.technicalErrors} 次）是内部错误导致的“结果未知”：`
+      + '同一单内已按提交节流自动重试，用尽后不再跨轮重发，'
       + '不代表订单确定创建失败；以站内列表为准。',
     )
   }
@@ -391,7 +392,7 @@ export function sssSubmissionNote(summary: SssSubmissionSummary): string {
   }
   if ((summary.technicalErrors ?? 0) > 0) {
     const head = parts.length > 0 ? `另有 ${summary.technicalErrors} 次` : `${summary.technicalErrors} 次`
-    parts.push(`${head}技术异常属内部错误、结果未知（未自动重发），不代表确定创建失败；以站内对账为准。`)
+    parts.push(`${head}技术异常属内部错误、结果未知（同一单内已自动重试、用尽后不再重发），不代表确定创建失败；以站内对账为准。`)
   }
   if (parts.length > 0) return parts.join(' ')
   if (summary.unconfirmed === null) {

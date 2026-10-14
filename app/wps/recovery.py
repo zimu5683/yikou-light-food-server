@@ -15,7 +15,7 @@ import datetime as _dt
 import hashlib
 import re
 from collections import Counter
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from app.wps.cli import KdocsCli
 from app.wps.common import (
@@ -400,9 +400,38 @@ def classify_journal_sheet(cli: KdocsCli,
     return _uncertain("partial_or_ambiguous", problems[:20])
 
 
+def _intent_slots_by_key(intents: Sequence[Any]) -> dict[str, dict[int, int]]:
+    """按账本条目键归拢本次操作意图的每槽位本地餐次。
+
+    键用 intent 的原始 ``name``/``phone``（与 ``executor._change_key``、账本条目键
+    同源）；规范化后的 ``phone_key`` 与账本里的键对不上，不能用。
+
+    返回值形如 ``{"张\\u0000111": {1: 7}}``：槽位 → 本批本地餐次（= 本次操作
+    写到云端的期望锚点）。
+    """
+    grouped: dict[str, dict[int, int]] = {}
+    for item in intents or ():
+        if not isinstance(item, Mapping):
+            continue
+        slot = int(item.get("slot") or 0)
+        if slot <= 0:
+            continue
+        key = f"{item.get('name', '')}\u0000{item.get('phone', '')}"
+        grouped.setdefault(key, {})[slot] = int(item.get("local_meals") or 0)
+    return grouped
+
+
 def _merge_into_ledger(ledger: SyncLedger, target_date: str, file_id: str,
-                       entries: Mapping[str, Any]) -> tuple[bool, str, dict[str, Any]]:
-    """在给定账本快照上计算恢复合并结果；不落盘。"""
+                       entries: Mapping[str, Any],
+                       intents: Sequence[Any] = ()
+                       ) -> tuple[bool, str, dict[str, Any]]:
+    """在给定账本快照上计算恢复合并结果；不落盘。
+
+    ``intents`` 是本次操作的写前意图：已有槽位的值发生变化时，只有"这一位就是
+    本次操作写出来的值"（例：账本 [6]、本地 7、云端已核对写到 11）才算合法增量；
+    与意图对不上的变化一律按外部冲突失败关闭（D05）。
+    """
+    written_by_this_op = _intent_slots_by_key(intents)
     to_record: dict[str, Any] = {}
     for storage_key, payload in entries.items():
         if not isinstance(payload, Mapping):
@@ -426,6 +455,14 @@ def _merge_into_ledger(ledger: SyncLedger, target_date: str, file_id: str,
         if new_slots == old_slots[:len(new_slots)]:
             # 本次云端验证只涉及较少槽位：旧账本已有更长前缀锚点，保持不动。
             continue
+        mine = written_by_this_op.get(str(storage_key)) or {}
+        if mine and len(new_slots) >= len(old_slots) and all(
+                old == new or (position in mine and int(mine[position]) == int(new))
+                for position, (old, new) in enumerate(zip(old_slots, new_slots), start=1)):
+            # 已有槽位的合法增量：这一位的变化正是本次操作写出去的值（只读核对
+            # 已证明云端达到期望值），因此按本次写入的锚点补记，不算外部冲突。
+            to_record[str(storage_key)] = dict(payload)
+            continue
         return False, f"ledger_slot_conflict:{name}", {}
     return True, "", to_record
 
@@ -445,6 +482,7 @@ def _merge_ledger(ledger: SyncLedger | None, record: Mapping[str, Any]) -> tuple
         return False, "ledger_missing"
     target_date = str(record.get("target_date") or "")
     file_id = str(record.get("file_id") or "")
+    intents = record.get("intents") or []
     path = getattr(ledger, "path", None)
     snapshot = copy.deepcopy(ledger.data)
     snapshot_digest = getattr(ledger, "_loaded_digest", None)
@@ -453,7 +491,7 @@ def _merge_ledger(ledger: SyncLedger | None, record: Mapping[str, Any]) -> tuple
             with FileLock(lock_path_for(path), timeout=30.0):
                 fresh = SyncLedger(path)
                 ok, reason, to_record = _merge_into_ledger(
-                    fresh, target_date, file_id, entries)
+                    fresh, target_date, file_id, entries, intents=intents)
                 if not ok:
                     return False, reason
                 if to_record:
@@ -463,7 +501,7 @@ def _merge_ledger(ledger: SyncLedger | None, record: Mapping[str, Any]) -> tuple
                 ledger._loaded_digest = fresh._loaded_digest
         else:
             ok, reason, to_record = _merge_into_ledger(
-                ledger, target_date, file_id, entries)
+                ledger, target_date, file_id, entries, intents=intents)
             if not ok:
                 return False, reason
             if to_record:

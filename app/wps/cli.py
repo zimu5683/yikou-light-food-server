@@ -21,6 +21,7 @@ from app.wps.common import (
     WRITE_BATCH_CELLS,
     _find_column,
     _is_transient,
+    cell_value_text,
 )
 from app.wps.errors import WpsCloudError
 from app.wps import android_runtime
@@ -314,7 +315,13 @@ class KdocsCli:
                   row_from: int, row_to: int,
                   col_from: int, col_to: int,
                   *, with_format: bool = False) -> dict[tuple[int, int], str]:
-        """读取矩形区域，返回 {(0-based 行, 0-based 列): cellText}。
+        """读取矩形区域，返回 {(0-based 行, 0-based 列): 值文本}。
+
+        值文本**优先取单元格原值** ``originalCellValue``，``cellText``（显示文本）
+        只作兜底：12 位电话被平台按数字存下后，显示文本是科学计数
+        ``1.59679E+11``（信息已经丢了），原值仍是 ``159678999961`` —— 用显示文本
+        做人键会把同一个人算成另一个人（2026-10-12 医学院中餐事故）。老接口/老
+        响应里没有原值字段时退回显示文本，行为与引入原值读取之前一致。
 
         接口返回里没有 ``detail`` 说明这张表读不了（例如是二进制 xlsx 而非在线
         表格），此时抛错而不是返回空结果 —— 否则调用方会把"读不了"误判成"表是空的"。
@@ -331,17 +338,25 @@ class KdocsCli:
         for cell in cells:
             if not isinstance(cell, dict):
                 continue
-            text = cell.get("cellText")
-            if text in (None, ""):
+            text = self._cell_text(cell)
+            if text == "":
                 continue
             if with_format:
                 key = (int(cell.get("originRow", 0)), int(cell.get("originCol", 0)))
-                grid[key] = {"text": str(text),
+                grid[key] = {"text": text,
                              "fill": (cell.get("cell_background_color")
                                       or cell.get("fill") or "")}
                 continue
-            grid[(int(cell.get("originRow", 0)), int(cell.get("originCol", 0)))] = str(text)
+            grid[(int(cell.get("originRow", 0)), int(cell.get("originCol", 0)))] = text
         return grid
+
+    @staticmethod
+    def _cell_text(cell: Mapping[str, Any]) -> str:
+        """从接口的单格数据里取出**值文本**（优先原值，显示文本兜底）。"""
+        original = cell.get("originalCellValue")
+        if original not in (None, ""):
+            return cell_value_text(original)
+        return cell_value_text(cell.get("cellText"))
 
     def read_row(self, file_id: str, worksheet_id: int, row: int,
                  col_from: int = 0, col_to: int = MAX_SCAN_COL - 1) -> dict[int, str]:
@@ -459,7 +474,7 @@ class KdocsCli:
         detail = data.get("detail") if isinstance(data, dict) else None
         cells = (detail or {}).get("rangeData") or []
         for cell in cells:
-            if isinstance(cell, dict) and cell.get("cellText") not in (None, ""):
+            if isinstance(cell, dict) and self._cell_text(cell):
                 return cell
         return None
 

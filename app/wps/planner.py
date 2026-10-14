@@ -41,7 +41,8 @@ from app.wps.common import (
     find_target_column,
     parse_date_header,
     person_key,
-    scan_bounds,
+    read_grid_chunked,
+    scan_region,
     sort_key_column,
     sort_key_value,
     weekday_number,
@@ -162,6 +163,126 @@ def _group_rows_per_person(orders: Sequence[CloudOrder],
     return result, warnings
 
 
+def _has_order_identity(prev_orders: Sequence[str] | None) -> bool:
+    """账本里有没有**可用**的槽位身份（至少一个非空订单号）。
+
+    ``['']``（当时本地「订单」列是空的）算"没有身份"：长度上有个列表，身份上
+    一个都没有 —— 只判断"有没有 orders 这个字段"会让它静默退回按行号配对。
+    """
+    return any(str(value or "").strip() for value in (prev_orders or []))
+
+
+def _identityless_pairing_double_counts(group: Sequence[CloudOrder],
+                                        prev_slots: Sequence[int]) -> bool:
+    """账本没有订单身份时，按行号配对会不会把一笔旧订单**重复加餐**。
+
+    判据是"旧行被新行顶掉"这个组合：
+
+    * 本地行数比账本槽位多（末尾有行被当成全新槽位全额加餐），**且**
+    * 账本前几个槽位里至少有一个在按行号配对时是**负增量**（本地行比槽位少，
+      增量被截成 0 丢掉）。
+
+    这时被丢掉的负增量与"多出来那一整行"往往是同一笔订单：本地行序变了
+    （「订单处理」按 W 编号从大到小写行），旧行挪到后面被当成新槽位再全额加一遍。
+    行数变多**本身**不报警 —— 新行追加在末尾、旧行逐一对得上时结果是准的，
+    那种正常补单必须照常写入。
+    """
+    if len(group) <= len(prev_slots):
+        return False
+    for slot, order in enumerate(group[:len(prev_slots)], start=1):
+        if order.meals <= 0:
+            continue
+        if order.meals < int(prev_slots[slot - 1] or 0):
+            return True
+    return False
+
+
+def _anonymous_pairing_double_counts(slot_orders: Sequence[CloudOrder | None],
+                                     prev_slots: Sequence[int]) -> bool:
+    """账本**有**订单身份、但本地有些行没有订单号：按位置套进槽位会不会重复加餐。
+
+    没有订单号的本地行没有身份可核对，只能按剩下的空位顺序配对，而它在**账本
+    记着身份**的槽位上产生的任何增量都不可核对 —— 那一行完全可能是另一笔订单。
+
+    判据（只看没有订单号、且落在账本槽位范围内的行）：
+
+    * 落在账本**有身份**的槽位上还要求加餐（本地餐次 > 账本锚点），或
+    * 有槽位的负增量被丢掉（本地餐次 < 账本锚点）**并且**本地行数比账本槽位多
+      —— 多出来的那一行多半就是被顶掉的这一笔旧订单。
+
+    两种情况都宁可失败关闭：这个人的云端行一个都不动，把问题亮在预览/日志里。
+    按订单号核对过的行、以及账本之外末尾槽位上的新行不受影响 —— 那些是正常补单。
+    """
+    grew = len([order for order in slot_orders if order is not None]) > len(prev_slots)
+    dropped = False
+    for slot, order in enumerate(slot_orders, start=1):
+        if order is None or slot > len(prev_slots):
+            continue
+        if str(order.order_no or "").strip():
+            continue        # 这一行有订单号：配对是核对过的，走身份规则
+        meals = int(order.meals or 0)
+        prev = int(prev_slots[slot - 1] or 0)
+        if meals > prev:
+            return True
+        if meals < prev:
+            dropped = True
+    return dropped and grew
+
+
+def _slots_by_identity(group: Sequence[CloudOrder],
+                       prev_orders: Sequence[str] | None) -> list[CloudOrder | None]:
+    """按账本里每个槽位的订单号把本地行放回**槽位下标**；本地暂时缺行的槽位是 ``None``。
+
+    本地行序不是稳定的：「订单处理」按 W 编号从大到小写行，正常补单也会让新单
+    排到旧单前面。只按位置配对就会把新单套进旧槽位、旧单再全额加一遍（D02）。
+
+    规则：账本第 i 个槽位的订单号能对上本地某一行 → 那一行排在位置 i（下标
+    ``i-1``），返回列表长度按账本槽位数放齐。**账本有身份、本地却没有这一行的
+    槽位留 ``None``**：这一笔订单只是暂时不在本地表里，云端那一行与账本锚点都
+    不能动 —— 把后面的本地行整体前移去填这个洞，就是拿别的订单的锚点做减法，
+    云端会永久多入账（D03）。
+
+    剩下的本地行两类，都不许丢（丢一行就是丢一份餐）：
+
+    * **带订单号但对不上账本**（本批新下的单）→ 放进"账本没有身份"的槽位
+      （空身份槽位、账本之外的末尾槽位），放不下的追加到末尾；
+    * **没有订单号**的没有身份可核对 → 沿用按行号填空位（含上面的洞）的旧行为。
+
+    账本没有订单号（旧账本）时原样返回 ``list(group)``（没有洞）：调用方沿用
+    按行号的位置配对。
+    """
+    orders = [str(value or "").strip() for value in (prev_orders or [])]
+    if not any(orders):
+        return list(group)
+    remaining = list(group)
+    slots: list[CloudOrder | None] = [None] * max(len(orders), len(group))
+    for index, order_no in enumerate(orders, start=1):
+        if not order_no:
+            continue
+        for position, order in enumerate(remaining):
+            if str(order.order_no or "").strip() == order_no:
+                slots[index - 1] = remaining.pop(position)
+                break
+    identified = [order for order in remaining if str(order.order_no or "").strip()]
+    anonymous = [order for order in remaining if not str(order.order_no or "").strip()]
+    # 新单优先填"账本没有身份"的位置；账本有身份的位置一个都不占（D03）
+    vacant = [index for index, order_no in enumerate(orders, start=1) if not order_no]
+    vacant += list(range(len(orders) + 1, len(slots) + 1))
+    for position in vacant:
+        if not identified:
+            break
+        slots[position - 1] = identified.pop(0)
+    slots.extend(identified)
+    # 没有订单号的行：按顺序填剩下的空位（含洞）
+    for index in range(len(slots)):
+        if not anonymous:
+            break
+        if slots[index] is None:
+            slots[index] = anonymous.pop(0)
+    slots.extend(anonymous)
+    return slots
+
+
 def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder],
                       conf: Mapping[str, str], target: _dt.date,
                       run_date: _dt.date | None,
@@ -205,8 +326,15 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
         plan.warnings.append("云端文件不可读或不是在线表格")
         return plan
     worksheet_id = int(infos[0].get("sheetId") or 1)
-    row_to, col_to = scan_bounds(infos[0])
-    grid = cli.read_grid(plan.file_id, worksheet_id, 0, row_to, 0, col_to)
+    # 读取范围按**整张表**要读全：单次请求的 45000 格预算会静默截断宽表（只读到
+    # 前 225 行之类的），拿截断快照建人员索引会把范围外的老客户当成新客户重复
+    # 插行。读不全（used range 超上限）时整张表拒绝写入，绝不按残缺快照写。
+    row_to, col_to, unreadable = scan_region(infos[0])
+    if unreadable:
+        plan.blocked_reason = (unreadable + " 为避免把已有客户重复插成新行，已拒绝写入本表；"
+                               "请先清理云端表尾的残留格式/内容，再重新预览。")
+        return plan
+    grid = read_grid_chunked(cli, plan.file_id, worksheet_id, 0, row_to, 0, col_to)
     plan.append_row = max(plan.append_row, 0)
 
     header = {col: text for (row, col), text in grid.items() if row == HEADER_ROW - 1}
@@ -319,9 +447,10 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
     name_col = plan.columns.get("name") or 1
     remark_col = plan.columns.get("remark") or name_col
     try:
-        fmt_grid = cli.read_grid(plan.file_id, worksheet_id,
-                                 FIRST_DATA_ROW - 1, row_to, name_col - 1, remark_col - 1,
-                                 with_format=True)
+        fmt_grid = read_grid_chunked(
+            cli, plan.file_id, worksheet_id,
+            FIRST_DATA_ROW - 1, row_to, name_col - 1, remark_col - 1,
+            with_format=True)
     except WpsCloudError:
         fmt_grid = {}
     name_cells: dict[int, dict[str, str]] = {}
@@ -367,11 +496,88 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
         is_new_person = not cloud_rows
         prev_slots = (ledger.synced_slots(date_key, plan.file_id, *key)
                       if ledger is not None else None)
+        prev_orders = (ledger.synced_orders(date_key, plan.file_id, *key)
+                       if ledger is not None else None)
+        prev_positions = (ledger.synced_positions(date_key, plan.file_id, *key)
+                          if ledger is not None else None)
+        if (prev_slots is not None and len(prev_slots) >= 2
+                and _has_order_identity(prev_orders)
+                and not any(prev_positions or ())):
+            # 升级窗口（只有这一半）：账本记着订单身份，却没记"槽位在云端这个人的
+            # 第几行" —— 槽位配对看起来是核对过的，实际只能按数组位置硬套。补单
+            # 新行插到既有行上方（关闭排序）、或地址排序把同一人跨地址组重排后，
+            # 数组位置已经不等于槽位序，这一批可能把增量写到别人的行上。
+            plan.warnings.append(
+                f"{first_order.name}（{first_order.phone}）：账本里还没有记下每个槽位"
+                f"在云端的第几行（旧版账本），本次只能按行号顺序配对；如果本地行序"
+                f"或云端行序被补单/排序改过，请核对云端这个人的每一行后再传"
+                f"（本批写入后会把物理位置补记进账本）")
         if is_new_person and any(name == first_order.name for name, _phone in people):
             plan.warnings.append(
                 f"{first_order.name}：云端已有同名的人（电话不同），本次会新增 "
                 f"{len(group)} 行，请核对是不是同一个人（重复行会让总餐次被加两次）")
-        for slot, order in enumerate(group, start=1):
+        # 槽位 = 本地第 i 行 ↔ 账本第 i 槽 ↔ 云端这个人的某一物理行（具体哪一行
+        # 由账本记的槽位位置给出，见 SyncLedger.synced_positions）。账本记了订单号
+        # 时先按身份把本地行放回**槽位下标**（补单会让本地行序变化，D02）；
+        # 本地暂时缺行的槽位是 None，主循环必须跳过它（D03）。没有订单号（旧账本）
+        # 或本地「订单」列为空时只能沿用位置配对。
+        slot_orders = _slots_by_identity(group, prev_orders)
+        identity = _has_order_identity(prev_orders)
+        if prev_slots is not None and (not identity or any(
+                not str(order.order_no or "").strip() for order in group)):
+            why = "账本里还没有订单号" if not identity else "本地「订单」列有空白"
+            unverifiable = (_identityless_pairing_double_counts(group, prev_slots)
+                            if not identity
+                            else _anonymous_pairing_double_counts(slot_orders,
+                                                                  prev_slots))
+            if unverifiable:
+                # 配对不可核对时按行号硬套会把一笔已经同步过的旧订单再加一遍：
+                # 升级窗口（账本还没记订单号），以及账本记着身份、本地「订单」列
+                # 却空着，都是这个形状。宁可失败关闭：这个人的云端行一个都不动，
+                # 把问题亮在预览/日志里，让用户核对，也不重复入账。
+                if identity:
+                    anonymous_rows = "、".join(
+                        str(row) for order in group
+                        if not str(order.order_no or "").strip()
+                        for row in (order.rows or ((order.row,) if order.row else ()))) or "?"
+                    plan.warnings.append(
+                        f"{first_order.name}（{first_order.phone}）：本地有 "
+                        f"{len(group)} 行，账本里记着订单号，但本地「订单」列有空白"
+                        f"（第 {anonymous_rows} 行），无法核对哪一行对应哪一笔订单："
+                        f"本次不写这个人的云端行（按行号硬套会把旧订单再全额加一遍）。"
+                        f"请把本地「订单」列补齐（重新执行「订单处理」）后再传")
+                else:
+                    plan.warnings.append(
+                        f"{first_order.name}（{first_order.phone}）：本地有 "
+                        f"{len(group)} 行，账本里只有 {len(prev_slots)} 个已同步槽位，"
+                        f"且{why}，无法核对新增行对应哪一笔订单：本次不写这个人的"
+                        f"云端行（按行号硬套会把旧订单再全额加一遍）。请先人工核对"
+                        f"云端这个人的行与餐次，再重传")
+                continue
+            suspect = (not identity and prev_slots is not None
+                       and len(group) < len(prev_slots))
+            plan.warnings.append(
+                f"{first_order.name}（{first_order.phone}）：本批槽位无法按订单身份核对"
+                f"（{why}），"
+                + ("本次仍按行号顺序配对；" if not identity
+                   else "没有订单号的行只能按剩下的空位顺序配对；")
+                + ("本地比账本槽位少，行号配对只对「缺的是最后几行」成立 —— "
+                   "如果缺的是中间的行，请先核对再传；" if suspect else "")
+                + "写入云端时会把订单号补记进账本，供下一批核对")
+        for slot, order in enumerate(slot_orders, start=1):
+            if order is None:
+                # 本地暂时没有这一槽位的行（账本在这一槽记着订单身份）：云端这一行
+                # 与账本锚点都原样保留。绝不能把后面的本地行前移到这个位置 —— 那会
+                # 拿别的订单的锚点做减法，云端永久多入账（D03）。
+                prev_order = (str((prev_orders or [])[slot - 1] or "").strip()
+                              if slot - 1 < len(prev_orders or ()) else "")
+                if prev_order:
+                    plan.warnings.append(
+                        f"{first_order.name}（{first_order.phone}）：本地暂时没有订单"
+                        f"「{prev_order}」（账本第 {slot} 个槽位）的那一行，本次不动云端"
+                        f"这一行、也不动账本锚点 —— 本地行回来后按订单身份核对，"
+                        f"不会重复加餐")
+                continue
             local_rows = tuple(order.rows) or ((order.row,) if order.row else ())
             local_note = "、".join(str(row) for row in local_rows) or "?"
             if order.meals <= 0:
@@ -389,9 +595,23 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
                     f"{order.name}（第 {slot} 行）：本地 {order.meals} 餐少于账本里本批"
                     f"已同步的 {prev} 餐（可能退单），本次不动云端总餐次，请人工核对")
                 added = 0
-            if slot <= len(cloud_rows):
+            # 槽位→物理行：账本记了"这一槽位在云端这个人的第几行"就按它取。槽位序
+            # 是身份序（历史写入序），云端物理行序会被补单插入与地址排序改掉 ——
+            # 补单新行插到既有行上方、或排序把同一人跨地址组重排后，数组位置
+            # ``cloud_rows[slot-1]`` 已经落在**别人的订单**那一行上：增量会写到
+            # 那一行（人级合计仍对，执行仍报成功，但两行的值与订单对不上）。
+            # 只有旧账本（没记过位置）与本批新槽位才退回按数组位置配对。
+            position = (prev_positions[slot - 1]
+                        if prev_positions is not None and slot <= len(prev_positions)
+                        else 0)
+            if position > 0:
+                # 账本记过位置：取这一槽位自己的那一行（超出 = 这一行被删了）
+                row = cloud_rows[position - 1] if position <= len(cloud_rows) else 0
+            else:
+                # 旧账本 / 本批新槽位：只能沿用按数组位置配对
+                row = cloud_rows[slot - 1] if slot <= len(cloud_rows) else 0
+            if row:
                 # 云端已有这一行：总餐次 = 现值 + 本次增量（累加，不是绝对值）
-                row = cloud_rows[slot - 1]
                 before = _as_int(grid.get((row - 1, total_col - 1))) if total_col else 0
                 raw_mark = str(grid.get((row - 1, plan.target_col - 1), "") or "").strip()
                 already = raw_mark == CELL_MARK
@@ -405,8 +625,10 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
                                 meal_type=order.meal_type, meal_kind=order.meal_kind,
                                 local_meals=order.meals, ledger_prev=prev,
                                 target_occupied=occupied, local_rows=local_rows,
-                                slot=slot, pre_row=row,
-                                cloud_before_rows=tuple(cloud_rows))
+                                slot=slot, pre_row=row, cloud_row=row,
+                                cloud_before_rows=tuple(cloud_rows),
+                                order_no=str(order.order_no or "").strip(),
+                                address_in_sheet=str(address_of.get(row, "") or "").strip())
                 # 半成品行自愈：上次中断可能留下缺「类型/餐种/公式」的行，本次补齐。
                 change.fill_type = bool(
                     type_col and order.meal_type
@@ -551,11 +773,19 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
                         local_meals=order.meals,
                         ledger_prev=None,
                         local_rows=tuple(order.rows) or ((order.row,) if order.row else ()),
-                        slot=slot, pre_row=pre_row)
+                        slot=slot, pre_row=pre_row,
+                        order_no=str(order.order_no or "").strip())
         plan.changes.append(change)
         final_rows_by_key.setdefault(key, {})[slot] = row
     plan.final_rows = {key: tuple(rows[i] for i in sorted(rows))
                        for key, rows in final_rows_by_key.items()}
+    # 既有槽位在本批结束后的物理行号：槽位 i 现在对应这个人的第 i 行（既有行按
+    # 行号升序），插入/排序后落到第几行可预测（同 ``final_row_of``）。写账本时
+    # 只用来补"没有变更的槽位"；有变更的槽位以执行后的实际行号为准。
+    for key, rows in people.items():
+        plan.slot_rows[key] = {
+            slot: final_row_of.get(pre_insert_row(row), row)
+            for slot, row in enumerate(rows, start=1)}
     plan.changes = existing_changes + plan.changes
     if sort_on:
         plan.sort_enabled = True

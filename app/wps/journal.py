@@ -262,6 +262,67 @@ class SyncJournal:
                         break
         return result
 
+    def blocking_operations(self, target_date: str, file_id: str, *,
+                            exclude_operation_id: str = ""
+                            ) -> dict[str, dict[str, Any]]:
+        """仍会阻止「同一目标日期 + 同一云表」再次写入的 operation。
+
+        这是**重复累加的最后一道闸门**：只要上一次对这张表（同日期）的写入没有
+        走到可证明的终点（``verified`` / ``failed_no_write`` / ``not_started``），
+        就不能再写它 —— 否则"结果未知"的那次如果其实写成功了，这一次会把同一批
+        餐再加一遍。
+
+        闸门**只针对（目标日期 + 云表）这一对键**：某张表结果未知不牵连别的表、
+        更不牵连别的日期批次（2026-10-12 需求：表间独立上传）。
+
+        两类命中：
+
+        * 未处置的 pending（``planned`` / ``writing`` / ``ledger_pending`` /
+          ``uncertain``，以及任何未知状态）—— 结果未知，必须人工处置；
+        * ``retired_guarded`` —— 已退出待处理队列，但防重复闸门仍然保留。
+
+        ``exclude_operation_id``：正在执行的本次 operation 必须排除，否则它自己
+        刚建出来的 ``planned`` 记录会把本批挡在门外（自锁）。
+        """
+        key_date = str(target_date or "")
+        key_file = str(file_id or "")
+        blocked: dict[str, dict[str, Any]] = {}
+        for op_id, op in self.operations().items():
+            if not isinstance(op, Mapping) or str(op_id) == str(exclude_operation_id or ""):
+                continue
+            op_retired = bool(op.get("retired_guarded")) or (
+                str(op.get("status") or "") == "retired_guarded")
+            # op 级状态未知（不在当前版本词表内）同样是必须继续阻断的审计数据：
+            # 即使它的每个 sheet 看起来都是终态，也不能当作"已核清"放行。
+            # 恢复流程会把未知状态改写成 ``uncertain`` 并留下
+            # ``unsupported_status_preserved`` 标记 —— 那只是保留审计值，
+            # 人工处置之前仍然照堵。
+            op_status_unknown = (
+                str(op.get("status") or "") not in OP_STATUSES
+                or bool(op.get("unsupported_status_preserved")))
+            sheets = op.get("sheets") or {}
+            if not isinstance(sheets, Mapping):
+                continue
+            for record in sheets.values():
+                if not isinstance(record, Mapping):
+                    continue
+                record_date = str(record.get("target_date") or "")
+                if not record_date:
+                    record_date = str(op.get("target_date") or "")
+                if record_date != key_date:
+                    continue
+                if str(record.get("file_id") or "") != key_file:
+                    continue
+                status = str(record.get("status") or "")
+                retired = bool(op_retired or record.get("retired_guarded")
+                               or status == "retired_guarded")
+                unknown = (op_status_unknown or status not in SHEET_STATUSES
+                           or status in PENDING_SHEET_STATUSES)
+                if retired or unknown:
+                    blocked[str(op_id)] = op
+                    break
+        return blocked
+
     def guarded_operations(self) -> dict[str, dict[str, Any]]:
         """返回显式退出但保留防重复闸门的 operation。"""
         result: dict[str, dict[str, Any]] = {}

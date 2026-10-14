@@ -78,9 +78,21 @@ class Change:
     # 排序前这一槽位所在的物理行号；排序后用它写排序身份标记，
     # 避免"同人两行地址不同"时按行号升序把 slot 映射错（WPS-C8）。
     pre_row: int = 0
+    # 计划时这一槽位对应的**云端原始行号**（插入/排序都还没发生时看到的行号）。
+    # 上传前的只读复核用它核对旧值/目标格；不能拿 slot 去索引 cloud_before_rows ——
+    # 槽位按订单身份配对后，槽位序与"这个人的第几行"不再相等（D02/D03）。
+    cloud_row: int = 0
     # build_plan 看到的这个人排序前已有的云端行号（1-based，升序）；
     # 新增槽位为空元组。恢复核对用它判断"原值槽位"和"本次新建槽位"。
     cloud_before_rows: tuple[int, ...] = ()
+    # ---- 槽位身份（D02/D03）：本地「订单」列（W 编号）与排序前云端的地址原文 ----
+    # ``order_no``：这一槽位对应的本地订单号。账本按它记 ``orders``，本地行序
+    # 变化（补单按 W 编号从大到小写行）时靠它把槽位与订单身份对上，不再按行号硬套。
+    order_no: str = ""
+    # ``address_in_sheet``：排序前这一槽位在**云端**那一行的地址原文（不是本地
+    # 地址）。排序后重定位时用它核对"写回的那一行确实还是原来这一行"——地址是
+    # 每个写错行的场景都会失配的信号（D01）。
+    address_in_sheet: str = ""
 
     @property
     def target_blocked(self) -> bool:
@@ -149,6 +161,10 @@ class SheetPlan:
     row_keys: dict[int, int] = field(default_factory=dict)
     # 预测的排序后行号：{(姓名, 电话): (第 1 行, 第 2 行, ...)}，按槽位顺序
     final_rows: dict[tuple[str, str], tuple[int, ...]] = field(default_factory=dict)
+    # 既有槽位在本批结束后的物理行号：{(姓名, 电话): {槽位: 行号}}（插入/排序后
+    # 的预测）。账本 positions 用它补"没有变更的槽位"；有变更的槽位以执行后的
+    # 实际行号为准（见 executor._ledger_entries）。
+    slot_rows: dict[tuple[str, str], dict[int, int]] = field(default_factory=dict)
     # 实际排序结果与预测不一致（真机 sort_range 行为异常）
     sort_mismatch: bool = False
     # 排序后数据区的最后一行（1-based）
