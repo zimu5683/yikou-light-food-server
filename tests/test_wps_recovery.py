@@ -741,8 +741,12 @@ def test_target_zero_preserved_through_crash_recovery(tmp_path):
     assert cli.grid[(2, 7)] == "9"
     assert ledger2.synced_slots(TARGET.isoformat(), "F1", "张", "111") == [6]
 
-def test_multi_sheet_partial_failure_blocks_remaining_sheet(tmp_path):
-    """一张表写入结果不确定后，后续表必须阻断，不能继续扩大部分成功。"""
+def test_multi_sheet_partial_failure_does_not_block_remaining_sheet(tmp_path):
+    """一张表写入结果不确定后，**后续表照常执行**（2026-10-12 表间独立上传需求）。
+
+    旧约定「前一张表结果不确定 → 后续表 blocked、连尝试都不尝试」已被需求二取代：
+    某张表的结果未知只堵它自己（未核清之前它不许重写，防重复加餐），不牵连别的表。
+    """
     grid_a = make_grid(rows=[{0: "张", 2: "111", 7: "3"}])
     grid_b = make_grid(rows=[{0: "李", 2: "222", 7: "5"}])
     cli_a = GridCli(grid_a, fail_write_on_call=2, fail_write_after_cells=1)
@@ -763,18 +767,19 @@ def test_multi_sheet_partial_failure_blocks_remaining_sheet(tmp_path):
     # F1 新客户 base_cells 是第 1 次写，最终单元格是第 2 次；让其部分写后失败。
     result = apply_plan(router, plans, ledger=ledger, marker_enabled=False)
 
-    assert result["status"] == "uncertain"
-    assert result["uncertain"] is True
-    assert result["written"] == 0
     a_item = next(item for item in result["sheets"] if item["sheet"] == "东湖中餐")
     b_item = next(item for item in result["sheets"] if item["sheet"] == "衣锦中餐")
-    assert a_item["status"] == "uncertain"
-    assert b_item["status"] == "blocked"
-    assert b_item["next_action"] == "manual_reconcile"
-    assert cli_b.writes == [] and cli_b.inserts == [], "后续表一个云端写请求都不能发"
-    assert cli_b.grid[(2, 7)] == "5"
+    assert a_item["status"] == "uncertain", "失败表按结果未知处理"
+    assert b_item["status"] == "ok", "后续表必须照常执行"
+    assert cli_b.writes, "后续表必须真实写入云端"
+    assert cli_b.grid[(2, 7)] == "7", "李的总餐次 5 + 本次 2 = 7"
+    assert cli_b.grid[(2, 4)] == "1", "日期格标 1"
+    # 顶层仍如实反映"有一张表要人工处理"，但不阻断其它表的成功
+    assert result["status"] == "uncertain"
+    assert result["uncertain"] is True
+    assert result["written"] == 1
     assert ledger.synced_slots(TARGET.isoformat(), "F1", "新人A", "111") is None
-    assert ledger.synced_slots(TARGET.isoformat(), "F2", "李", "222") is None
+    assert ledger.synced_slots(TARGET.isoformat(), "F2", "李", "222") == [2]
 
 def test_sort_slot_identity_recovery_after_crash(tmp_path):
     """C8 崩溃恢复：新槽位排序到旧行前面，靠实际地址/身份重建而不是行号升序。"""
@@ -2117,8 +2122,12 @@ def test_w3_target_date_gone_needs_guarded_retire_and_keeps_same_target_block(tm
         def write_cells(self, *_args, **_kwargs):
             raise RuntimeError("unexpected in-process failure before cloud write")
 
-    with pytest.raises(RuntimeError):
-        apply_plan(Boom(cli.grid), plans, ledger=ledger, marker_enabled=False)
+    # 未预期异常不再整批照抛（2026-10-12 表间独立需求）：这一张表被记成
+    # 「结果未知」，journal 里留下本次操作供只读核对，其余表照常执行。
+    aborted = apply_plan(Boom(cli.grid), plans, ledger=ledger, marker_enabled=False)
+    assert aborted["status"] != "ok"
+    assert aborted["written"] == 0
+    assert aborted["sheets"][0]["uncertain"] is True
 
     journal_path = ledger.journal_path
     op_id = next(iter(SyncJournal(journal_path).operations()))
@@ -2241,3 +2250,56 @@ def test_w2_unknown_operation_status_alone_blocks_and_query_is_uncertain(tmp_pat
         "guarded retire 后不应再阻塞其他目标日期"
     raw = reloaded.get_operation("op-unknown-only")
     assert raw["sheets"]["s"]["status"] == "verified", "sheet 原始状态审计值不能被覆盖"
+
+
+def test_云端已核对后补记本操作的合法槽位增量(tmp_path):
+    """D05：已有槽位的**合法增量**（账本 [6] → 本次 +1 → 云端已写到 10）恢复时补记账本。
+
+    修复前 `_merge_into_ledger` 只接受"完全相同 / 互为前缀"，[6]→[7] 一律报
+    `ledger_slot_conflict` —— 即使只读核对已证明云端达到期望值，恢复仍然失败并
+    继续阻断同日期同表的上传。合法增量的判据是"这一位等于本操作写出的值"。
+    """
+    cli = GridCli(make_grid(rows=[{0: "张", 2: "111", 7: "3"}]))
+    ledger_path = tmp_path / "state.json"
+    ledger = SyncLedger(ledger_path)
+    first = apply_plan(cli, _plan(cli, _orders(6), ledger), ledger=ledger,
+                       marker_enabled=False)
+    assert first["status"] == "ok" and cli.grid[(2, 7)] == "9"
+
+    ledger2 = SyncLedger(ledger_path)
+
+    def broken_save():
+        raise OSError("disk full")
+
+    ledger2.save = broken_save  # type: ignore[method-assign]
+    second = apply_plan(cli, _plan(cli, _orders(7), ledger2), ledger=ledger2,
+                        marker_enabled=False)
+    assert second["status"] == "uncertain"
+    assert cli.grid[(2, 7)] == "10", "云端已经写到 10"
+
+    reader = SyncLedger(ledger_path)
+    journal = SyncJournal(journal_path_for(ledger_path))
+    op_id = next(op_id for op_id, op in journal.operations().items()
+                 if op.get("status") == "ledger_pending")
+    out = resolve_pending_operation(reader, op_id, "cloud_verified", cli=cli,
+                                    confirm_structure_checked=True)
+
+    assert out["ok"] is True, out
+    reloaded = SyncLedger(ledger_path)
+    assert reloaded.synced_slots(TARGET.isoformat(), "F1", "张", "111") == [7], \
+        "云端已核对成功：本操作的合法增量要补记进账本"
+    assert cli.grid[(2, 7)] == "10", "恢复过程不得再加餐"
+
+    # 闸门解除且本批已一致：再次上传是 no-op，一个格子都不写。
+    writes_before = len(cli.writes)
+    again_plan = build_plan(
+        cli, local_orders={"东湖中餐": _orders(7)},
+        tables={"东湖中餐": {"file_id": "F1"}},
+        target=TARGET, ledger=SyncLedger(ledger_path), marker_enabled=False,
+        address_order={}, sort_enabled=False,
+    )
+    again = apply_plan(cli, again_plan, ledger=SyncLedger(ledger_path),
+                       marker_enabled=False)
+    assert again["status"] != "uncertain"
+    assert again["written"] == 0 and len(cli.writes) == writes_before
+    assert cli.grid[(2, 7)] == "10"

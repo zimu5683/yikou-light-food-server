@@ -209,6 +209,8 @@ def _run_batch(tmp_path, monkeypatch, *, rows, station,
 # ----------------------------------------------------------------------
 # 现场量级：目标 99 · 提交前已有 26 · 本轮提交 73 · 成功 25 · 技术异常 48
 # → 本轮新增站内确认 25，总确认 51，未确认 48
+# （48 个技术异常单各在**同一单内**重试 2 次 → 共 169 次 POST；technical_errors
+#   按任务计 48，attempts 按真实调用计 169。）
 # ----------------------------------------------------------------------
 def test_live_batch_reports_exact_counts_and_never_claims_new_creations(
         tmp_path, monkeypatch):
@@ -227,10 +229,10 @@ def test_live_batch_reports_exact_counts_and_never_claims_new_creations(
     result, logs, posts = _run_batch(tmp_path, monkeypatch, rows=rows,
                                      station=station, respond=respond)
 
-    assert len(posts) == 73 and len(posts_seen) == 73
+    assert len(posts) == 169 and len(posts_seen) == 169  # 25 + 48 × 3 次尝试
     stats = result["summary"]["submission"]
     assert stats == {
-        "target_total": 99, "preconfirmed": 26, "submitted": 73, "attempts": 73,
+        "target_total": 99, "preconfirmed": 26, "submitted": 73, "attempts": 169,
         "success_responses": 25, "technical_errors": 48, "explicit_rejections": 0,
         "auth_rejections": 0, "balance_rejections": 0, "not_sent": 0,
         "newly_confirmed": 25, "confirmed": 51, "unconfirmed": 48,
@@ -252,7 +254,7 @@ def test_live_batch_reports_exact_counts_and_never_claims_new_creations(
     text = "\n".join(logs)
     counts = [line for line in logs if line.startswith("本轮提交统计：")]
     assert counts == [
-        "本轮提交统计：目标 99 单；提交前已有 26 单；本轮提交 73 单（73 次 POST）；"
+        "本轮提交统计：目标 99 单；提交前已有 26 单；本轮提交 73 单（169 次 POST）；"
         "成功响应 25 次；技术异常（结果未知）48 次；明确拒绝 0 次；未发送 0 单；"
         "本轮新增站内确认 25 单；总确认 51/99；未确认 48 单",
     ]
@@ -292,13 +294,17 @@ def test_all_orders_already_in_station_reports_zero_submission(
 
 def test_unknown_response_confirmed_later_keeps_the_error_count(
         tmp_path, monkeypatch):
-    """技术异常后由站内确认：最终状态清零，但响应异常次数不许消失。"""
+    """技术异常（同单重试 3 次）后由站内确认：最终状态清零，但响应异常次数不许消失。"""
     rows = _rows(2)
     station = []
+    seen_phones: set[str] = set()
 
     def respond(body, index, tasks):
-        # 两单其实都落单了；第二单的响应是平台内部异常。
-        station.append(_station_record(_task_by_phone(tasks, body["receivePhone"])))
+        # 两单其实都落单了；第二单每次尝试的响应都是平台内部异常。
+        phone = body["receivePhone"]
+        if phone not in seen_phones:
+            seen_phones.add(phone)
+            station.append(_station_record(_task_by_phone(tasks, phone)))
         if index == 0:
             return {"success": True}
         return {"success": False, "message": INTERNAL_ERROR}
@@ -306,10 +312,10 @@ def test_unknown_response_confirmed_later_keeps_the_error_count(
     result, logs, posts = _run_batch(tmp_path, monkeypatch, rows=rows,
                                      station=station, respond=respond)
 
-    assert len(posts) == 2  # 结果未知绝不自动重发
+    assert len(posts) == 4  # 第二单在**同一单内**重试 2 次；绝无跨单补发
     assert result["status"] == "confirmed"
     stats = result["summary"]["submission"]
-    assert (stats["attempts"], stats["submitted"]) == (2, 2)
+    assert (stats["attempts"], stats["submitted"]) == (4, 2)
     assert stats["success_responses"] == 1 and stats["technical_errors"] == 1
     assert stats["confirmed"] == 2 and stats["unconfirmed"] == 0
     assert stats["newly_confirmed"] == 2 and stats["not_sent"] == 0
@@ -554,12 +560,14 @@ def test_end_to_end_runner_counts_reach_bridge_message_and_operation_summary(
     worker.join(20.0)
     assert not worker.is_alive(), "闪时送任务没有在超时内结束"
 
-    assert len(posts) == 2  # 只提交站内缺失的 2 单，结果未知绝不重发
+    # 只提交站内缺失的 2 单；其中 1 单内部异常 → 同单重试 2 次（共 4 次 POST），
+    # 绝无跨单补发。
+    assert len(posts) == 4
     operation = bridge.operation_status(reservation.operation.operation_id)
     assert operation["status"] != "success"
     submission = operation["summary"]["submission"]
     assert submission == {
-        "target_total": 3, "preconfirmed": 1, "submitted": 2, "attempts": 2,
+        "target_total": 3, "preconfirmed": 1, "submitted": 2, "attempts": 4,
         "success_responses": 1, "technical_errors": 1, "explicit_rejections": 0,
         "auth_rejections": 0, "balance_rejections": 0, "not_sent": 0,
         "newly_confirmed": 1, "confirmed": 2, "unconfirmed": 1, "reconciled": True,
@@ -569,7 +577,7 @@ def test_end_to_end_runner_counts_reach_bridge_message_and_operation_summary(
     assert error_events and error_events[-1]["payload"]["ok"] is False
     message = error_events[-1]["payload"]["message"]
     assert "提交前已有 1 单" in message
-    assert "本轮提交 2 单（2 次 POST）" in message
+    assert "本轮提交 2 单（4 次 POST）" in message
     assert "技术异常（结果未知）1 次" in message
     assert "本轮新增站内确认 1 单" in message
     assert "总确认 2/3" in message and "未确认 1 单" in message

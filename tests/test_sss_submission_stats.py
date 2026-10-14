@@ -332,14 +332,19 @@ def test_preparation_failure_is_discarded_from_the_journal(monkeypatch, tmp_path
     assert all(record["status"] != "unresolved" for record in broken_records)
 
 
-@pytest.mark.parametrize("outcome_state,expected", [
-    ("success", {"succeeded": 1, "uncertain": 0, "failures": 0}),
-    ("reject", {"succeeded": 0, "uncertain": 0, "failures": 1}),
-    ("unknown", {"succeeded": 0, "uncertain": 1, "failures": 0}),
+@pytest.mark.parametrize("outcome_state,expected,expected_attempts", [
+    ("success", {"succeeded": 1, "uncertain": 0, "failures": 0}, 1),
+    ("reject", {"succeeded": 0, "uncertain": 0, "failures": 1}, 1),
+    ("unknown", {"succeeded": 0, "uncertain": 1, "failures": 0}, 3),
 ])
 def test_diagnostic_failure_never_changes_the_classification(monkeypatch,
-                                                             outcome_state, expected):
-    """诊断构造失败只丢记录：成功 / 明确拒绝 / 未知三种分类都不改，也不重发。"""
+                                                             outcome_state, expected,
+                                                             expected_attempts):
+    """诊断构造失败只丢记录：分类不变，也不会额外触发任何重发。
+
+    「unknown」态的平台内部异常会按重试策略尝试 3 次（这是平台驳回驱动的，
+    与诊断构造失败无关）；诊断失败只影响记录的落盘。
+    """
     tasks = _tasks(1)
     posts: list[dict] = []
     logs: list[str] = []
@@ -358,10 +363,10 @@ def test_diagnostic_failure_never_changes_the_classification(monkeypatch,
     monkeypatch.setattr(sss_submission, "submission_diagnostic", broken_diagnostic)
     result = sss_submission._submit_tasks_concurrent(
         tasks, _submitter(tasks, handler), Event(), logs.append, max_workers=1)
-    assert len(posts) == 1  # 诊断失败绝不触发重发
+    assert len(posts) == expected_attempts  # 诊断失败绝不触发额外重发
     assert (len(result.succeeded), len(result.uncertain), len(result.failures)) == (
         expected["succeeded"], expected["uncertain"], expected["failures"])
-    assert result.attempts == 1
+    assert result.attempts == expected_attempts
     assert any("提交诊断构造失败" in message and "ValueError" in message
                for message in logs)
     assert not any("diagnostic boom" in message or "13800000001" in message
@@ -553,16 +558,21 @@ def test_same_client_request_id_manual_retry_gets_a_new_attempt_id():
 
 
 def test_round_emits_exact_counts_and_send_markers_without_customer_data():
+    """一轮的精确计数与逐序号标记：平台驳回在**同一单内**自动重试，业务拒绝不重试。"""
     tasks = _tasks(12)
     logs = []
-    responses = {"n": 0}
+    posts_by_door: dict[str, int] = {}
 
     def handler(task, body):
-        responses["n"] += 1
-        if responses["n"] == 2:
-            return {"success": False, "message": INTERNAL_ERROR}
-        if responses["n"] == 3:
+        door = body["receiveAddress"]["doorNum"]
+        posts_by_door[door] = posts_by_door.get(door, 0) + 1
+        if door == "A100":      # 第一单：平台驳回一次后成功（自动重试生效）
+            return ({"success": False, "message": INTERNAL_ERROR}
+                    if posts_by_door[door] == 1 else {"success": True})
+        if door == "A101":      # 第二单：业务明确拒绝（确定未建单，不重试）
             return {"success": False, "message": "地址无效"}
+        if door == "A1011":     # 最后一单：三次尝试都被平台驳回 → 结果待对账
+            return {"success": False, "message": INTERNAL_ERROR}
         return {"success": True}
 
     result = sss_submission._submit_tasks_concurrent(
@@ -570,32 +580,41 @@ def test_round_emits_exact_counts_and_send_markers_without_customer_data():
 
     counts = [message for message in logs if message.startswith("本轮统计：")]
     assert len(counts) == 1
-    assert ("本轮统计：实际发起 12 次 POST（12 单）；成功响应 10，技术异常 1，"
+    assert ("本轮统计：实际发起 15 次 POST（12 单）；成功响应 10，技术异常 1，"
             "明确拒绝 1，登录失效 0，余额不足 0，未发送 0") == counts[0]
     assert (result.attempts, len(result.succeeded), len(result.uncertain),
-            result.explicit_rejections) == (12, 10, 1, 1)
+            result.explicit_rejections) == (15, 10, 1, 1)
 
     markers = [message for message in logs if message.startswith("本轮发送顺序")]
     assert len(markers) == 1
     marks = markers[0].rsplit("（", 1)[0]  # 最后一个括号后是图例，不能混进计数
-    assert marks.count("✔") == 10 and marks.count("✖") == 1
+    expected_marks = (["✖", "✔", "⚠"] + ["✔"] * 9 + ["✖", "✖", "✖"])
+    assert marks.count("✔") == 10 and marks.count("✖") == 4
     assert marks.count("⚠") == 1
     assert marks.split("：", 1)[1].split() == [
-        f"{seq}{mark}" for seq, mark in zip(
-            range(1, 13), ["✔", "✖", "⚠"] + ["✔"] * 9)]
+        f"{seq}{mark}" for seq, mark in zip(range(1, 16), expected_marks)]
+
+    # 驳回重试必须逐次可见：第一单与最后一单都打过「平台驳回（第 N/3 次）」。
+    retry_notes = [message for message in logs if "平台驳回（第" in message]
+    assert any("第 1/3 次" in message for message in retry_notes)
+    assert any("重试生效" in message for message in logs)
 
     # 技术异常提示必须指向“结果待对账”，不得声称（或暗示）服务端已回滚。
     notes = [message for message in logs if "未获可确认结果" in message]
     assert len(notes) == 1
-    assert "结果待站内对账确认" in notes[0]
+    assert "同一单内已按提交节流自动重试" in notes[0]
+    assert "仍待站内对账确认" in notes[0]
     assert "不代表订单未创建" in notes[0]
     assert not any("回滚" in message for message in logs)
     assert not any("自动放宽" in message for message in logs)
     # 十单进度日志保持兼容。
     assert any("本轮收到成功响应 10/12 单" in message for message in logs)
-    # 精简结果与计数都不含客户姓名/电话。
-    for private in ("测试0", "测试11", "13800000000", "13800000011"):
-        assert private not in "".join(logs)
+    # 计数 / 标记 / 汇总提示这几行不含任何客户姓名或电话
+    # （失败与驳回明细按既有口径点名订单行，便于人工定位）。
+    for line in counts + markers + notes:
+        assert "测试" not in line and "1380000000" not in line
+    # 电话号一律不出现（任何一行都不允许）。
+    assert "13800000000" not in "".join(logs)
 
 
 def test_whitelisted_server_identity_headers_are_sanitized():
@@ -775,26 +794,33 @@ def test_final_reconciliation_failure_keeps_response_counts():
 
 
 def test_java_exception_then_station_confirmation_keeps_history():
-    """平台内部异常后由站内确认：当前状态清零，历史异常次数保留。"""
+    """平台内部异常（本单内重试 3 次）后由站内确认：当前状态清零，历史异常次数保留。
+
+    每次尝试都返回内部异常驳回 → 收尾仍是「技术异常/待对账」（technical_errors
+    按**任务**计 1，attempts 按真实 POST 计 3）；站内对账确认后当前 uncertain
+    清零，但技术异常这条历史计数保留。
+    """
     task = _tasks(1)[0]
     station: list[dict] = []
     posts = []
 
     def handler(inner_task, body):
         posts.append(body)
-        station.append(_record(inner_task))
+        if len(posts) == 1:
+            # 第一次请求其实已落单（站内可见），但响应是内部异常 —— 由收尾对账确认。
+            station.append(_record(inner_task))
         return {"success": False, "message": INTERNAL_ERROR}
 
     outcome: dict = {}
     final, reconciled = sss_submission._run_reconciled_submission(
         [task], lambda: (_submitter([task], handler), lambda: None),
         _station_fetch(station), Event(), None, None, 4, outcome=outcome)
-    assert len(posts) == 1  # 结果未知绝不自动重发
+    assert len(posts) == 3  # 平台驳回在**同一单内**自动重试满 3 次
     assert reconciled and final is not None and final.confirmed == {task["identifier"]}
     assert outcome["uncertain"] == []
     stats = _stats(outcome)
     assert stats["technical_errors"] == 1 and stats["success_responses"] == 0
-    assert stats["attempts"] == 1 and stats["submitted"] == 1
+    assert stats["attempts"] == 3 and stats["submitted"] == 1
     assert stats["confirmed"] == 1 and stats["newly_confirmed"] == 1
     assert stats["unconfirmed"] == 0 and stats["not_sent"] == 0
 

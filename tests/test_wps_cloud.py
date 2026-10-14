@@ -1674,3 +1674,386 @@ def test_effective_tables_test_mode_uses_copies_and_rejects_production():
     config.wps_test_tables = {"东湖中餐": "H8vzKoTJVrMP7mA9QG591xqS9W8Bg57iG"}
     with pytest.raises(WpsCloudError, match="已过期试验田"):
         wc.effective_tables(config)
+
+
+# ----------------------------------------------------------------------
+# 值原样上传（2026-10-12 需求）：写进去、读回来、显示出来是同一个值
+# ----------------------------------------------------------------------
+def test_cell_value_text_keeps_numeric_strings_intact():
+    """原值→文本：数字字符串原样、浮点整数去 .0、None 为空。"""
+    from app.wps.common import cell_value_text
+    assert cell_value_text(159678999961) == "159678999961"
+    assert cell_value_text(159678999961.0) == "159678999961"
+    assert cell_value_text("159 6789 9961") == "159 6789 9961"
+    assert cell_value_text("+86-159-6789-9961") == "+86-159-6789-9961"
+    assert cell_value_text(None) == ""
+
+
+def test_text_cell_formula_quotes_digit_strings_only():
+    """写值只有 opType=formula 一种：纯数字串按文本写（前置单引号），其余原样。
+
+    事故根因：直接把 12 位号码当数字写 → 云端存成数字、显示成科学计数
+    ``1.59679E+11``，协作者看到的不是客户填的号码。
+    """
+    from app.wps.common import text_cell_formula
+    assert text_cell_formula("159678999961") == "'159678999961"
+    assert text_cell_formula("13800000000") == "'13800000000"
+    # 带空格/连字符/+86 的形态不是纯数字：原样写，不做任何清洗
+    assert text_cell_formula("159 6789 9961") == "159 6789 9961"
+    assert text_cell_formula("+8613800000000") == "+8613800000000"
+    # 非电话文本不受影响
+    assert text_cell_formula("张三") == "张三"
+    assert text_cell_formula("B10") == "B10"
+
+
+class _RawResponseCli(wps_cli.KdocsCli):
+    """直接返回固定接口报文的 KdocsCli 替身（走真实 read_grid 解析逻辑）。"""
+
+    def __init__(self, payload):
+        self.payload = payload
+        self.path = "/fake/kdocs-cli"
+        self.timeout = 5
+        self.token = None
+
+    def _run(self, *args, params=None, retries=2):
+        return self.payload
+
+
+def test_read_grid_prefers_the_original_value_over_display_text():
+    """读层优先取 ``originalCellValue``；没有该字段时退回 ``cellText``（老响应）。"""
+    cli = _RawResponseCli({"detail": {"rangeData": [
+        {"originRow": 2, "originCol": 2, "cellText": "1.59679E+11",
+         "originalCellValue": 159678999961},
+        {"originRow": 3, "originCol": 2, "cellText": "13800000000"},
+    ]}})
+    grid = cli.read_grid("F1", 1, 0, 5, 0, 5)
+    assert grid[(2, 2)] == "159678999961"    # 原值优先：显示成科学计数也不丢值
+    assert grid[(3, 2)] == "13800000000"     # 没有原值字段：退回显示文本
+
+
+def test_scientific_display_no_longer_hides_the_incident_customer():
+    """事故同款：云端显示 ``1.59679E+11``，人键仍按原值 159678999961 定位。"""
+    cli = _RawResponseCli({"detail": {"rangeData": [
+        {"originRow": 2, "originCol": 0, "cellText": "mer"},
+        {"originRow": 2, "originCol": 2, "cellText": "1.59679E+11",
+         "originalCellValue": 159678999961},
+    ]}})
+    grid = cli.read_grid("F1", 1, 0, 2, 0, 2)
+    assert person_key(grid[(2, 0)], grid[(2, 2)]) == ("mer", "159678999961")
+
+
+def test_new_customer_phone_is_written_as_text_so_it_displays_as_filled():
+    """新客户电话格按文本写：云端显示/回读都保持客户填的原样（12 位不截断）。"""
+    cli = FakeCli(make_grid(BASE_HEADER, [{0: "老人", 2: "111", 7: "3"}]))
+    orders = [CloudOrder("东湖中餐", "新人", "小", "159678999961", "中餐", "经济", 2)]
+    plans = _plan(cli, orders, sort=False)
+    result = apply_plan(cli, plans, ledger=None, marker_enabled=False)
+    assert result["written"] == 1
+    phone_cells = [c for batch in cli.writes for c in batch["cells"]
+                   if c["col"] == 3]
+    assert phone_cells and phone_cells[0]["value"] == "'159678999961"
+
+
+def test_phone_style_write_is_idempotent_on_the_second_run(tmp_path):
+    """值一致时第二次上传是 no-op：不会因为文本写的单引号重复加餐/重复写格。"""
+    led = SyncLedger(tmp_path / "state.json")
+    cli = FakeCli(make_grid(BASE_HEADER, [{0: "老人", 2: "111", 7: "3"}]))
+    orders = [CloudOrder("东湖中餐", "新人", "小", "159678999961", "中餐", "经济", 2)]
+    first = apply_plan(cli, _plan(cli, orders, sort=False, ledger=led), ledger=led,
+                       marker_enabled=False)
+    assert first["written"] == 1
+    writes_before = len(cli.writes)
+    second = apply_plan(cli, _plan(cli, orders, sort=False, ledger=led), ledger=led,
+                        marker_enabled=False)
+    assert second["written"] == 0
+    assert second["sheets"][0]["status"] in {"noop", "ok"}
+    assert len(cli.writes) == writes_before, "第二次上传不得再写任何格子"
+
+
+# ----------------------------------------------------------------------
+# 表间独立上传（2026-10-12 需求）：一张表失败/不确定不牵连别的表
+# ----------------------------------------------------------------------
+def _two_sheet_orders():
+    return {
+        "东湖中餐": [CloudOrder("东湖中餐", "新人", "小", "999", "中餐", "经济", 6)],
+        "东湖晚餐": [CloudOrder("东湖晚餐", "新人晚", "小", "888", "晚餐", "经济", 2)],
+    }
+
+
+def _two_sheet_plans(cli):
+    return build_plan(cli, local_orders=_two_sheet_orders(),
+                      tables={"东湖中餐": {"file_id": "F1"},
+                              "东湖晚餐": {"file_id": "F2"}},
+                      target=dt.date(2026, 9, 11), ledger=None,
+                      address_order={}, sort_enabled=False)
+
+
+def _pending_operation(journal, *, file_id: str, date_key: str, sheet: str):
+    from app.wps.journal import new_operation_id
+    op = new_operation_id()
+    journal.create_operation(op, {f"0:{sheet}:{file_id}": {
+        "sheet": sheet, "file_id": file_id, "target_date": date_key,
+        "status": "uncertain", "next_action": "manual_reconcile",
+        "reason": "写入过程中断电，无法判断是否已写", "problems": []}},
+        target_date=date_key)
+    journal.save()
+    return op
+
+
+def test_pending_operation_blocks_only_its_own_sheet(tmp_path, monkeypatch):
+    """同日期某张表的结果未知只堵它自己：别的表照常写入（表间独立上传）。"""
+    from app.wps import executor as wps_executor
+    from app.wps.journal import SyncJournal, journal_path_for
+    monkeypatch.setattr(wps_executor, "recover_pending_operations",
+                        lambda *a, **k: {"status": "none", "operations": [],
+                                         "uncertain": False})
+    cli = FakeCli(make_grid(BASE_HEADER, [{0: "老人", 2: "111", 7: "3"}]))
+    plans = _two_sheet_plans(cli)
+    ledger = SyncLedger(tmp_path / "state.json")
+    journal = SyncJournal(journal_path_for(ledger.path))
+    _pending_operation(journal, file_id="F1", date_key="2026-09-11", sheet="东湖中餐")
+
+    result = apply_plan(cli, plans, ledger=ledger, journal=journal,
+                        marker_enabled=False)
+
+    by_sheet = {item["sheet"]: item for item in result["sheets"]}
+    assert by_sheet["东湖中餐"]["status"] == "uncertain"
+    assert by_sheet["东湖中餐"]["next_action"] == "manual_reconcile"
+    assert by_sheet["东湖晚餐"]["status"] == "ok"
+    # “真的写入”的证据：新人晚这一行的目标日期格标了 1
+    rows = {row for (row, col), text in cli.grid.items() if text == "新人晚"}
+    assert rows and all(cli.grid.get((row, 4)) == "1" for row in rows)
+
+
+def test_pending_operation_for_another_date_blocks_nothing(tmp_path, monkeypatch):
+    """闸门按「日期 + 表」设限：别的日期批次的历史未决不阻断本次上传。"""
+    from app.wps import executor as wps_executor
+    from app.wps.journal import SyncJournal, journal_path_for
+    monkeypatch.setattr(wps_executor, "recover_pending_operations",
+                        lambda *a, **k: {"status": "none", "operations": [],
+                                         "uncertain": False})
+    cli = FakeCli(make_grid(BASE_HEADER, [{0: "老人", 2: "111", 7: "3"}]))
+    plans = _two_sheet_plans(cli)
+    ledger = SyncLedger(tmp_path / "state.json")
+    journal = SyncJournal(journal_path_for(ledger.path))
+    _pending_operation(journal, file_id="F1", date_key="2026-09-10", sheet="东湖中餐")
+
+    result = apply_plan(cli, plans, ledger=ledger, journal=journal,
+                        marker_enabled=False)
+
+    statuses = {item["sheet"]: item["status"] for item in result["sheets"]}
+    assert statuses == {"东湖中餐": "ok", "东湖晚餐": "ok"}
+
+
+def test_uncertain_sheet_does_not_block_the_following_sheets(tmp_path):
+    """一张表回读校验不过（uncertain）后，后面的表仍被真实执行。"""
+    class _CorruptFirstSheet(FakeCli):
+        """第一张表（F1）假装写成功但不落地 → 回读校验必不过；第二张表正常。"""
+
+        def write_cells(self, file_id, worksheet_id, cells):
+            if file_id == "F1":
+                self.writes.append({"file_id": file_id, "cells": list(cells)})
+                return
+            super().write_cells(file_id, worksheet_id, cells)
+
+    cli = _CorruptFirstSheet(make_grid(BASE_HEADER, [{0: "老人", 2: "111", 7: "3"}]))
+    plans = _two_sheet_plans(cli)
+    ledger = SyncLedger(tmp_path / "state.json")
+
+    result = apply_plan(cli, plans, ledger=ledger, marker_enabled=False)
+
+    by_sheet = {item["sheet"]: item for item in result["sheets"]}
+    assert by_sheet["东湖中餐"]["uncertain"] is True
+    assert by_sheet["东湖晚餐"]["status"] == "ok"
+    rows = {row for (row, col), text in cli.grid.items() if text == "新人晚"}
+    assert rows and all(cli.grid.get((row, 4)) == "1" for row in rows)
+
+
+# ----------------------------------------------------------------------
+# 读取完整性：单次读取被截断时不能把局部当整张表
+# ----------------------------------------------------------------------
+def test_customer_beyond_single_read_budget_is_not_treated_as_new():
+    """云表 300 行 × 200 列：第 230 行的老客户必须被读到并判成 existing。
+
+    修复前：``scan_bounds`` 的单次格数预算只覆盖前 225 行，范围外客户被当成
+    "不存在" → 计划把他当新客户重复插一行。
+    """
+    rows = [{0: "路人", 2: "111", 7: "3"}]
+    for _ in range(226):                      # 撑到第 230 行（0-based 229）
+        rows.append({0: "", 2: "", 7: ""})
+    rows.append({0: "老客户", 1: "D2", 2: "222", 7: "10"})
+
+    class _WideCli(FakeCli):
+        def sheets_info(self, file_id):
+            return [{"sheetId": 1, "sheetName": "Sheet1", "rowTo": 300, "colTo": 199}]
+
+    grid = make_grid(BASE_HEADER, rows)
+    cli = _WideCli(grid)
+    orders = [CloudOrder("东湖中餐", "老客户", "D2", "222", "中餐", "经济", 2)]
+    plans = build_plan(cli, local_orders={"东湖中餐": orders},
+                       tables={"东湖中餐": {"file_id": "F1"}},
+                       target=dt.date(2026, 9, 11), ledger=None,
+                       address_order={}, sort_enabled=False)
+    plan = plans[0]
+    assert plan.blocked_reason == ""
+    matching = [c for c in plan.changes if person_key(c.name, c.phone) == ("老客户", "222")]
+    assert matching and matching[0].kind == "existing", "范围外的老客户被当成了新客户"
+    assert matching[0].total_after == 12      # 10 + 2：累加到原行，而不是新插一行
+
+
+def test_sheet_longer_than_read_limit_blocks_the_write():
+    """used range 超过可完整读取上限：整表拒绝写入且零云端请求后的写。"""
+    class _TooLongCli(FakeCli):
+        def sheets_info(self, file_id):
+            return [{"sheetId": 1, "sheetName": "Sheet1", "rowTo": 500, "colTo": 50}]
+
+    cli = _TooLongCli(make_grid(BASE_HEADER, [{0: "老人", 2: "111", 7: "3"}]))
+    orders = [CloudOrder("东湖中餐", "新人", "小", "999", "中餐", "经济", 2)]
+    plans = _plan(cli, orders, sort=False)
+    assert plans[0].blocked_reason, "读不全必须整表阻断"
+    result = apply_plan(cli, plans, ledger=None, marker_enabled=False)
+    assert result["written"] == 0 and cli.writes == []
+
+
+def test_read_grid_chunked_covers_the_whole_region():
+    """分块读取覆盖整个范围，且每次请求都不超过单次格数上限。"""
+    class _RecordingCli(FakeCli):
+        def __init__(self, grid):
+            super().__init__(grid)
+            self.ranges: list[tuple[int, int, int, int]] = []
+
+        def read_grid(self, file_id, worksheet_id, row_from, row_to,
+                      col_from, col_to, *, with_format=False):
+            self.ranges.append((row_from, row_to, col_from, col_to))
+            return super().read_grid(file_id, worksheet_id, row_from, row_to,
+                                     col_from, col_to, with_format=with_format)
+
+    cli = _RecordingCli({(row, col): f"v{row}{col}"
+                         for row in range(0, 700) for col in range(0, 200)})
+    grid = wc.read_grid_chunked(cli, "F1", 1, 0, 699, 0, 199)
+    assert set(grid) == {(row, col) for row in range(700) for col in range(200)}
+    assert all((row_to - row_from + 1) * (col_to - col_from + 1) <= wc.MAX_READ_CELLS
+               for row_from, row_to, col_from, col_to in cli.ranges)
+
+
+# ----------------------------------------------------------------------
+# 账本身份与锚点（D02/D03/D04）：订单号配对、缺行不截断、基准不倒退
+# ----------------------------------------------------------------------
+def _order(order_no: str, meals: int, *, name: str = "张", phone: str = "111"):
+    return CloudOrder("东湖中餐", name, "小", phone, "中餐", "经济", meals,
+                      order_no=order_no)
+
+
+def _apply(cli, orders, led, *, sort=False):
+    return apply_plan(cli, _plan(cli, orders, sort=sort, ledger=led), ledger=led,
+                      marker_enabled=False)
+
+
+def test_补单重跑按订单身份配对槽位(tmp_path):
+    """补单改变本地行序（按 W 编号从大到小写行）：靠订单号把本地行放回原槽位。
+
+    第一次 W5=6 餐 → 云端 3+6=9、账本 [6]/[W5]；第二次本地多下 W11=1 餐且排到
+    W5 前面 → 只能再 +1（云端 10）；绝不能把 W11 套进旧槽位、W5 再全额加一遍。
+    """
+    led = SyncLedger(tmp_path / "state.json")
+    cli = FakeCli(make_grid(BASE_HEADER, [{0: "张", 2: "111", 7: "3"}]))
+    _apply(cli, [_order("W5", 6)], led)
+    assert led.synced_slots("2026-09-11", "F1", "张", "111") == [6]
+    assert led.synced_orders("2026-09-11", "F1", "张", "111") == ["W5"]
+
+    result = _apply(cli, [_order("W11", 1), _order("W5", 6)], led)
+
+    assert result["written"] == 1
+    # 旧槽位（W5 那一行）保持 9 不动；新单只在自己那一行写 1（合计 10）。
+    # 修复前会把 W11 套进旧槽位、W5 被当成新槽位再全额加 6（新行写 6、合计 15）。
+    assert cli.grid[(2, 7)] == "9" and cli.grid[(3, 7)] == "1"
+    assert led.synced_slots("2026-09-11", "F1", "张", "111") == [6, 1]
+    assert led.synced_orders("2026-09-11", "F1", "张", "111") == ["W5", "W11"]
+
+
+def test_本地行数减少时保留末尾槽位锚点(tmp_path):
+    """本地暂时只剩第一行：账本不能被截短；行回来时按订单身份核对，不重复加餐。"""
+    led = SyncLedger(tmp_path / "state.json")
+    cli = FakeCli(make_grid(BASE_HEADER, [{0: "张", 2: "111", 7: "3"}]))
+    _apply(cli, [_order("W1", 6), _order("W2", 6)], led)
+    assert led.synced_slots("2026-09-11", "F1", "张", "111") == [6, 6]
+    assert led.synced_orders("2026-09-11", "F1", "张", "111") == ["W1", "W2"]
+
+    # 本地暂时只剩第一行、并改成 7 餐：只 +1，且账本第二个槽位原样保留。
+    _apply(cli, [_order("W1", 7)], led)
+    assert cli.grid[(2, 7)] == "10"      # 第一行 9 + 1
+    assert led.synced_slots("2026-09-11", "F1", "张", "111") == [7, 6], \
+        "本地行数减少时不能丢掉末尾旧槽位的防重复锚点"
+
+    # 第二行回来：两行都已入账 → 一个格子都不写。
+    writes_before = len(cli.writes)
+    result = _apply(cli, [_order("W1", 7), _order("W2", 6)], led)
+    assert result["written"] == 0 and len(cli.writes) == writes_before
+    assert cli.grid[(2, 7)] == "10" and cli.grid[(3, 7)] == "6"
+
+
+def test_负增量被截时账本基准不倒退(tmp_path):
+    """云端不扣减（负增量截 0），账本锚点也不许倒退：先减后恢复不重复加餐。"""
+    led = SyncLedger(tmp_path / "state.json")
+    cli = FakeCli(make_grid(BASE_HEADER, [{0: "张", 2: "111", 7: "3"}]))
+    _apply(cli, [_order("W1", 6), _order("W2", 1)], led)
+    assert cli.grid[(2, 7)] == "9" and cli.grid[(3, 7)] == "1"
+
+    # 第一槽本地减少（云端不扣、增量截 0），第二槽 +1：锚点必须保持 6，不许降到 4。
+    _apply(cli, [_order("W1", 4), _order("W2", 2)], led)
+    assert cli.grid[(2, 7)] == "9" and cli.grid[(3, 7)] == "2"
+    assert led.synced_slots("2026-09-11", "F1", "张", "111") == [6, 2], \
+        "云端没扣减，账本基准也不许倒退"
+
+    # 本地恢复原值：两槽都已入账 → 不再加餐。
+    writes_before = len(cli.writes)
+    result = _apply(cli, [_order("W1", 6), _order("W2", 2)], led)
+    assert result["written"] == 0 and len(cli.writes) == writes_before
+    assert cli.grid[(2, 7)] == "9" and cli.grid[(3, 7)] == "2"
+
+
+def test_账本还没有订单号时按行号配对并补记身份(tmp_path):
+    """旧账本（无 orders/positions）：本批仍按行号配对，但会把订单号与位置补记下来。"""
+    led = SyncLedger(tmp_path / "state.json")
+    cli = FakeCli(make_grid(BASE_HEADER, [{0: "张", 2: "111", 7: "3"}]))
+    _apply(cli, [_order("W5", 6)], led)
+
+    # 模拟旧版本账本：只有 slots，没有 orders/positions。
+    entry = led.data["batches"]["2026-09-11"]["F1"]["people"]["张\u0000111"]
+    entry.pop("orders", None)
+    entry.pop("positions", None)
+    led.save()
+
+    # 同一批重跑：按行号配对 → 增量为 0（noop），并把身份补记进账本供下一批核对。
+    result = _apply(cli, [_order("W5", 6)], led)
+    assert result["written"] == 0
+    assert led.synced_orders("2026-09-11", "F1", "张", "111") == ["W5"]
+    assert led.synced_positions("2026-09-11", "F1", "张", "111") == [1]
+
+
+def test_排序后地址核对不通过时整表停写():
+    """D01：排序后落表行的地址与计划时读到的云端地址对不上 → 停止写入。
+
+    地址是"这一行还是原来那一行"的唯一凭据：同一个人多行、或表被协作者改动后
+    按行号硬写时，姓名/餐次可能照样相符，只有地址必然对不上。宁可让用户重传，
+    也不能把增量写到别人的行上。
+    """
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "D1", 2: "111", 7: "3"},
+        {0: "王", 1: "小", 2: "222", 7: "3"},
+    ]))
+    orders = [CloudOrder("东湖中餐", "张", "D1", "111", "中餐", "经济", 1),
+              CloudOrder("东湖中餐", "新人", "小", "999", "中餐", "经济", 1)]
+    plans = _plan(cli, orders, address_order={"东湖中餐": ["小", "D1"]})
+    existing = next(c for c in plans[0].changes if c.name == "张")
+    assert existing.address_in_sheet == "D1"
+    # 模拟"计划时看到的行"与"排序后落到的行"不是同一行（身份错配）
+    existing.address_in_sheet = "另一个地址"
+
+    result = apply_plan(cli, plans, ledger=None, marker_enabled=False)
+
+    item = result["sheets"][0]
+    assert result["status"] != "ok"
+    assert item["uncertain"] is True and "地址核对不通过" in item["reason"]
+    assert cli.grid[(2, 7)] == "3", "定位存疑时不得改动云端总餐次"
+    assert "重新上传" in item["reason"]

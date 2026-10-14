@@ -6,6 +6,7 @@ import json
 import re
 import time
 import uuid
+from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from threading import Lock, local
 from typing import Any, Callable
@@ -39,6 +40,21 @@ class _ExplicitRejection(LookupError):
     """平台返回可识别的参数校验拒绝，允许在只读对账后决定是否重试。"""
 
 
+class _RetryableInternalReject(_SubmissionUncertain):
+    """平台内部异常驳回（快速驳回）：单次响应确定未建单，可在同一批内自动重试。
+
+    2026-10-09 排查：平台的快速驳回（HTTP 200 + ``IndexOutOfBoundsException``
+    等内部异常）不创建订单，只消耗一个平台序号（"幽灵单"，不可见、不产生扣费）；
+    浏览器模式实测「驳回后原表单再点一次即成功」（102 单实跑、重复 0 单）。
+    因此每次尝试都可以安全重发同一单。
+
+    **红线不动**：只有这一个响应形态可重试；超时/断连/缺 ``success`` 字段的
+    "结果未知"绝不自动重发，业务类驳回（"商品已下架"等）也不重试。重试用尽后
+    仍按保守口径收尾（见 :func:`_check_success` 的调用方：仍记「技术异常/待对账」），
+    由提交后只读对账确认。
+    """
+
+
 _VALIDATION_REJECTION_RE = re.compile(
     r"^(?:(?:操作失败|下单失败|创建失败)[!！,，:：\s]*)?"
     r"(?:地址无效|(?:收货|收件)?地址(?:不能为空|不完整|格式错误)"
@@ -53,6 +69,10 @@ _BALANCE_REJECTION_RE = re.compile(
     r"|^(?:insufficient\s+balance|balance\s+(?:is\s+)?insufficient)[.!\s]*$",
     re.IGNORECASE,
 )
+
+#: 单笔订单的最大提交尝试次数（1 次首试 + 2 次重试），与桌面端浏览器模式
+#: "共点 3 次最终确定"对齐。仅对平台内部异常驳回生效（见 _RetryableInternalReject）。
+_API_SUBMIT_ATTEMPTS = 3
 
 
 def _balance_precheck(tasks: list[dict[str, Any]], total: float | None,
@@ -93,6 +113,11 @@ def _check_success(resp: Any) -> None:
 
     success=false、错误码、Java 异常都不能证明事务已回滚；不认识的失败
     保留前置记录，仅做只读对账，不能据此重发非幂等 POST。
+
+    唯一的例外是**平台内部异常驳回**（快速驳回）：2026-10-09 排查与浏览器
+    模式实测都证明这种响应不创建订单（"幽灵单"），因此它可以在同一批内按
+    提交节流自动重试（见 :class:`_RetryableInternalReject`）；重试用尽后仍
+    按"结果待对账"的保守口径收尾。
     """
     if not isinstance(resp, dict):
         raise _SubmissionUncertain(
@@ -101,7 +126,7 @@ def _check_success(resp: Any) -> None:
     if is_internal_error_payload(resp):
         exception = re.search(r"\b(?:java|javax|org|com)\.[\w.]*(?:Exception|Error)\b", message)
         detail = f"：{exception.group(0)}" if exception else ""
-        raise _SubmissionUncertain(f"平台内部异常，无法确认是否落单{detail}")
+        raise _RetryableInternalReject(f"平台内部异常，无法确认是否落单{detail}")
     if is_server_error_payload(resp):
         raise _SubmissionUncertain("平台返回服务端错误，无法确认是否落单")
     if is_auth_expired_payload(resp):
@@ -289,7 +314,9 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
                              on_stop: Callable[[], None] | None = None,
                              read_timeout_s: float | None = None,
                              min_interval_s: float = 0.0,
-                             round_no: int = 1) -> _SubmitResult:
+                             round_no: int = 1,
+                             submit_attempts: int = _API_SUBMIT_ATTEMPTS
+                             ) -> _SubmitResult:
     """有界并发提交，停止、401、余额不足后不再派发新任务。
 
     同一轮最多保留 ``max_workers`` 个在途 POST。请求超时或断链只记录为
@@ -299,6 +326,12 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
     POST 的起点至少间隔该值，0 = 关闭节流。间隔只来自配置且在运行期固定，不会
     因为平台返回内部异常（``IndexOutOfBoundsException`` 等）自动放宽。
 
+    ``submit_attempts`` > 1 时，**只有平台内部异常驳回**（快速驳回，确定未建单，
+    见 :class:`_RetryableInternalReject`）会在同一批内自动重试同一单，最多尝试
+    该次数；每次尝试都重新过 ``pacer.wait``（吃全局节流）、各占一个
+    ``send_seq``/``attempt_id``/诊断记录。重试用尽仍按"技术异常/待对账"收尾。
+    结果未知（超时/断连/缺 ``success``）与业务类驳回**绝不**自动重发。
+
     ``round_no`` 是批次内的提交轮次（独立调用默认 1），只进入诊断记录。
     ``send_seq`` 是**本地派发起点**序号（同一轮内从 1 开始，由派发临界区内的
     计数决定）：它不代表响应完成顺序，也不代表服务端到达顺序；停止等待与未派发
@@ -307,7 +340,8 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
 
     停止 / 401 / 余额不足在全部准备完成、进入派发临界区之前做最终确认：已经中止
     时按「未发送」处理，不发出 POST、不占序号、不计调用次数；本地准备失败同理，
-    并只按异常类型提示，不输出报文或异常正文。
+    并只按异常类型提示，不输出报文或异常正文。重试等待期间被停止/401/余额拦下
+    时，保留该单**本轮已发出请求**的既有结论，绝不改记成「未发送」。
 
     结束后输出一行本轮汇总（`_emit_round_summary`）、一行精确计数和一行按
     ``send_seq`` 排列的成功/异常标记。
@@ -319,13 +353,17 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
     except (TypeError, ValueError):
         pacing = 0.0
     pacer = _SubmitPacer(pacing)
+    try:
+        attempts = max(1, int(submit_attempts or 1))
+    except (TypeError, ValueError):
+        attempts = 1
     if isinstance(round_no, bool) or not isinstance(round_no, int) or round_no < 1:
         round_no = 1
     iterator = iter(tasks)
     in_flight: dict[Any, dict[str, Any]] = {}
     stop_closed = False
     latencies: list[float] = []
-    diagnostic_records: dict[str, dict[str, Any]] = {}
+    diagnostic_records: dict[str, list[dict[str, Any]]] = {}
     # 派发序号/计数只在这一小段加锁（微秒级），网络请求绝不进入锁内，
     # 并发路数仍然有界且互不串行。
     dispatch_lock = Lock()
@@ -350,66 +388,97 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
             _emit(callback, f"提交准备失败（{type(exc).__name__}）：{identifier} 未发送，"
                             "站内对账后可按未发送任务补发；不记为已发送未知")
             return identifier, "stopped", ""
-        if not pacer.wait(stop_event, halted):
-            # 节流等待期间收到停止/中止：请求确实没有发出，按「未发送」处理
-            # （重登后仍属于可补发的明确未发送任务），也不占用派发序号。
-            return identifier, "stopped", ""
-        interval_at_send = pacer.interval
-        # 所有准备完成、进入派发临界区之前的最终中止确认（stop / 401 / 余额不足）。
-        if halted():
-            return identifier, "stopped", ""
-        with dispatch_lock:
-            started = time.perf_counter()
-            started_at = time.time()
-            dispatch_state["seq"] += 1
-            send_seq = dispatch_state["seq"]
-            previous_start = dispatch_state["previous_start"]
-            dispatch_state["previous_start"] = started
-            seq_by_identifier[identifier] = send_seq
-            result.attempts += 1
-            result.dispatched.add(identifier)
-            # 序号与起点同区取得，间隔直接作差（不夹紧，避免掩盖异常值）。
-            actual_interval_s = (None if previous_start is None
-                                 else started - previous_start)
-        response: Any = None
-        transport: dict[str, Any] = {}
-        try:
-            response = submit(task["payload"])
-            _check_success(response)
-        except _AuthExpired as exc:
-            transport = dict(getattr(exc, "diagnostics", {}) or {})
-            state, detail = "auth", str(exc)
-        except _BalanceDepleted as exc:
-            state, detail = "balance", str(exc)
-        except _ExplicitRejection as exc:
-            state, detail = "failure", str(exc)
-        except (_SubmissionUncertain, SssTransportError) as exc:
-            transport = dict(getattr(exc, "diagnostics", {}) or {})
-            state, detail = "uncertain", str(exc)
-        except Exception as exc:
-            # 非幂等 POST 一旦调用出去，非显式拒绝的异常一律是“已发送未知”；
-            # 不能落入 failure/discard，否则平台已落单但响应异常时会重复 POST。
-            state, detail = "uncertain", str(exc)
-        else:
-            state, detail = "success", ""
-        elapsed = time.perf_counter() - started
-        # list.append 在 CPython 下是原子的；这里只做统计，不参与任何判定。
-        latencies.append(elapsed)
-        try:
-            record: dict[str, Any] | None = submission_diagnostic(
-                task, response, started_at=started_at, elapsed_s=elapsed, state=state,
-                payload_hash=request_digest, transport=transport, send_seq=send_seq,
-                round_no=round_no, attempt_id=attempt_id,
-                actual_interval_s=actual_interval_s)
-            record["min_interval_s"] = round(interval_at_send, 3)
-        except Exception as exc:
-            # 诊断只是旁路：构造失败不得改变已经取得的分类，也不触发任何重发。
-            record = None
-            _emit(callback, f"提交诊断构造失败（{type(exc).__name__}）："
-                            "该次提交仍按已取得的响应分类，不会因此重发")
-        if record is not None:
-            diagnostic_records[identifier] = record
-        _trace(f"POST {identifier}: {elapsed:.2f}s -> {state}")
+        state, detail = "stopped", ""
+        spent = 0.0
+        for attempt in range(1, attempts + 1):
+            attempt_id = uuid.uuid4().hex[:16]
+            if not pacer.wait(stop_event, halted):
+                # 节流等待期间收到停止/中止：首轮表示"请求确实没有发出"（按未发送
+                # 处理，重登后可补发）；重试轮的请求已经发出过，保留既有结论，
+                # 绝不能改记成「未发送」。
+                if attempt == 1:
+                    return identifier, "stopped", ""
+                break
+            interval_at_send = pacer.interval
+            # 所有准备完成、进入派发临界区之前的最终中止确认（stop / 401 / 余额不足）。
+            if halted():
+                if attempt == 1:
+                    return identifier, "stopped", ""
+                break
+            with dispatch_lock:
+                started = time.perf_counter()
+                started_at = time.time()
+                dispatch_state["seq"] += 1
+                send_seq = dispatch_state["seq"]
+                previous_start = dispatch_state["previous_start"]
+                dispatch_state["previous_start"] = started
+                seq_by_identifier[identifier] = send_seq
+                result.attempts += 1
+                result.dispatched.add(identifier)
+                # 序号与起点同区取得，间隔直接作差（不夹紧，避免掩盖异常值）。
+                actual_interval_s = (None if previous_start is None
+                                     else started - previous_start)
+            response: Any = None
+            transport: dict[str, Any] = {}
+            retryable_reject = False
+            try:
+                response = submit(task["payload"])
+                _check_success(response)
+            except _AuthExpired as exc:
+                transport = dict(getattr(exc, "diagnostics", {}) or {})
+                state, detail = "auth", str(exc)
+            except _BalanceDepleted as exc:
+                state, detail = "balance", str(exc)
+            except _RetryableInternalReject as exc:
+                # 平台内部异常驳回：单次响应确定未建单，可安全重试；
+                # 收尾仍按"技术异常/待对账"的保守口径。
+                transport = dict(getattr(exc, "diagnostics", {}) or {})
+                state, detail = "uncertain", str(exc)
+                retryable_reject = True
+            except _ExplicitRejection as exc:
+                state, detail = "failure", str(exc)
+            except (_SubmissionUncertain, SssTransportError) as exc:
+                transport = dict(getattr(exc, "diagnostics", {}) or {})
+                state, detail = "uncertain", str(exc)
+            except Exception as exc:
+                # 非幂等 POST 一旦调用出去，非显式拒绝的异常一律是“已发送未知”；
+                # 不能落入 failure/discard，否则平台已落单但响应异常时会重复 POST。
+                state, detail = "uncertain", str(exc)
+            else:
+                state, detail = "success", ""
+            elapsed = time.perf_counter() - started
+            spent += elapsed
+            # list.append 在 CPython 下是原子的；这里只做统计，不参与任何判定。
+            try:
+                record: dict[str, Any] | None = submission_diagnostic(
+                    task, response, started_at=started_at, elapsed_s=elapsed,
+                    state=state, payload_hash=request_digest, transport=transport,
+                    send_seq=send_seq, round_no=round_no, attempt_id=attempt_id,
+                    actual_interval_s=actual_interval_s)
+                record["min_interval_s"] = round(interval_at_send, 3)
+            except Exception as exc:
+                # 诊断只是旁路：构造失败不得改变已经取得的分类，也不触发任何重发。
+                record = None
+                _emit(callback, f"提交诊断构造失败（{type(exc).__name__}）："
+                                "该次提交仍按已取得的响应分类，不会因此重发")
+            if record is not None:
+                diagnostic_records.setdefault(identifier, []).append(record)
+            # 每次真实 POST 各占一个 send_seq：完成顺序可能倒置，标记按序号排列。
+            round_marks[send_seq] = state
+            _trace(f"POST {identifier}"
+                   + (f"（第 {attempt}/{attempts} 次尝试）" if attempts > 1 else "")
+                   + f": {elapsed:.2f}s -> {state}；min_interval_s={interval_at_send:.3f}")
+            if state == "success":
+                if attempt > 1:
+                    _emit(callback,
+                          f"{identifier} 第 {attempt} 次提交后成功（平台驳回重试生效）")
+                break
+            if not (retryable_reject and attempt < attempts and not halted()):
+                break
+            _emit(callback,
+                  f"平台驳回（第 {attempt}/{attempts} 次）：{identifier}："
+                  f"{detail[:120]}；按提交节流等待后自动重试该单…")
+        latencies.append(spent)
         return identifier, state, detail
 
     started_at = time.perf_counter()
@@ -443,8 +512,7 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
                 if seq is not None:
                     # 完成顺序可能倒置；精简结果一律按派发时的 send_seq 排列。
                     round_marks[seq] = state
-                diagnostic = diagnostic_records.pop(identifier, None)
-                if diagnostic is not None:
+                for diagnostic in diagnostic_records.pop(identifier, None) or ():
                     diagnostic["workers"] = workers
                     try:
                         write_submission_diagnostic(diagnostic)
@@ -487,9 +555,10 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
                          for seq in sorted(round_marks))
         _emit(callback, f"本轮发送顺序（send_seq:结果）：{marks}（{_SEND_MARKER_LEGEND}）")
     if result.uncertain:
-        _emit(callback, f"本轮 {len(result.uncertain)} 次请求未获可确认结果"
-                        "（例如平台建单内部异常）：结果待站内对账确认，"
-                        "不代表订单未创建，本批不会自动重发")
+        _emit(callback, f"本轮 {len(result.uncertain)} 单未获可确认结果"
+                        "（例如平台建单内部异常）：同一单内已按提交节流自动重试，"
+                        "用尽后结果仍待站内对账确认，不代表订单未创建，"
+                        "本批不会跨轮自动重发")
     if latencies:
         _emit(callback, f"脱敏提交诊断日志：{diagnostic_log_path()}")
     return result
@@ -619,6 +688,35 @@ def _run_reconciled_submission(
     batch_started_at = time.time()
     batch_window_start = batch_started_at - _BATCH_CLOCK_SKEW_S
     task_by_id = {str(task.get("identifier")): task for task in tasks}
+    fingerprint_of = {str(task.get("identifier")): _task_fingerprint(task)
+                      for task in tasks}
+    #: 已经由某轮对账确认过、占用了站内一条记录的任务标识（D09 的账目来源）。
+    confirmed_tasks: set[str] = set()
+
+    def consumed_evidence(round_tasks: list[dict[str, Any]]) -> Counter:
+        """本轮对账要扣除的「已消费站内记录」数（按指纹计）。
+
+        一条站内记录只能充当一条任务的完成证据：前几轮已经确认掉、且**不在本轮
+        名单里**的任务，各自占用了站内的一条记录，本轮必须先把它们扣掉，否则
+        同一张旧记录会被第二次当成新任务的证据（D09：只成功 0 单、站内仅 1 单，
+        却报两单全部完成）。
+
+        仍在本轮名单里的已确认任务不扣：同一批任务会被重复对账（收尾对账、
+        重试前/后对账扫的都是同一份名单），重复扫描必须幂等，否则第二次扫描
+        会把自己上一轮的确认结果翻成缺失。
+        """
+        round_identifiers = {str(task.get("identifier")) for task in round_tasks}
+        return Counter(fingerprint_of[identifier]
+                       for identifier in confirmed_tasks
+                       if identifier not in round_identifiers
+                       and identifier in fingerprint_of)
+
+    def reconcile(round_tasks: list[dict[str, Any]], label: str, **options: Any
+                  ) -> "_Reconciliation | None":
+        """只读对账（带上跨轮「已消费站内记录」账目）；"查不到"与"查失败"如实返回。"""
+        return _safe_reconcile(round_tasks, fetch_json, callback, label,
+                               consumed=consumed_evidence(round_tasks), **options)
+
     state: dict[str, Any] = outcome if outcome is not None else {}
     state.setdefault("uncertain", [])
     state.setdefault("failures", {})
@@ -865,7 +963,7 @@ def _run_reconciled_submission(
             journal_ids.difference_update(unsent)
             _sync_outcome()
 
-    initial = _safe_reconcile(tasks, fetch_json, callback, "下单前站内对账", attempts=1)
+    initial = reconcile(tasks, "下单前站内对账", attempts=1)
     if initial is None:
         stop_event.set()
         state["reconcile_failed"] = True
@@ -886,6 +984,7 @@ def _run_reconciled_submission(
         return initial, True
 
     preconfirmed = set(initial.confirmed)
+    confirmed_tasks.update(initial.confirmed)
     current = list(initial.missing)
     balance_error = ""
     round_no = 0
@@ -926,8 +1025,8 @@ def _run_reconciled_submission(
             and not state.get("journal_error")):
         _emit(callback, "登录态过期，正在重新登录并对账…")
         relogin()
-        after_login = _safe_reconcile(
-            current, fetch_json, callback, "重登后站内对账",
+        after_login = reconcile(
+            current, "重登后站内对账",
             created_after=batch_window_start, attempts=_RECONCILE_POLL_ATTEMPTS)
         if after_login is None:
             stop_event.set()
@@ -942,6 +1041,7 @@ def _run_reconciled_submission(
             return merged, True
         # 重登后对账确认的订单也要计入最终 confirmed，否则 created 数会少算。
         preconfirmed.update(after_login.confirmed)
+        confirmed_tasks.update(after_login.confirmed)
         _resolve_confirmed_uncertain(after_login)
         current = list(after_login.missing)
         allowed = auth_ids | not_sent_ids | failure_ids
@@ -978,8 +1078,8 @@ def _run_reconciled_submission(
         _RECONCILE_POLL_ATTEMPTS
         if not (stop_event.is_set() or balance_error or state.get("journal_error")) else 1
     )
-    final_current = _safe_reconcile(
-        current, fetch_json, callback, "收尾站内对账",
+    final_current = reconcile(
+        current, "收尾站内对账",
         created_after=batch_window_start, attempts=poll_attempts,
         zero_retry_delay=_PREFILTER_ZERO_RETRY_DELAY_S)
     if final_current is None:
@@ -1026,8 +1126,8 @@ def _run_reconciled_submission(
         if identifier not in failure_ids and identifier not in not_sent_ids:
             _emit(callback, f"订单 {identifier} 不属于显式失败/未发送，拒绝重试；仅做只读核对")
             continue
-        before_retry = _safe_reconcile(
-            current, fetch_json, callback, "重试前站内对账",
+        before_retry = reconcile(
+            current, "重试前站内对账",
             created_after=batch_window_start, attempts=_RECONCILE_POLL_ATTEMPTS,
             zero_retry_delay=_PREFILTER_ZERO_RETRY_DELAY_S)
         if before_retry is None:
@@ -1043,6 +1143,7 @@ def _run_reconciled_submission(
             return merged, True
         if identifier not in {str(item.get("identifier")) for item in before_retry.missing}:
             _emit(callback, f"{identifier} 已在站内确认，跳过重试")
+            confirmed_tasks.update(before_retry.confirmed)
             final = _merge_reconciliation(preconfirmed, before_retry)
             _resolve_confirmed_uncertain(final)
             continue
@@ -1056,8 +1157,8 @@ def _run_reconciled_submission(
             stop_event.set()
         if state.get("journal_error"):
             stop_event.set()
-        final_current = _safe_reconcile(
-            current, fetch_json, callback, "重试后站内对账",
+        final_current = reconcile(
+            current, "重试后站内对账",
             created_after=batch_window_start,
             attempts=1 if stop_event.is_set() else _RECONCILE_POLL_ATTEMPTS,
             zero_retry_delay=_PREFILTER_ZERO_RETRY_DELAY_S)
@@ -1072,6 +1173,7 @@ def _run_reconciled_submission(
             merged = _merge_reconciliation(preconfirmed, final_current)
             _record_final(merged, True)
             return merged, True
+        confirmed_tasks.update(final_current.confirmed)
         final = _merge_reconciliation(preconfirmed, final_current)
         _resolve_confirmed_uncertain(final)
         if stop_event.is_set():

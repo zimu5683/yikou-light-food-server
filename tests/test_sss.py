@@ -6,6 +6,7 @@ import re
 
 import pytest
 
+from app.integrations.api_client import SssTransportError
 from app.ordering import sss
 from app.ordering import reconcile as sss_reconcile
 from app.ordering import runner as sss_runner
@@ -2197,3 +2198,180 @@ def test_resolve_submit_min_interval_falls_back_to_paced_default():
 
     assert resolve_submit_min_interval_s(_Empty()) == 2.5
     assert resolve_submit_min_interval_s(_Broken()) == 2.5
+
+
+# ----------------------------------------------------------------------
+# D06：地址门牌数字边界（B10 不得顶替 B1）+ 同栋房号/单元/楼层收紧
+# ----------------------------------------------------------------------
+def test_地址兼容_门牌数字边界不得被吞并():
+    """``…b1`` 是 ``…b10`` 的前缀：包含匹配必须在数字边界处停下（D06）。
+
+    站内 B10 的订单若被当成 B1 任务的完成证据，B1 这一单就被跳过 —— 直接漏下单。
+    入参是 ``_address_combo`` 折叠后的串（去空白、小写）。
+    """
+    compat = sss._addresses_compatible
+    assert compat("b1", "b1") is True
+    # 不同门牌：1–2 位数字扩展（b10/b12/b100）与楼栋号无法区分，判不同址
+    assert compat("浙江省杭州市临安区学府路1号d2", "浙江省杭州市临安区学府路1号d10") is False
+    assert compat("b1", "b10") is False
+    assert compat("b1", "b12") is False
+    assert compat("b1", "b100") is False
+    assert compat("b10", "b1") is False
+    # 纯格式差异仍兼容：省市区前缀、“栋/号”尾缀、同栋异户写法
+    assert compat("浙江省杭州市临安区b1", "b1") is True
+    assert compat("b1栋", "b1") is True
+    assert compat("b1-2", "b1") is True
+
+
+def test_地址兼容_大小写与空白由_address_combo折叠():
+    """大小写/空白不是 ``_addresses_compatible`` 的职责：折叠后才比较（生产路径）。"""
+    record = sss._payload_fingerprint({
+        "receiveName": "张三", "receivePhone": "13800000001",
+        "expectedDeliveryTime": "2026-09-10 11:00:00",
+        "receiveAddress": {"doorNum": " b1 "},
+    })
+    task = sss._payload_fingerprint({
+        "receiveName": "张三", "receivePhone": "13800000001",
+        "expectedDeliveryTime": "2026-09-10 11:00:00",
+        "receiveAddress": {"doorNum": "B1"},
+    })
+    conflict, undecidable = sss._fingerprint_compatibility(record, task)
+    assert conflict is False and undecidable is False
+
+
+def test_地址兼容_同栋房号单元楼层写法视为同址():
+    """同栋内写了房号/单元/楼层：按"已有单"处理，不重复下单（D06 收紧）。
+
+    数字串后紧跟 室/房/间/单元/层、或裸数字串 ≥3 位 → 判同址；
+    1–2 位数字（b10/b12/b100）仍判不同址，保住 D06 本体保护。
+    """
+    compat = sss._addresses_compatible
+    assert compat("b11101室", "b1") is True
+    assert compat("b1-1101室", "b1") is True
+    assert compat("b12单元", "b1") is True
+    assert compat("b13层", "b1") is True
+    assert compat("b11101", "b1") is True           # 裸 4 位 = 房号
+    assert compat("b1101", "b1") is True            # 裸 3 位 = 房号
+    assert compat("b110", "b1") is False            # 2 位与楼栋号无法区分
+    assert compat("b112", "b1") is False
+
+
+def _b10_only_fetch(task_door: str):
+    """站内只有一条 B10 订单的列表查询（门牌在 recipientAddress 整串里）。"""
+    def fetch(path: str):
+        return {"success": True, "result": {"records": [{
+            "receiveName": "张三",
+            "receivePhone": "13800000001",
+            "expectedDeliveryTime": "2026-09-10 11:00:00",
+            "recipientAddress": "浙江省杭州市临安区学府路1号" + task_door.upper(),
+            "status": 2,
+        }], "total": 1}}
+    return fetch
+
+
+def test_对账_站内_b10_记录不得确认_b1_任务():
+    """站内只有 B10 的订单时，B1 的任务必须如实报缺失（不能张冠李戴）。"""
+    task = _task("b1", door="B1")
+    result = sss_reconcile._reconcile_tasks([task], _b10_only_fetch("B10"))
+    assert result.confirmed == set()
+    assert [item["identifier"] for item in result.missing] == ["b1"]
+
+
+def test_对账_站内_b1_记录可以确认_b1_任务():
+    """对照组：门牌一致时照常确认（证明上面的失败来自数字边界而不是别的原因）。"""
+    task = _task("b1", door="B1")
+    result = sss_reconcile._reconcile_tasks([task], _b10_only_fetch("B1"))
+    assert result.confirmed == {"b1"} and result.missing == []
+
+
+# ----------------------------------------------------------------------
+# D09：一条站内记录只能充当一条任务的完成证据（跨轮不得重复使用）
+# ----------------------------------------------------------------------
+def test_同一张站内记录只能确认一条任务(monkeypatch):
+    """两条内容相同的任务、站内只有一条旧记录（无创建时间）时如实报部分完成。
+
+    提交前对账用这条记录确认了第一条；第二条的 POST 明确被拒（确定未建单）；
+    收尾对账**绝不能**拿同一条旧记录再确认第二条 —— 修复前会把只成功 0 单、
+    站内仅 1 单的批次误报成两单全部完成（D09）。
+    """
+    first = _full_task("午餐 第 3 行 张三")
+    second = _full_task("午餐 第 4 行 张三")
+    # 旧记录没有创建时间：收尾对账的批次时间窗无法排除它，只能靠「已消费」账目。
+    record = _full_station_record(first, created_at=None)
+    submits = []
+
+    def fetch(path):
+        return {"success": True, "result": {"records": [dict(record)], "total": 1}}
+
+    def factory():
+        def submit(payload):
+            submits.append(payload)
+            # 业务类明确拒绝（确定未建单）；不是"结果未知"。
+            return {"success": False, "message": "地址无效", "code": 400}
+        return submit, lambda: None
+
+    class Stop:
+        def is_set(self):
+            return False
+
+        def set(self):
+            raise AssertionError("本场景不该停止整批")
+
+    monkeypatch.setattr(sss_reconcile, "_RECONCILE_POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(sss_submission, "_PREFILTER_ZERO_RETRY_DELAY_S", 0)
+    final, reconciled = sss._run_reconciled_submission(
+        [first, second], factory, fetch, Stop(), None, None, max_workers=1)
+
+    assert reconciled is True and final is not None
+    assert final.confirmed == {"午餐 第 3 行 张三"}, "同一条站内记录不能确认两条任务"
+    assert [item["identifier"] for item in final.missing] == ["午餐 第 4 行 张三"]
+    assert len(submits) == 1, "第二条是明确拒绝，不重发"
+
+
+# ----------------------------------------------------------------------
+# D10：重登后的自动补发只收「确定没有建单」的任务
+# ----------------------------------------------------------------------
+def test_重登后不自动补发已发送但结果未知的任务(monkeypatch):
+    """已经发出、结果不可确认（超时/断连）的任务绝不在重登后自动补发。
+
+    对账天生滞后于建单："重登后列表里仍读不到"说明不了它没建单 —— 自动重发
+    会让同一次运行里把已受理的订单再提交一遍（D10）。只有明确 401/未派发/
+    显式失败的任务才走补发；被扣下的未知单只继续走只读对账。
+    """
+    first = _full_task("sent-unknown", door="A101")
+    second = _full_task("auth-expired", door="B202")
+    posts: list[str] = []
+    relogins: list[int] = []
+
+    def fetch(path):
+        return {"success": True, "result": {"records": [], "total": 0}}
+
+    def factory():
+        def submit(payload):
+            door = payload["receiveAddress"]["doorNum"]
+            posts.append(door)
+            if door == "A101":
+                # 请求已发出、读取响应超时：结果未知（绝不可自动重发）。
+                raise SssTransportError("读取响应超时")
+            if posts.count("B202") == 1:
+                # 第一次：登录态失效（确定未建单，允许重登后补发）。
+                return {"success": False, "code": 10000, "message": "token失效，请重新登陆"}
+            return {"success": True}
+        return submit, lambda: None
+
+    class Stop:
+        def is_set(self):
+            return False
+
+        def set(self):
+            raise AssertionError("本场景不该停止整批")
+
+    monkeypatch.setattr(sss_reconcile, "_RECONCILE_POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(sss_submission, "_PREFILTER_ZERO_RETRY_DELAY_S", 0)
+    final, reconciled = sss._run_reconciled_submission(
+        [first, second], factory, fetch, Stop(), None, None, max_workers=1,
+        relogin=lambda: relogins.append(1))
+
+    assert posts == ["A101", "B202", "B202"], f"未知单被自动补发：{posts}"
+    assert relogins == [1], "登录失效应触发一次重登"
+    assert reconciled is True and final is not None

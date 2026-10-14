@@ -465,7 +465,8 @@ def _reconcile_tasks(tasks: list[dict[str, Any]],
                      *, created_after: float | None = None,
                      created_before: float | None = None,
                      prefilter: dict[str, Any] | None = None,
-                     days_margin: int = 0) -> _Reconciliation:
+                     days_margin: int = 0,
+                     consumed: Counter | None = None) -> _Reconciliation:
     """按订单身份对账，兼容列表接口的概要结构。
 
     匹配以「姓名 + 电话 + 预约时间」为核心；站内明确给出、却与任务不一致的
@@ -478,6 +479,14 @@ def _reconcile_tasks(tasks: list[dict[str, Any]],
 
     ``prefilter`` 只是服务端粗筛（参见 ``_build_list_prefilter``），不改变
     任何本地判定标准。
+
+    ``consumed`` 是**已消费站内记录**的账目：``{指纹: 已占用条数}``，表示这些
+    记录已经被别的任务（前几轮对账）当作完成证据用掉了。核对时先从可见条数里
+    扣除，再切分 confirmed/missing —— 一条站内记录只能充当一条任务的完成证据。
+    不扣除时，同一张旧记录会在每一轮对账里被重新数一遍：先确认「午餐 第 3 行
+    张三」、收尾再确认「午餐 第 4 行 张三」，把只成功 0 单、站内仅 1 单的批次
+    误报成两单全部完成（D09）。记录缺 id 时无法证明「这一条」是新证据，按已
+    占用处理：宁可少确认，也不多确认。
     """
     expected = Counter(_task_fingerprint(task) for task in tasks)
     waiting: dict[OrderFingerprint, list[dict[str, Any]]] = {}
@@ -532,12 +541,19 @@ def _reconcile_tasks(tasks: list[dict[str, Any]],
     confirmed: set[str] = set()
     missing: list[dict[str, Any]] = []
     duplicate_count = 0
+    already_used = consumed or Counter()
+    matched_count = 0
     for fingerprint, grouped_tasks in waiting.items():
         on_site = actual[fingerprint]
-        confirmed.update(task["identifier"] for task in grouped_tasks[:min(len(grouped_tasks), on_site)])
-        missing.extend(grouped_tasks[min(len(grouped_tasks), on_site):])
-        duplicate_count += max(0, on_site - len(grouped_tasks))
-    return _Reconciliation(confirmed, missing, duplicate_count, sum(actual.values()))
+        # 跨轮扣除：已经被别的任务用掉的站内记录不再参与本轮匹配，日志里的
+        # 「站内匹配 x/y 单」也随之只统计真正可用的证据（与 confirmed 一致）。
+        available = max(0, on_site - already_used.get(fingerprint, 0))
+        matched_count += available
+        confirmed.update(task["identifier"]
+                         for task in grouped_tasks[:min(len(grouped_tasks), available)])
+        missing.extend(grouped_tasks[min(len(grouped_tasks), available):])
+        duplicate_count += max(0, available - len(grouped_tasks))
+    return _Reconciliation(confirmed, missing, duplicate_count, matched_count)
 
 
 def _reconcile_person_matches(tasks: list[dict[str, Any]],
@@ -619,7 +635,8 @@ def _safe_reconcile(tasks: list[dict[str, Any]],
                     created_after: float | None = None,
                     attempts: int = 1,
                     prefilter: dict[str, Any] | None = None,
-                    zero_retry_delay: float | None = None) -> _Reconciliation | None:
+                    zero_retry_delay: float | None = None,
+                    consumed: Counter | None = None) -> _Reconciliation | None:
     """只读对账；列表延迟时有限轮询，绝不因“暂时查不到”而重发 POST。
 
     ``prefilter`` 非空时用服务端时间窗粗筛，**结论一律由本地严格判定负责**。
@@ -645,7 +662,7 @@ def _safe_reconcile(tasks: list[dict[str, Any]],
     for attempt in range(attempts):
         try:
             reconciliation = _reconcile_tasks(tasks, fetch_json, created_after=created_after,
-                                              prefilter=prefilter)
+                                              prefilter=prefilter, consumed=consumed)
         except Exception as exc:
             last_error = str(exc)
             if attempt + 1 < attempts:
@@ -667,7 +684,8 @@ def _safe_reconcile(tasks: list[dict[str, Any]],
             time.sleep(zero_retry_delay)
             try:
                 reconciliation = _reconcile_tasks(
-                    tasks, fetch_json, created_after=created_after, prefilter=prefilter)
+                    tasks, fetch_json, created_after=created_after,
+                    prefilter=prefilter, consumed=consumed)
             except Exception as exc:
                 last_error = str(exc)
                 reconciliation = None

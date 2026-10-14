@@ -86,6 +86,25 @@ def _validate_payload(payload: Any) -> dict[str, Any]:
                         raise LedgerCorruptError("账本 slots 结构非法")
                     if not slots or any(_to_int(value) is None for value in slots):
                         raise LedgerCorruptError("账本 slots 值非法")
+                # 槽位身份（订单号）：有就必须与 slots 等长，否则按身份配对的
+                # 前提不成立 —— 宁可失败关闭，也不要用错位身份算出错的增量。
+                orders = entry.get("orders")
+                if orders is not None:
+                    if (not isinstance(orders, (list, tuple))
+                            or not all(isinstance(value, str) for value in orders)
+                            or not isinstance(slots, (list, tuple))
+                            or len(orders) != len(slots)):
+                        raise LedgerCorruptError("账本 orders 与 slots 不一致")
+                # 槽位→物理行位置：有就必须与 slots 等长，否则"槽位在云端这个人的
+                # 第几行"这个前提不成立 —— 宁可失败关闭，也不要拿错位的位置配对。
+                positions = entry.get("positions")
+                if positions is not None:
+                    if (not isinstance(positions, (list, tuple))
+                            or not all(_to_int(value) is not None
+                                       for value in positions)
+                            or not isinstance(slots, (list, tuple))
+                            or len(positions) != len(slots)):
+                        raise LedgerCorruptError("账本 positions 与 slots 不一致")
     return payload
 
 
@@ -273,6 +292,47 @@ class SyncLedger:
                 return None if value is None else [value]
         return None
 
+    def synced_orders(self, date_key: str, file_id: str,
+                      name: str, phone: str) -> list[str] | None:
+        """查"某人本批**每个槽位**对应的本地订单号"；没有记录返回 ``None``。
+
+        与 :meth:`synced_slots` 等长（未知身份是空字符串）。旧账本没有这个字段
+        （升级后第一批）→ ``None``：这时只能沿用按行号的位置配对，本批会把
+        订单号补记下来供下一批核对。
+        """
+        entry = self._person_entry(date_key, file_id, name, phone)
+        if entry is None:
+            return None
+        orders = entry.get("orders")
+        if not isinstance(orders, (list, tuple)):
+            return None
+        return [str(value or "") for value in orders]
+
+    def synced_positions(self, date_key: str, file_id: str,
+                         name: str, phone: str) -> list[int] | None:
+        """查"某人每个槽位在云端这个人的**第几行**"；没有记录返回 ``None``。
+
+        与 :meth:`synced_slots` 等长（``0`` = 这一槽位没有对应的云端行）。
+        槽位序是**身份序**（历史写入序），而云端表的物理行序会随补单插入与地址
+        排序变化 —— 补单新行插到既有行上方、或排序把同一人跨地址组重排后，
+        两者不再相等，按数组位置 ``cloud_rows[slot-1]`` 配对就会把增量写到别人的
+        行上（人级合计仍对，执行仍报成功）。位置按"在这个人的行里排第几"记，
+        插行/删行不会让它失效。
+
+        旧账本没有这个字段（升级后第一批）→ ``None``：只能沿用按数组位置配对，
+        本批写入后会把位置补记下来供下一批核对。
+        """
+        entry = self._person_entry(date_key, file_id, name, phone)
+        if entry is None:
+            return None
+        positions = entry.get("positions")
+        if not isinstance(positions, (list, tuple)):
+            return None
+        values = [_to_int(value) for value in positions]
+        if any(value is None for value in values):
+            return None
+        return [int(value) for value in values]
+
     def synced_total(self, date_key: str, file_id: str,
                      name: str, phone: str) -> int | None:
         """查"上次写入后的云端总餐次"（仅审计/排查用；旧版账本没有这个字段）。"""
@@ -287,12 +347,16 @@ class SyncLedger:
         return self.synced_local(date_key, file_id, name, phone)
 
     def record(self, date_key: str, file_id: str,
-               entries: Mapping[str, int | Mapping[str, int]]) -> None:
+               entries: Mapping[str, int | Mapping[str, Any]]) -> None:
         """把本次写入后的状态记进账本（键为 ``姓名\\u0000电话``），并刷新批次时间。
 
-        值可以是 ``{"local": 本地餐次合计, "slots": [每行餐次], "total": 各槽位总餐次之和}``，
-        也可以是单个整数（= 本地餐次合计，兼容旧调用）。``slots`` 是幂等锚点：
-        本地第 i 行对应第 i 个槽位，重复上传时逐个槽位算增量。
+        值可以是 ``{"local": 已同步量合计, "slots": [每槽位已同步量],
+        "orders": [每槽位订单号], "positions": [每槽位在云端这个人的第几行],
+        "total": 槽位总餐次之和}``，也可以是单个整数（= 已同步量合计，兼容旧调用）。
+        ``slots`` 是幂等锚点：本地第 i 行对应第 i 个槽位，重复上传时逐个槽位算
+        增量；``orders`` 是槽位身份，本地行序变化时靠它把槽位与订单对上（D02）；
+        ``positions`` 是槽位的物理位置，云端行序被插入/排序改过时靠它配对
+        （都与 ``slots`` 等长，未知值分别是空字符串与 0）。
         """
         batch = self._batch(date_key, file_id)
         stamp = _dt.datetime.now().isoformat(timespec="microseconds")
@@ -305,6 +369,18 @@ class SyncLedger:
                     clean = [_to_int(item) or 0 for item in slots]
                     payload: dict[str, Any] = {"local": sum(clean), "slots": clean,
                                                "at": stamp}
+                    # 槽位身份：只接受与 slots 等长的列表，长短不一的坏数据
+                    # 宁可不记（校验器会拒绝读），也不要写进账本。
+                    orders = value.get("orders")
+                    if isinstance(orders, (list, tuple)) and len(orders) == len(clean):
+                        payload["orders"] = [str(item or "") for item in orders]
+                    # 槽位→物理位置：同样只接受与 slots 等长、可解析的列表。
+                    positions = value.get("positions")
+                    if (isinstance(positions, (list, tuple))
+                            and len(positions) == len(clean)
+                            and all(_to_int(item) is not None for item in positions)):
+                        payload["positions"] = [int(_to_int(item) or 0)
+                                                for item in positions]
                 else:
                     payload = {"local": _to_int(value.get("local")) or 0, "at": stamp}
                 total = _to_int(value.get("total"))

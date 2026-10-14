@@ -25,6 +25,7 @@ from app.wps.common import (
     format_sort_key,
     person_key,
     probe_sort_area,
+    text_cell_formula,
 )
 from app.wps.atomicio import AtomicWriteError, FileLock, LockTimeout, operation_lock_path_for
 from app.wps.errors import WpsCloudError
@@ -163,12 +164,25 @@ def _change_key(change: Change) -> str:
 
 def _ledger_entries(changes: Sequence[Change], *, only_keys: set[str] | None = None,
                     ledger: SyncLedger | None = None,
-                    date_key: str = "", file_id: str = "") -> dict[str, dict[str, Any]]:
-    """账本条目：每个受影响的人输出**与本地槽位等长**的 slots。
+                    date_key: str = "", file_id: str = "",
+                    slot_rows: Mapping[tuple[str, str], Mapping[int, int]] | None = None
+                    ) -> dict[str, dict[str, Any]]:
+    """账本条目：每个受影响的人输出**与本地槽位等长**的 slots/orders/positions。
 
     WPS-C7：绝不能只把 pending 的槽位 append 进去，否则“第 1 槽已同步、第 2 槽新增”
     时会把旧槽位截断，下一次上传把另一个槽位再全额加一遍。未被本次 pending 的槽位
     沿用旧锚点；本地槽位是权威顺序。
+
+    ``slots`` 记的是每个槽位"本批在云端**已入账**的累计量"：本次有变更的槽位
+    取 ``账本旧值 + 本次实际增量``（负增量被截为 0 时锚点保持不动 —— 云端不
+    扣减，基准也就不许倒退，D04）。``orders`` 是同一槽位的本地订单号，本地行序
+    变化时靠它把槽位与订单身份对上（D02）；未知身份记空字符串。
+
+    ``positions`` 记这个槽位的行**在云端这个人的行里排第几**（本批结束后的
+    物理位置；``0`` = 这一槽位没有对应的云端行）。槽位序是身份序，云端物理行序
+    会被补单插入与地址排序改掉；下一批靠这个位置配对，才不会把增量写到别人的
+    订单那一行上。有变更的槽位用 ``change.row``（执行器按地址组定位后的实际
+    行号），没有变更的槽位用 ``slot_rows`` 里计划算好的预测行号。
     """
     grouped: dict[str, list[Change]] = {}
     for change in changes:
@@ -181,22 +195,80 @@ def _ledger_entries(changes: Sequence[Change], *, only_keys: set[str] | None = N
         name, _separator, phone = key.partition("\u0000")
         old_slots = (ledger.synced_slots(date_key, file_id, name, phone)
                      if ledger is not None else None)
+        old_orders = (ledger.synced_orders(date_key, file_id, name, phone)
+                      if ledger is not None else None)
         by_slot = {int(change.slot): change for change in items}
-        max_slot = max([0, *by_slot, *range(len(old_slots or []))])
+        # 每个槽位本批结束后的物理行号：有变更的以实际行号为准，其余用计划
+        # 预测的行号（既有行按槽位序对应行号升序）。
+        row_of_slot: dict[int, int] = dict(
+            (slot_rows or {}).get(person_key(name, phone), {}) or {})
+        for slot, change in by_slot.items():
+            row_of_slot[slot] = int(change.row or 0)
+        # 位置 = 在这个人的行里排第几：按行号排序后名次就是位置（同一个行号
+        # 只可能属于一个槽位，重复时按槽位序兜底，保证名次互不相同）。
+        ranked = sorted(((slot, row) for slot, row in row_of_slot.items() if row > 0),
+                        key=lambda item: (item[1], item[0]))
+        position_of_slot = {slot: rank for rank, (slot, _row) in enumerate(ranked, 1)}
+        # 槽位是 1-based：旧锚点长度为 N 时覆盖槽位 1..N（用 range(N) 会把
+        # 最后一个旧槽位漏掉，本地行数减少时防重复锚点就丢了 —— D03）。
+        max_slot = max([0, *by_slot, *range(1, len(old_slots or []) + 1),
+                        *range(1, len(old_orders or []) + 1)])
         if max_slot <= 0:
             continue
         slots: list[int] = []
-        for position in range(1, max_slot + 1):
-            change = by_slot.get(position)
+        orders: list[str] = []
+        positions: list[int] = []
+        for slot in range(1, max_slot + 1):
+            change = by_slot.get(slot)
             if change is not None:
-                slots.append(int(change.local_meals))
-            elif old_slots is not None and position <= len(old_slots):
-                slots.append(int(old_slots[position - 1]))
+                slots.append(int(change.ledger_prev or 0)
+                             + (int(change.total_after) - int(change.total_before)))
+                orders.append(str(change.order_no or "").strip())
+            elif old_slots is not None and slot <= len(old_slots):
+                slots.append(int(old_slots[slot - 1]))
+                orders.append(str(old_orders[slot - 1] or "").strip()
+                              if old_orders is not None and slot <= len(old_orders)
+                              else "")
             else:
                 slots.append(0)
+                orders.append("")
+            positions.append(position_of_slot.get(slot, 0))
         total = sum(int(change.total_after) for change in by_slot.values())
-        entries[key] = {"slots": slots, "local": sum(slots), "total": total}
+        entries[key] = {"slots": slots, "orders": orders, "positions": positions,
+                        "local": sum(slots), "total": total}
     return entries
+
+
+def _identity_backfill_keys(plan: SheetPlan,
+                            ledger: SyncLedger | None) -> set[str]:
+    """本批能顺手补上槽位身份（订单号）与物理位置的人（账本键）。
+
+    账本没有 ``orders``（旧版本写的，升级后第一批）时槽位只能按行号配对；
+    没有 ``positions`` 时槽位与云端物理行只能按数组位置硬套。如果只有"真的写了
+    云端"的批次才记账本，那些**没有变更**的批次（noop）就永远补不上这两样，
+    升级窗口会一直开着。所以：只要计划里这些人已经算出了订单号，就把身份与
+    位置补进账本供下一批核对 —— 哪怕这一批一个格子都不用写。
+
+    只读账本（``synced_orders`` 走 ``_person_entry``，不建空批次）。
+    """
+    if ledger is None or not plan.changes:
+        return set()
+    date_key = plan.target_date.isoformat() if plan.target_date else ""
+    grouped: dict[str, list[Change]] = {}
+    for change in plan.changes:
+        grouped.setdefault(_change_key(change), []).append(change)
+    keys: set[str] = set()
+    for key, items in grouped.items():
+        if not any(str(change.order_no or "").strip() for change in items):
+            continue
+        name, _separator, phone = key.partition("\u0000")
+        prev_orders = ledger.synced_orders(date_key, plan.file_id, name, phone)
+        positions = ledger.synced_positions(date_key, plan.file_id, name, phone)
+        if any(str(value or "").strip() for value in (prev_orders or ())) \
+                and positions is not None:
+            continue
+        keys.add(key)
+    return keys
 
 
 def _sort_token(index: int) -> str:
@@ -236,15 +308,32 @@ def _intent_for_change(plan: SheetPlan, change: Change, index: int) -> dict[str,
     }
 
 
+def _plan_slot_rows(plan: SheetPlan) -> dict[tuple[str, str], dict[int, int]]:
+    """计划预测的 {人键: {槽位: 行号}}（账本 positions 的兜底来源）。
+
+    优先用 ``plan.slot_rows``（既有槽位在插入/排序后的预测行号，覆盖"没有变更
+    的槽位"）；手工构造的老计划没有它时退回 ``plan.final_rows``。
+    """
+    if plan.slot_rows:
+        return {key: {int(slot): int(row) for slot, row in rows.items()}
+                for key, rows in plan.slot_rows.items()}
+    return {key: {slot: int(row) for slot, row in enumerate(rows, start=1)}
+            for key, rows in (plan.final_rows or {}).items()}
+
+
 def _build_journal_record(plan: SheetPlan, worksheet_id: int, marker_enabled: bool,
                           ledger: SyncLedger | None) -> dict[str, Any]:
     """把一个 SheetPlan 变成日志记录；记录里的期望值只来自 plan，不猜云端。"""
     pending_seed = [change for change in plan.changes if change.needs_write]
-    affected = {_change_key(change) for change in pending_seed}
+    # 本批要落进账本的键：待写的变更，外加"账本还没记订单号/位置、这次能补上"
+    # 的人（哪怕没有待写的格子也要记 —— 否则升级窗口一直开着，D02）。
+    affected = ({_change_key(change) for change in pending_seed}
+                | _identity_backfill_keys(plan, ledger))
     entries = _ledger_entries(plan.changes, only_keys=affected, ledger=ledger,
                               date_key=(plan.target_date.isoformat()
                                         if plan.target_date else ""),
-                              file_id=plan.file_id)
+                              file_id=plan.file_id,
+                              slot_rows=_plan_slot_rows(plan))
     marker_expected = ""
     if marker_enabled and plan.marker_col and pending_seed:
         marker_expected = str(plan.weekday_number)
@@ -495,12 +584,17 @@ def _precheck_plan_before_write(cli: KdocsCli, plan: SheetPlan,
             problems.append(f"目标表头已变化：第 {plan.target_col} 列现在是「{text}」")
     wanted_rows: list[int] = []
     existing = [c for c in plan.changes if c.kind == "existing" and c.needs_write
-                and c.cloud_before_rows]
+                and (c.cloud_row or c.cloud_before_rows)]
     if existing:
         for change in existing:
-            index = int(change.slot) - 1
-            if 0 <= index < len(change.cloud_before_rows):
-                wanted_rows.append(int(change.cloud_before_rows[index]))
+            row = int(change.cloud_row or 0)
+            if row <= 0:
+                # 旧计划没有 cloud_row 时退回按槽位取"排序前云端行号"
+                index = int(change.slot) - 1
+                if 0 <= index < len(change.cloud_before_rows):
+                    row = int(change.cloud_before_rows[index])
+            if row > 0:
+                wanted_rows.append(row)
         if wanted_rows:
             lo, hi = min(wanted_rows), max(wanted_rows)
             cols = [plan.columns.get("name") or 1, plan.columns.get("phone") or 3]
@@ -510,11 +604,14 @@ def _precheck_plan_before_write(cli: KdocsCli, plan: SheetPlan,
             grid = cli.read_grid(plan.file_id, worksheet_id, lo - 1, hi - 1,
                                  min(cols) - 1, max(cols) - 1)
             for change in existing:
-                index = int(change.slot) - 1
-                if not (0 <= index < len(change.cloud_before_rows)):
+                row = int(change.cloud_row or 0)
+                if row <= 0:
+                    index = int(change.slot) - 1
+                    if 0 <= index < len(change.cloud_before_rows):
+                        row = int(change.cloud_before_rows[index])
+                if row <= 0:
                     problems.append(f"{change.name}：计划缺少排序前云端行号，无法复核旧值")
                     continue
-                row = int(change.cloud_before_rows[index])
                 name = str(grid.get((row - 1, (plan.columns.get("name") or 1) - 1), "")).strip()
                 phone = str(grid.get((row - 1, (plan.columns.get("phone") or 3) - 1), "")).strip()
                 if person_key(name, phone) != person_key(change.name, change.phone):
@@ -676,7 +773,11 @@ def _apply_one_plan(cli: KdocsCli, plan: SheetPlan, worksheet_id: int, *,
         if plan.columns.get("address"):
             base_cells.append({"row": at, "col": plan.columns["address"],
                                "value": change.address})
-        base_cells.append({"row": at, "col": plan.columns["phone"], "value": change.phone})
+        base_cells.append({"row": at, "col": plan.columns["phone"],
+                           # 电话是"值"不是数字：纯数字串按文本写，否则 12 位号码
+                           # 会被平台存成数字、显示成科学计数（2026-10-12 事故）。
+                           # 带空格/连字符/+86 的形态原样写，不做任何清洗。
+                           "value": text_cell_formula(change.phone)})
         if plan.columns.get("type") and change.meal_type:
             base_cells.append({"row": at, "col": plan.columns["type"],
                                "value": change.meal_type})
@@ -824,17 +925,38 @@ def _apply_one_plan(cli: KdocsCli, plan: SheetPlan, worksheet_id: int, *,
             return {"status": "uncertain", "reason": reason, "uncertain": True,
                     "next_action": "manual_reconcile", "problems": []}
         assigned = _assign_change_rows(plan, details, token_rows)
+        address_at: dict[tuple[tuple[str, str], int], str] = {
+            (key, int(row)): address
+            for key, rows in details.items() for row, address in rows}
         missing: list[str] = []
+        mismatched: list[str] = []
         for index, change in enumerate(plan.changes):
             row = assigned.get(index)
             key = person_key(change.name, change.phone)
             if row is None or int(row) not in actual_rows.get(key, []):
                 missing.append(change.name)
+                continue
+            # 地址是"这一行还是原来那一行"的凭据（D01）：同一个人多行、排序后
+            # 按行号硬套时，姓名/餐次可能照样相符，只有地址必然对不上。计划阶段
+            # 记下的云端地址原文与排序后实际读回的地址不一致 → 证明不了写入目标
+            # 的正确性，整表停止写入（宁可让用户重传，也不覆盖别人的行）。
+            wanted = _address_key(change.address_in_sheet)
+            got = _address_key(address_at.get((key, int(row)), ""))
+            if wanted and got and wanted != got:
+                mismatched.append(
+                    f"{change.name} 第 {change.slot} 行（计划时地址「{change.address_in_sheet}」，"
+                    f"第 {row} 行实际是「{address_at.get((key, int(row)), '')}」）")
         if missing:
             reason = f"排序后定位不到这些人：{'、'.join(missing[:5])}"
             emit(f"[云同步] {plan.sheet} {reason}", "ERROR")
             return {"status": "uncertain", "reason": reason, "uncertain": True,
                     "next_action": "manual_reconcile", "problems": []}
+        if mismatched:
+            reason = ("排序后地址核对不通过：" + "；".join(mismatched[:3])
+                      + "。已停止写入本表。表已重排，请重新上传（重复执行安全）")
+            emit(f"[云同步] {plan.sheet} {reason}", "ERROR")
+            return {"status": "uncertain", "reason": reason, "uncertain": True,
+                    "next_action": "manual_reconcile", "problems": mismatched[:10]}
         drift = 0
         for index, change in enumerate(plan.changes):
             change.row = assigned[index]
@@ -1016,6 +1138,17 @@ def _plan_ledger_digests(plans: Sequence[SheetPlan]) -> set[str]:
             if getattr(plan, "ledger_digest", None)}
 
 
+def _ledger_state_fingerprint(ledger: SyncLedger | None) -> str:
+    """账本内存状态指纹（恢复前后比较用；不可序列化时返回空串）。"""
+    if ledger is None:
+        return ""
+    try:
+        import json as _json
+        return _json.dumps(ledger.data, sort_keys=True, ensure_ascii=False)
+    except Exception:  # noqa: BLE001 - 比较用，失败就当"无法判断"（空串）
+        return ""
+
+
 def _operation_lock_target(ledger: SyncLedger | None,
                           journal: SyncJournal | None) -> Any:
     """整次 apply_plan 使用的跨进程 operation 锁路径；没有落盘目标则返回 None。"""
@@ -1101,40 +1234,71 @@ def _refresh_ledger_after_lock(ledger: SyncLedger | None
     return ledger, "", disk_digest
 
 
-def _plan_guard_reason(journal: SyncJournal,
-                      plans: Sequence[SheetPlan]) -> str:
-    """同一目标日期 + 云表是否仍有 retired_guarded 防重复闸门。"""
-    checker = getattr(journal, "has_guard", None)
-    if not callable(checker):
+def _sheet_guard_reason(plan: SheetPlan, journal: SyncJournal,
+                        operation_id: str = "") -> str:
+    """写入前**这张表**的防重复闸门（只读）；返回拒绝原因（空 = 放行）。
+
+    闸门按「同目标日期 + 同云表」设限（见 ``journal.blocking_operations``）：
+    某张表结果未知**只堵它自己**，不阻断其它表的写入（2026-10-12 需求：
+    表间独立上传）。两类拦截：
+
+    1. 还有未处置的同目标写入（``planned``/``writing``/``ledger_pending``/
+       ``uncertain`` 或未知状态）——上一次写这张表的结果没确认，再写可能把
+       同一批餐重复累加；
+    2. ``retired_guarded`` —— 已退出待处理队列，但防重复闸门仍然保留，
+       只有实际云端核对才能解除。
+
+    ``operation_id`` 是本次正在执行的 operation，必须排除 —— 否则它自己刚建出来的
+    ``planned`` 记录会把本批挡在门外（自锁）。
+    """
+    target_key = plan.target_date.isoformat() if plan.target_date else ""
+    if not target_key or not plan.file_id:
         return ""
-    for plan in plans:
-        if not plan.target_date or not plan.file_id:
-            continue
-        try:
-            if checker(plan.target_date.isoformat(), plan.file_id):
-                return ("该目标日期/表的旧任务已人工退出但仍保留防重复闸门；"
-                        "请先人工核对云端并完成恢复确认，不能直接再次上传")
-        except Exception:  # noqa: BLE001 - 查询失败按有闸门处理更安全
-            return ("无法确认该目标日期/表是否仍有防重复闸门；"
-                    "已拒绝写入，请人工核对后重新预览")
-    return ""
+    try:
+        blockers = journal.blocking_operations(target_key, plan.file_id,
+                                               exclude_operation_id=operation_id)
+    except Exception:  # noqa: BLE001 - 查询失败按有闸门处理更安全
+        return ("无法确认该目标日期/表是否仍有防重复闸门；"
+                "已拒绝写入这张表，请人工核对后重新预览")
+    if not blockers:
+        return ""
+    pending_ids = [op_id for op_id, op in blockers.items()
+                   if not (bool(op.get("retired_guarded"))
+                           or str(op.get("status") or "") == "retired_guarded")]
+    if pending_ids:
+        return ("这张表还有未处置的同目标写入（结果未知："
+                + "、".join(sorted(pending_ids))
+                + "）。如果上一次其实写成功了，本次再写会把餐次重复累加 —— "
+                "请先在「云同步恢复」里对旧任务做只读核对并处置后再上传。")
+    return ("这张表还有未解除的防重复闸门（同日期同表的上一次写入结果未知）。"
+            "请先在「云同步恢复」里对旧任务做只读核对并处置后再上传。")
 
 
-def _guarded_result(plans: Sequence[SheetPlan], reason: str, *,
-                    journal_path: str = "") -> dict[str, Any]:
-    operation_id = new_operation_id()
-    count = max(1, len(plans) or 1)
-    return {
-        "status": "uncertain", "uncertain": True, "next_action": "manual_reconcile",
-        "reason": reason, "operation_id": operation_id,
-        "summary": {"written": 0, "failed": count, "uncertain": True,
-                    "sheets": len(plans), "next_action": "manual_reconcile"},
-        "journal_path": journal_path, "recovery": None,
-        "written": 0, "failed": count,
-        "sheets": [{"sheet": plan.sheet, "status": "uncertain",
-                    "reason": reason, "uncertain": True,
-                    "next_action": "manual_reconcile", "problems": []} for plan in plans],
-    }
+def _abort_sheet(plan: SheetPlan, exc: BaseException, *,
+                 journal: SyncJournal | None, operation_id: str,
+                 record_key: str, emit: Callable[[str], Any]) -> dict[str, Any]:
+    """某张表抛了未预期异常：只把这张表记成「结果未知」，整批继续。
+
+    为什么按 ``uncertain`` 而不是 ``failed``：异常可能发生在任何一个云端请求
+    之后，本地无法证明"一个格子都没写"；记错方向的代价不对称 —— 记 uncertain
+    最多多一次人工核对，记 failed 却可能让下一次上传把同一批餐重复累加。
+    因此这里**不回滚也不猜**，交给「云同步恢复」只读核对后处置。
+
+    为什么要有这层兜底：原先执行循环只吞 ``WpsCloudError``，其它异常会跳出逐表
+    循环 —— 一张表（例如它的布局触发了代码里的某个编程错误）出意外，排在它后面
+    的表一张都不会写（2026-10-12 需求：表间独立上传）。
+    """
+    detail = f"{type(exc).__name__}: {exc}"
+    emit(f"[云同步] {plan.sheet} 执行中发生未预期错误，本表记为结果未知；"
+         f"其余表继续（请到「云同步恢复」只读核对本表）：{detail}", "ERROR")
+    if journal is not None:
+        _journal_set(journal, operation_id, record_key, "uncertain", emit=emit,
+                     next_action="manual_reconcile",
+                     reason=f"未预期错误：{detail}", problems=[],
+                     cloud_checked=False, evidence="local_journal")
+    return {"sheet": plan.sheet, "status": "failed", "aborted": True,
+            "reason": f"未预期错误：{detail}", "uncertain": True,
+            "next_action": "manual_reconcile", "problems": []}
 
 
 def _stale_state_result(plans: Sequence[SheetPlan], reason: str, *,
@@ -1280,6 +1444,11 @@ def _apply_plan_impl(cli: KdocsCli, plans: Iterable[SheetPlan], *,
     ``status``、``uncertain``、``next_action``、``operation_id``、``summary``、
     ``journal_path``、``recovery``。任何“可能已写但无法确认”的结果都会
     ``uncertain=true``，每张不确定的表带 ``status="uncertain"`` 与 ``next_action``。
+
+    **表间独立**（2026-10-12 需求）：某张表失败/结果未知**只影响它自己** ——
+    防重复闸门按「同目标日期 + 同云表」设限（``_sheet_guard_reason``），未核清的
+    旧记录只堵那一张表；执行中某张表抛未预期异常也只把它记成结果未知
+    （``_abort_sheet``），后续表照常执行。汇总逐表给出状态，整批结论由逐表状态判定。
     """
     emit = log or (lambda _msg, _level="INFO": None)
     plan_list = list(plans)
@@ -1291,14 +1460,12 @@ def _apply_plan_impl(cli: KdocsCli, plans: Iterable[SheetPlan], *,
         "sheets": [], "written": 0, "failed": 0,
     }
 
-    guard_reason = ""
     try:
         if journal is None:
             ledger_path = getattr(ledger, "path", None) if ledger is not None else None
             journal = (SyncJournal(journal_path_for(ledger_path))
                        if ledger_path else SyncJournal())
         result["journal_path"] = str(journal.path or "")
-        guard_reason = _plan_guard_reason(journal, plan_list)
         pending_ops = journal.pending_operations()
     except Exception as exc:  # noqa: BLE001 - 日志不可读必须失败关闭
         reason = f"意图日志不可读（{exc}）：已拒绝任何云端写入"
@@ -1313,67 +1480,67 @@ def _apply_plan_impl(cli: KdocsCli, plans: Iterable[SheetPlan], *,
                                "next_action": "fix_journal"})
         emit(f"[云同步] {reason}", "ERROR")
         return result
-    if guard_reason:
-        emit(f"[云同步] {guard_reason}", "ERROR")
-        return _guarded_result(plan_list, guard_reason,
-                               journal_path=str(journal.path or ""))
     if pending_ops:
+        # 先尝试自动恢复（能判定的直接判定）。两条分岔：
+        #
+        # * 恢复**核清了**历史操作（recovered/not_started，或合并了账本条目）：
+        #   本次计划是按恢复前的账本/云端状态构建的，继续写可能重复加餐 ——
+        #   保持既有口径"本次未写入，请重新预览后再上传"。
+        # * 恢复后**仍有**未核清记录：不再整体阻断 —— 受影响的那张表由下面的
+        #   逐表闸门挡住，其它表按需求继续执行（表间独立上传）。
+        ledger_before = _ledger_state_fingerprint(ledger)
         try:
             report = recover_pending_operations(cli, journal, ledger=ledger, log=emit)
         except Exception as exc:  # noqa: BLE001 - 恢复失败不能当作没有未完成操作
             reason = f"恢复对账异常：{type(exc).__name__}: {exc}"
-            result.update(status="uncertain", uncertain=True,
-                          next_action="fix_journal", reason=reason,
-                          failed=max(1, len(plan_list) or 1),
-                          sheets=[{"sheet": plan.sheet, "status": "uncertain",
-                                   "reason": reason, "uncertain": True,
-                                   "next_action": "fix_journal", "problems": []}
-                                  for plan in plan_list],
-                          summary={"failed": max(1, len(plan_list) or 1),
-                                   "uncertain": True,
-                                   "next_action": "fix_journal"})
-            emit(f"[云同步] {reason}：已拒绝本次任何云端写入", "ERROR")
-            return result
-        result["recovery"] = report
-        result["operation_id"] = (report["operations"][0]["operation_id"]
-                                  if report.get("operations") else operation_id)
-        sheet_items: list[dict[str, Any]] = []
-        for operation in report.get("operations", []):
-            for sheet in operation.get("sheets", []):
-                sheet_items.append({
-                    "sheet": sheet.get("sheet", ""),
-                    "status": sheet.get("status", "uncertain"),
-                    "reason": sheet.get("reason", ""),
-                    "problems": sheet.get("problems", []),
-                    "next_action": sheet.get("next_action", "manual_reconcile"),
-                    "uncertain": bool(sheet.get("status") == "uncertain"),
-                })
-        result["sheets"] = sheet_items
-        result["written"] = 0
-        result["failed"] = max(1, len(plan_list) or 1)
-        result["uncertain"] = bool(report.get("uncertain"))
-        result["status"] = str(report.get("status") or "uncertain")
-        result["next_action"] = str(report.get("next_action") or "manual_reconcile")
-        if report.get("status") == "recovered":
-            result["reason"] = "已恢复历史完整操作，本次未写入；请重新预览后再上传"
-        elif report.get("status") == "not_started":
-            result["reason"] = "历史操作已确认完全未执行；请重新预览后再上传"
-        elif report.get("status") == "uncertain":
-            result["reason"] = "存在未完成或无法确认的意图日志，已阻断本次写入；请先人工核对云端"
-        result["summary"] = {
-            "written": 0, "failed": result["failed"],
-            "uncertain": result["uncertain"],
-            "next_action": result["next_action"],
-            "recovered": len(report.get("recovered_operation_ids") or []),
-            "not_started": len(report.get("not_started_operation_ids") or []),
-        }
-        if report.get("status") == "uncertain":
-            emit("[云同步] 存在未完成/不确定的意图日志，已阻断本次写入；"
-                 "请先按核对指引人工处理", "ERROR")
+            result["recovery_error"] = reason
+            emit(f"[云同步] {reason}：受影响的那张表会被逐表闸门挡住，"
+                 f"其它表按需求继续", "ERROR")
         else:
-            emit(f"[云同步] 已恢复历史操作：{report.get('status')}；"
-                 f"本次未写入，请重新预览后再上传", "WARN")
-        return result
+            result["recovery"] = report
+            resolved = bool(report.get("recovered_operation_ids")
+                            or report.get("not_started_operation_ids"))
+            ledger_changed = _ledger_state_fingerprint(ledger) != ledger_before
+            if resolved or ledger_changed:
+                result["operation_id"] = (report["operations"][0]["operation_id"]
+                                          if report.get("operations") else operation_id)
+                sheet_items: list[dict[str, Any]] = []
+                for operation in report.get("operations", []):
+                    for sheet in operation.get("sheets", []):
+                        sheet_items.append({
+                            "sheet": sheet.get("sheet", ""),
+                            "status": sheet.get("status", "uncertain"),
+                            "reason": sheet.get("reason", ""),
+                            "problems": sheet.get("problems", []),
+                            "next_action": sheet.get("next_action", "manual_reconcile"),
+                            "uncertain": bool(sheet.get("status") == "uncertain"),
+                        })
+                result["sheets"] = sheet_items
+                result["written"] = 0
+                result["failed"] = max(1, len(plan_list) or 1)
+                result["uncertain"] = bool(report.get("uncertain"))
+                result["status"] = str(report.get("status") or "uncertain")
+                result["next_action"] = str(report.get("next_action")
+                                            or "manual_reconcile")
+                if report.get("status") == "recovered":
+                    result["reason"] = "已恢复历史完整操作，本次未写入；请重新预览后再上传"
+                elif report.get("status") == "not_started":
+                    result["reason"] = "历史操作已确认完全未执行；请重新预览后再上传"
+                elif report.get("status") == "uncertain":
+                    result["reason"] = ("存在未完成或无法确认的意图日志，"
+                                        "已阻断本次写入；请先人工核对云端")
+                result["summary"] = {
+                    "written": 0, "failed": result["failed"],
+                    "uncertain": result["uncertain"],
+                    "next_action": result["next_action"],
+                    "recovered": len(report.get("recovered_operation_ids") or []),
+                    "not_started": len(report.get("not_started_operation_ids") or []),
+                }
+                emit(f"[云同步] 已恢复历史操作：{report.get('status')}；"
+                     f"本次未写入，请重新预览后再上传", "WARN")
+                return result
+            emit("[云同步] 存在未完成/不确定的意图日志：受影响的那张表本次会被"
+                 "闸门挡住，其它表继续上传；请按核对指引人工处理", "ERROR")
 
     pre_items: dict[int, dict[str, Any]] = {}
     runnable: list[tuple[int, SheetPlan, int, str]] = []
@@ -1384,10 +1551,23 @@ def _apply_plan_impl(cli: KdocsCli, plans: Iterable[SheetPlan], *,
                                 "reason": plan.blocked_reason, "uncertain": False,
                                 "next_action": "none", "problems": []}
             continue
-        if not plan.target_col:
+        # 闸门先于"没有目标日期列"检查：这张表有未核清的历史写入时，必须按
+        # 「需要人工核对」报出来，不能被一个 skipped 悄悄盖过（与桌面端
+        # _guard_block_reason 的顺序一致）。
+        guard = _sheet_guard_reason(plan, journal, operation_id)
+        if not plan.target_col and not guard:
             pre_items[index] = {"sheet": plan.sheet, "status": "skipped",
                                 "reason": "未找到目标日期列", "uncertain": False,
                                 "next_action": "none", "problems": []}
+            continue
+        if guard:
+            emit(f"[云同步] {plan.sheet}：拒绝写入 —— {guard}", "ERROR")
+            # 状态用 uncertain 而不是 blocked：``blocked`` 在 Bridge 口径里是
+            # 「本地日志不可用」（fix_journal）；这里这张表的**上一次**写入结果
+            # 未知，属于需要人工只读核对的那一类。
+            pre_items[index] = {"sheet": plan.sheet, "status": "uncertain",
+                                "reason": guard, "uncertain": True,
+                                "next_action": "manual_reconcile", "problems": []}
             continue
         try:
             infos = cli.sheets_info(plan.file_id)
@@ -1426,22 +1606,33 @@ def _apply_plan_impl(cli: KdocsCli, plans: Iterable[SheetPlan], *,
                                     "next_action": "fix_journal", "problems": []}
             result.update(status="uncertain", uncertain=True, next_action="fix_journal")
         else:
-            stop_after_uncertain = False
             for index, plan, worksheet_id, record_key in runnable:
-                if stop_after_uncertain:
-                    pre_items[index] = {
-                        "sheet": plan.sheet, "status": "blocked", "uncertain": True,
-                        "reason": "前一张表结果不确定，已阻断后续云端写入",
-                        "next_action": "manual_reconcile", "problems": []}
-                    continue
-                item = _apply_one_plan(cli, plan, worksheet_id,
-                                       journal=journal, operation_id=operation_id,
-                                       record_key=record_key, ledger=ledger,
-                                       marker_enabled=marker_enabled, emit=emit)
-                if item.get("status") == "ok":
+                # 表间独立：某张表失败/结果未知**只影响它自己**，后续表照常执行；
+                # 连未预期的编程/数据异常也只把该表记成结果未知（见 _abort_sheet）。
+                try:
+                    item = _apply_one_plan(cli, plan, worksheet_id,
+                                           journal=journal, operation_id=operation_id,
+                                           record_key=record_key, ledger=ledger,
+                                           marker_enabled=marker_enabled, emit=emit)
+                except Exception as exc:  # noqa: BLE001 - 兜底见 _abort_sheet 的说明
+                    item = _abort_sheet(plan, exc, journal=journal,
+                                        operation_id=operation_id,
+                                        record_key=record_key, emit=emit)
+                if item.get("status") in ("ok", "noop"):
+                    # noop 也走这里：没有待写格子、但账本缺订单身份/物理位置时，
+                    # 这批要把它们补记进账本（否则升级窗口一直开到下次真正写入）。
                     record = (journal.get_operation(operation_id) or {}).get("sheets", {}).get(record_key, {})
-                    entries = record.get("ledger_entries") or {}
+                    record_entries = record.get("ledger_entries") or {}
                     target_date = str(record.get("target_date") or "")
+                    entries = record_entries
+                    if record_entries and ledger is not None:
+                        # 正式记账用**执行后**的行号重算 positions（executor 已把
+                        # change.row 更新为排序/定位后的实际行）；journal 里那份
+                        # 是写前预测，只给恢复对账用。
+                        entries = _ledger_entries(
+                            plan.changes, only_keys=set(record_entries), ledger=ledger,
+                            date_key=target_date, file_id=plan.file_id,
+                            slot_rows=_plan_slot_rows(plan))
                     if entries and ledger is not None:
                         if not _journal_set(journal, operation_id, record_key,
                                             "ledger_pending", emit=emit,
@@ -1488,6 +1679,11 @@ def _apply_plan_impl(cli: KdocsCli, plans: Iterable[SheetPlan], *,
                                      reason="", problems=[],
                                      cloud_checked=True,
                                      evidence="executor_cloud_readback")
+                elif item.get("status") == "failed" and item.get("aborted"):
+                    # 未预期异常兜底（_abort_sheet）：日志状态已由它自己写成
+                    # uncertain，这里不能再覆盖成 failed_no_write（那会把
+                    # “结果未知”说成“可证明一个格子都没写”）。
+                    pass
                 elif item.get("status") == "failed":
                     _journal_set(journal, operation_id, record_key,
                                  "failed_no_write", emit=emit, next_action="none",
@@ -1495,10 +1691,6 @@ def _apply_plan_impl(cli: KdocsCli, plans: Iterable[SheetPlan], *,
                                  problems=item.get("problems") or [],
                                  cloud_checked=bool(item.get("cloud_checked", False)),
                                  evidence=str(item.get("evidence") or "local_journal"))
-                elif item.get("status") == "noop":
-                    _journal_set(journal, operation_id, record_key,
-                                 "verified", emit=emit, next_action="none",
-                                 reason="", problems=[])
                 else:
                     manual_required = str(item.get("manual_required") or "")
                     _journal_set(journal, operation_id, record_key, "uncertain",
@@ -1510,8 +1702,8 @@ def _apply_plan_impl(cli: KdocsCli, plans: Iterable[SheetPlan], *,
                                  cloud_checked=bool(item.get("cloud_checked", False)),
                                  evidence=str(item.get("evidence") or "local_journal"))
                 pre_items[index] = item
-                if item.get("uncertain"):
-                    stop_after_uncertain = True
+                # 注意：这里**不**因某张表 uncertain 而停掉后续表 ——
+                # 闸门与回滚各自按表设限，后面的表照常执行（表间独立上传）。
 
     # 输出：按原计划顺序保留旧 sheets 结构，并给出顶层状态。
     result_sheets: list[dict[str, Any]] = []

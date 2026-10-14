@@ -246,6 +246,42 @@ def test_read_cloud_meal_keeps_same_person_multiple_rows():
     assert [order["door"] for order in meal.orders] == ["b2", "b2"]
 
 
+def test_read_cloud_meal_reads_beyond_the_single_request_budget():
+    """云端 300 行 × 200 列时也要读全：第 230 行标了 1 的人不能被静默漏掉。
+
+    修复前：单次读取的格数预算只覆盖前 225 行，范围外的当天名单整片消失，
+    既不拒绝也不提示 —— 直接导致漏下单。
+    """
+    class _WideCli(FakeCli):
+        def sheets_info(self, file_id):
+            self.calls.append(f"sheets_info:{file_id}")
+            return [{"sheetId": 1, "sheetName": "Sheet1", "rowTo": 300, "colTo": 199}]
+
+    grid = build_sheet([("张三", "b2", "13800000001", "1")])
+    grid[(229, 3)] = "1"                       # 第 230 行的当天名单（远端）
+    grid[(229, 0)] = "远端客户"
+    grid[(229, 1)] = "b9"
+    grid[(229, 2)] = "13800009999"
+    meal = si.read_cloud_meal(_WideCli({LUNCH_FILE: grid}), file_id=LUNCH_FILE,
+                              table="东湖中餐", meal="午餐", target=TARGET)
+    assert meal.marked_total == 2
+    assert [order["name"] for order in meal.orders] == ["张三", "远端客户"]
+    assert meal.orders[1]["row"] == 230
+
+
+def test_read_cloud_meal_refuses_when_the_sheet_cannot_be_read_in_full():
+    """used range 超过可完整读取上限：按拒单语义拒绝，绝不拿残缺快照当名单。"""
+    class _TooLongCli(FakeCli):
+        def sheets_info(self, file_id):
+            self.calls.append(f"sheets_info:{file_id}")
+            return [{"sheetId": 1, "sheetName": "Sheet1", "rowTo": 500, "colTo": 20}]
+
+    grid = build_sheet([("张三", "b2", "13800000001", "1")])
+    with pytest.raises(si.ImportRefused, match="读不全"):
+        si.read_cloud_meal(_TooLongCli({LUNCH_FILE: grid}), file_id=LUNCH_FILE,
+                           table="东湖中餐", meal="午餐", target=TARGET)
+
+
 def test_collect_day_orders_skips_unconfigured_table():
     config = make_config()
     config.wps_tables = {"东湖中餐": {"file_id": LUNCH_FILE}}

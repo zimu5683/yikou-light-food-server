@@ -157,8 +157,54 @@ def parse_date_header(text: Any) -> tuple[int, int] | None:
     return month, day
 
 
+def cell_value_text(value: Any) -> str:
+    """把云端单元格的**原值**（``originalCellValue``）转成最贴近本地写法的文本。
+
+    * 数字字符串原样保留（``"159678999961"``）；
+    * 浮点整数值去掉多余的 ``.0``（``159678999961.0`` → ``"159678999961"``）；
+    * ``None`` → 空串。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return format(value, ".15g")
+    if isinstance(value, int):
+        return str(value)
+    return str(value).strip()
+
+
+def looks_like_number(text: str) -> bool:
+    """纯数字文本（去掉两侧空白后全为 0-9，且至少一位）。"""
+    return bool(text) and text.isdigit()
+
+
+def text_cell_formula(text: Any) -> str:
+    """写单元格用的"强制文本"公式：纯数字串一律带前置单引号。
+
+    平台的写值操作只有 ``opType=formula`` 一种。直接把纯数字字符串交给它当公式
+    写，12 位号码会被当成数字存起来：回读的原值仍在，但**显示**成科学计数
+    ``1.59679E+11``，协作者看到的就不是客户填的号码（2026-10-12 医学院中餐事故）。
+    前置单引号是电子表格的"按文本存"约定：显示与回读都保持原样，值不变形。
+
+    非数字文本（姓名/地址/餐种，以及带空格/连字符/+86 的电话）原样写，不改写。
+    """
+    raw = "" if text is None else str(text)
+    if looks_like_number(raw.strip()):
+        return "'" + raw
+    return raw
+
+
 def person_key(name: Any, phone: Any) -> tuple[str, str]:
-    """客户匹配键：名字 + 电话（都归一化：去空白、电话去小数点与非数字尾巴）。"""
+    """客户匹配键：名字 + 电话（都归一化：去空白、电话去小数点与非数字尾巴）。
+
+    电话**不做位数校验、不截断、不清洗语义**：空格、连字符、``+86``、前导 0
+    都只丢符号留数字。匹配建立在"值"上 —— 调用方必须先把回读值取成
+    :func:`cell_value_text`（原值），不能拿科学计数法的显示文本当值。
+    """
     n = str(name or "").strip()
     p = str(phone or "").strip()
     if p.endswith(".0"):
@@ -352,9 +398,13 @@ def scan_bounds(info: Mapping[str, Any] | None, *,
                 max_col: int = MAX_SCAN_COL,
                 max_row: int = MAX_SCAN_ROW,
                 budget: int = MAX_READ_CELLS) -> tuple[int, int]:
-    """按接口单次上限，算出安全的读取范围 ``(row_to, col_to)``（0-based 闭区间）。
+    """按接口单次上限，算出安全的**单次**读取范围 ``(row_to, col_to)``（0-based 闭区间）。
 
     先按需取列宽，再据此压缩行数 —— 宽表（排单表有 100+ 个日期列）必须少读行。
+
+    **这只是"这一次请求"的范围，不是整张表的范围**：拿它当整表去数人会静默漏掉
+    后面的行（旧事故：230 行的客户被当成不存在）。要读全请用
+    :func:`scan_region` + :func:`read_grid_chunked`。
     """
     sheet = (info or {}) if isinstance(info, Mapping) else {}
     col_to = min(int(sheet.get("colTo") or 0), max_col)
@@ -363,6 +413,59 @@ def scan_bounds(info: Mapping[str, Any] | None, *,
     if cols > 0:
         row_to = min(row_to, max(0, budget // cols - 1))
     return row_to, col_to
+
+
+def scan_region(info: Mapping[str, Any] | None, *,
+                max_col: int = MAX_SCAN_COL,
+                max_row: int = MAX_SCAN_ROW) -> tuple[int, int, str]:
+    """算出「**整张表**」要读的范围 ``(row_to, col_to, block_reason)``（0-based 闭区间）。
+
+    与 :func:`scan_bounds` 的区别：那个只保证**单次**请求不超格数上限，宽表里会把
+    行数压到「45000 ÷ 列数」行以内 —— 直接拿它当读取范围就是**静默截断**（老客户
+    被读成"不存在" → 名单漏人、同步时被当新客户插重复行）。这里给出按
+    ``MAX_SCAN_ROW``／``MAX_SCAN_COL`` 要读全的范围，配合 :func:`read_grid_chunked`
+    分块读取即可覆盖整张表。
+
+    ``block_reason`` 非空表示**无法证明读全**（used range 超过 ``MAX_SCAN_ROW``）：
+    调用方必须阻断（写侧拒绝写入、读侧按拒绝语义拒单），绝不能拿这份残缺快照
+    判断"当天名单为空 / 这是新客户"。
+    """
+    sheet = (info or {}) if isinstance(info, Mapping) else {}
+    reported_rows = int(sheet.get("rowTo") or 0)
+    col_to = min(int(sheet.get("colTo") or 0), max_col)
+    row_to = min(reported_rows, max_row)
+    if reported_rows > max_row:
+        return row_to, col_to, (
+            f"云端表的 used range 到第 {reported_rows + 1} 行，超过可完整读取的上限 "
+            f"{max_row + 1} 行：读到的只是其中一部分，"
+            f"可能漏掉已存在的客户或当天要送的人。")
+    return row_to, col_to, ""
+
+
+def read_grid_chunked(cli: Any, file_id: str, worksheet_id: int,
+                      row_from: int, row_to: int, col_from: int, col_to: int,
+                      *, with_format: bool = False) -> dict[tuple[int, int], Any]:
+    """按单次格数上限**分块**读取 0-based 闭区间，保证覆盖整个范围。
+
+    单次请求撞 5 万格上限会被接口拒绝；过去靠"压缩读取范围"躲开它，代价是宽表
+    只读到前几行。正确做法是**多读几次**：每块的行数 = ``MAX_READ_CELLS // 列数``。
+    """
+    if row_to < row_from or col_to < col_from:
+        return {}
+    width = col_to - col_from + 1
+    chunk = max(1, MAX_READ_CELLS // max(1, width))
+    grid: dict[tuple[int, int], Any] = {}
+    start = row_from
+    while start <= row_to:
+        end = min(row_to, start + chunk - 1)
+        if with_format:
+            grid.update(cli.read_grid(file_id, worksheet_id, start, end,
+                                      col_from, col_to, with_format=True))
+        else:
+            grid.update(cli.read_grid(file_id, worksheet_id, start, end,
+                                      col_from, col_to))
+        start = end + 1
+    return grid
 
 
 def effective_last_col(reported: int, *,

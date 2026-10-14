@@ -86,6 +86,12 @@ def test_unknown_rejection_is_not_evidence_of_no_order(response):
 
 
 def test_java_failure_keeps_journal_and_never_offers_repost(tmp_path):
+    """平台内部异常：账本记录保留、不提供人工重发入口；本批内自动重试一次不落下。
+
+    2026-10-12 起（对齐桌面端接口模式）：内部异常驳回确定未建单，会在同一批里
+    按提交节流自动重试（最多 3 次尝试）；重试用尽仍按"结果待对账"收尾 ——
+    记录保留、不出现人工重发决策，语义未变。
+    """
     task = _tasks()[0]
     key = sss_uncertain.batch_key("2026-10-08", "excel", "test-account")
     journal = tmp_path / "journal.json"
@@ -109,7 +115,7 @@ def test_java_failure_keeps_journal_and_never_offers_repost(tmp_path):
                       "batch_started_at": time.time()}, outcome=outcome,
     )
 
-    assert len(posts) == 1
+    assert len(posts) == 3, "内部异常驳回按同一单自动重试，共 3 次尝试"
     assert decisions == []
     assert reconciled and final is not None and final.missing == [task]
     assert outcome["uncertain"] == [task["identifier"]]
@@ -355,16 +361,17 @@ def test_technical_error_does_not_enter_auth_repost_path(error):
         sss_submission._post_one(Client(), {})
 
 
-@pytest.mark.parametrize("response", [
-    {"success": False, "code": 10000,
-     "message": "java.lang.Exception: token失效，请重新登陆"},
-    {"success": False, "code": 10000,
-     "message": "java.lang.Error: token失效，请重新登陆"},
-    {"success": False, "code": 500, "message": "token失效，请重新登陆"},
-    {"success": False, "errorCode": 500, "message": "地址无效"},
-    {"success": False, "error_code": 503, "message": "token失效，请重新登陆"},
+@pytest.mark.parametrize("response,expected_posts", [
+    ({"success": False, "code": 10000,
+      "message": "java.lang.Exception: token失效，请重新登陆"}, 3),
+    ({"success": False, "code": 10000,
+      "message": "java.lang.Error: token失效，请重新登陆"}, 3),
+    ({"success": False, "code": 500, "message": "token失效，请重新登陆"}, 1),
+    ({"success": False, "errorCode": 500, "message": "地址无效"}, 1),
+    ({"success": False, "error_code": 503, "message": "token失效，请重新登陆"}, 1),
 ])
-def test_server_failure_never_relogs_or_discards_journal(response, tmp_path):
+def test_server_failure_never_relogs_or_discards_journal(response, expected_posts,
+                                                         tmp_path):
     task = _tasks()[0]
     key = sss_uncertain.batch_key("2026-10-08", "excel", "test-account")
     journal = tmp_path / "journal.json"
@@ -397,7 +404,8 @@ def test_server_failure_never_relogs_or_discards_journal(response, tmp_path):
         )
     finally:
         client.close()
-    assert len(posts) == 1 and relogins == [] and decisions == []
+    # Java 包装的内部异常按平台驳回重试（3 次尝试）；纯服务端错误（5xx）不重试。
+    assert len(posts) == expected_posts and relogins == [] and decisions == []
     assert outcome["uncertain"] == [task["identifier"]]
     pending = sss_uncertain.pending_records(sss_uncertain.load_journal(journal)["records"], key)
     assert len(pending) == 1 and pending[0]["status"] == "unresolved"
@@ -454,7 +462,8 @@ def test_java_internal_error_keeps_interval_fixed_and_never_resends():
     """平台的建单内部异常只代表“结果待对账”，不是受理超速的证据：
 
     返回 IndexOutOfBoundsException 时间隔必须保持配置值、不自动放宽；分类仍是
-    “结果未知”，且每个任务只发一次 POST（绝不自动重发）。
+    “结果未知”。重试只发生在**同一单内**（驳回确定未建单），绝不对已发出、
+    结果未知的任务做跨单补发：每个任务恰好尝试 3 次、无第 4 次。
     """
     tasks = _many_tasks(4)
     starts = []
@@ -470,9 +479,9 @@ def test_java_internal_error_keeps_interval_fixed_and_never_resends():
         tasks, submit, Event(), logs.append, max_workers=4, min_interval_s=0.15)
     gaps = [later - earlier for earlier, later in zip(starts, starts[1:])]
     assert len(result.uncertain) == 4 and not result.succeeded
-    assert len(posts) == 4  # 每个任务恰好一次，内部异常不触发任何补发
+    assert len(posts) == 12  # 4 单 × 3 次尝试：每个任务都在同一单内重试满 3 次
     assert all(gap <= 0.4 for gap in gaps), gaps  # 未被放宽到 0.3 秒以上
-    assert result.attempts == 4 and result.dispatched == {t["identifier"] for t in tasks}
+    assert result.attempts == 12 and result.dispatched == {t["identifier"] for t in tasks}
     assert not any("自动放宽" in message for message in logs)
 
 
@@ -517,3 +526,151 @@ def test_submission_diagnostic_records_the_active_interval():
         encoding="utf-8").splitlines()[-1])
     assert record["min_interval_s"] == 2.5
     assert record["state"] == "success"
+
+
+# ----------------------------------------------------------------------
+# 平台驳回自动重试（对齐桌面端接口模式，2026-10-12）
+# ----------------------------------------------------------------------
+def test_platform_reject_is_retried_within_the_same_order():
+    """平台内部异常驳回（快速驳回，确定未建单）：同一单内自动重试，第 2 次成功。"""
+    tasks = _many_tasks(1)
+    posts: list[dict] = []
+    logs: list[str] = []
+
+    def submit(body):
+        posts.append(body)
+        if len(posts) == 1:
+            return {"success": False, "message": INTERNAL_ERROR}
+        return {"success": True}
+
+    result = sss_submission._submit_tasks_concurrent(
+        tasks, submit, Event(), logs.append, max_workers=1)
+
+    assert result.succeeded == {tasks[0]["identifier"]}
+    assert result.attempts == 2 and len(posts) == 2
+    assert any("平台驳回（第 1/3 次）" in message for message in logs)
+    assert any("重试生效" in message for message in logs)
+
+
+def test_platform_reject_retries_are_capped_at_three_attempts():
+    """驳回重试有上限：1 次首试 + 2 次重试；用尽仍按「技术异常/待对账」收尾。"""
+    tasks = _many_tasks(1)
+    posts: list[dict] = []
+
+    def submit(body):
+        posts.append(body)
+        return {"success": False, "message": INTERNAL_ERROR}
+
+    logs: list[str] = []
+    result = sss_submission._submit_tasks_concurrent(
+        tasks, submit, Event(), logs.append, max_workers=1)
+
+    assert len(posts) == 3, "最多 3 次尝试，绝不无限重试"
+    assert result.attempts == 3 and result.succeeded == set()
+    assert [identifier for identifier, _detail in result.uncertain] == [
+        tasks[0]["identifier"]]
+    # 用尽后仍是保守的「结果待对账」，没有落到"明确失败"分支。
+    assert result.explicit_rejections == 0
+
+
+def test_business_rejection_is_not_retried():
+    """业务类明确拒绝（"地址无效"等）是确定性的：重试只会白打请求。"""
+    tasks = _many_tasks(1)
+    posts: list[dict] = []
+
+    def submit(body):
+        posts.append(body)
+        return {"success": False, "message": "地址无效"}
+
+    result = sss_submission._submit_tasks_concurrent(
+        tasks, submit, Event(), lambda *_a: None, max_workers=1)
+
+    assert len(posts) == 1
+    assert result.explicit_rejections == 1 and len(result.uncertain) == 0
+
+
+def test_unknown_result_is_never_auto_retried():
+    """红线回归锁：超时/断连（结果未知）绝不自动重发，每单只发 1 次 POST。"""
+    tasks = _many_tasks(2)
+    posts: list[dict] = []
+
+    def submit(body):
+        posts.append(body)
+        raise SssTransportError("读取响应超时")
+
+    result = sss_submission._submit_tasks_concurrent(
+        tasks, submit, Event(), lambda *_a: None, max_workers=1)
+
+    assert len(posts) == 2 and result.attempts == 2
+    assert len(result.uncertain) == 2 and result.succeeded == set()
+
+
+def test_missing_success_field_is_never_auto_retried():
+    """响应缺少 success 字段属于"无法确认"：不得当驳回重试。"""
+    tasks = _many_tasks(1)
+    posts: list[dict] = []
+
+    def submit(body):
+        posts.append(body)
+        return {"message": "操作失败"}
+
+    result = sss_submission._submit_tasks_concurrent(
+        tasks, submit, Event(), lambda *_a: None, max_workers=1)
+
+    assert len(posts) == 1 and len(result.uncertain) == 1
+
+
+def test_each_reject_retry_attempt_gets_its_own_diagnostic():
+    """每次尝试各占一个 send_seq、各有一条独立 attempt_id 的诊断记录。"""
+    task = _tasks()[0]
+
+    def submit(body):
+        return {"success": False, "message": INTERNAL_ERROR}
+
+    result = sss_submission._submit_tasks_concurrent(
+        [task], submit, Event(), lambda *_a: None, max_workers=1)
+    assert result.attempts == 3
+    records = [json.loads(line) for line in
+               sss_diagnostics.diagnostic_log_path().read_text(
+                   encoding="utf-8").splitlines()]
+    assert len(records) == 3
+    assert [record["send_seq"] for record in records] == [1, 2, 3]
+    assert len({record["attempt_id"] for record in records}) == 3
+    assert all(record["state"] == "uncertain" for record in records)
+
+
+def test_reject_retry_waits_behind_the_pacer():
+    """重试吃全局提交节流：相邻两次尝试的起点仍按 min_interval 错开。"""
+    tasks = _many_tasks(1)
+    starts: list[float] = []
+
+    def submit(body):
+        starts.append(time.perf_counter())
+        return {"success": False, "message": INTERNAL_ERROR}
+
+    sss_submission._submit_tasks_concurrent(
+        tasks, submit, Event(), lambda *_a: None, max_workers=1,
+        min_interval_s=0.3)
+    assert len(starts) == 3
+    gaps = [later - earlier for earlier, later in zip(starts, starts[1:])]
+    assert all(gap >= 0.25 for gap in gaps), gaps
+
+
+def test_stop_during_retry_wait_keeps_the_sent_conclusion():
+    """重试等待期间被停止：该单**已发出过请求**，保留结论，绝不改记「未发送」。"""
+    tasks = _many_tasks(1)
+    stop = Event()
+    posts: list[dict] = []
+
+    def submit(body):
+        posts.append(body)
+        stop.set()          # 首次驳回后立刻触发停止
+        return {"success": False, "message": INTERNAL_ERROR}
+
+    result = sss_submission._submit_tasks_concurrent(
+        tasks, submit, stop, lambda *_a: None, max_workers=1, min_interval_s=0.2)
+
+    assert len(posts) == 1, "停止后不得继续重试"
+    assert result.not_sent == set(), "已发出过请求的单绝不能记成未发送"
+    assert [identifier for identifier, _detail in result.uncertain] == [
+        tasks[0]["identifier"]]

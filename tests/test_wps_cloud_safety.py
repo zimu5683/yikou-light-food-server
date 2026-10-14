@@ -483,22 +483,67 @@ def test_cloud_failures_never_raise_out_of_apply_plan(tmp_path, kwargs):
     assert isinstance(result["sheets"], list) and result["sheets"][0]["status"] != "ok"
 
 
-def test_unexpected_exception_propagates_out_of_apply_plan(tmp_path):
-    """记录实际分层：``apply_plan`` **只吞 WpsCloudError**，其它意外异常照抛。
+def _two_sheet_plans_with_boom(cli):
+    """两张表的计划 + 只在**第一张表**的第一次写调用上抛未预期异常。"""
+    orders = {
+        "东湖中餐": [CloudOrder("东湖中餐", "新人", "小", "999", "中餐", "经济", 6)],
+        "东湖晚餐": [CloudOrder("东湖晚餐", "新人晚", "小", "888", "晚餐", "经济", 2)],
+    }
+    plans = build_plan(cli, local_orders=orders,
+                       tables={"东湖中餐": {"file_id": "F1"},
+                               "东湖晚餐": {"file_id": "F2"}},
+                       target=dt.date(2026, 9, 11), ledger=None,
+                       address_order={}, sort_enabled=False)
+    real_write = cli.write_cells
+    state = {"calls": 0}
 
-    这不是缺陷 —— 它是纯云端逻辑层，让编程错误暴露出来更好排查；真正的安全边界在
-    上一层 ``Bridge.wps_upload``（见下一条）。写下来免得后人误以为这层也兜底。
+    def boom_once(*args, **kwargs):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise KeyError("坏数据")
+        return real_write(*args, **kwargs)
+
+    cli.write_cells = boom_once  # type: ignore[method-assign]
+    return plans
+
+
+def test_unexpected_exception_is_contained_to_its_own_sheet(tmp_path):
+    """未预期异常（非 WpsCloudError）只把该表记成「结果未知」，整批不再照抛。
+
+    这是 2026-10-12「表间独立上传」需求取代旧约定（意外异常照抛）后的行为：
+    异常可能发生在任一云端请求之后，本地证明不了"一个格子都没写"，因此该表按
+    uncertain 记录、交给「云同步恢复」只读核对 —— 记错方向的代价不对称。
     """
     cli = FakeCli(make_grid(BASE_HEADER, _existing_rows()))
-    plans = _plans(cli)
+    plans = _two_sheet_plans_with_boom(cli)
+    ledger = _ledger(tmp_path)
+    messages: list[str] = []
 
-    def boom(*_a, **_k):
-        raise KeyError("坏数据")
+    result = apply_plan(cli, plans, ledger=ledger, marker_enabled=False,
+                        log=lambda *a, **_k: messages.append(a[0] if a else ""))
 
-    cli.write_cells = boom  # type: ignore[method-assign]
+    by_sheet = {item["sheet"]: item for item in result["sheets"]}
+    assert by_sheet["东湖中餐"]["uncertain"] is True
+    assert by_sheet["东湖中餐"]["next_action"] == "manual_reconcile"
+    assert "未预期错误" in by_sheet["东湖中餐"]["reason"]
+    assert any("未预期错误" in str(m) for m in messages)
 
-    with pytest.raises(KeyError):
-        apply_plan(cli, plans, ledger=None, marker_enabled=False)
+
+def test_unexpected_exception_still_writes_the_following_sheets(tmp_path):
+    """前一张表抛未预期异常后，**后面的表仍然真的写入云端**（表间独立上传）。"""
+    cli = FakeCli(make_grid(BASE_HEADER, _existing_rows()))
+    plans = _two_sheet_plans_with_boom(cli)
+    ledger = _ledger(tmp_path)
+
+    result = apply_plan(cli, plans, ledger=ledger, marker_enabled=False)
+
+    by_sheet = {item["sheet"]: item for item in result["sheets"]}
+    assert by_sheet["东湖晚餐"]["status"] == "ok"
+    # “真的写入”的证据：新人晚这一行的目标日期格（第 5 列，0-based 4）标了 1。
+    rows = {row for (row, col), text in cli.grid.items() if text == "新人晚"}
+    assert rows, "后面的表没有被写入云端"
+    for row in rows:
+        assert cli.grid.get((row, 4)) == "1"
 
 
 def test_wps_upload_without_preview_rejects_before_any_cloud_write(tmp_path):
