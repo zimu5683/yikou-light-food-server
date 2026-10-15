@@ -74,6 +74,15 @@
 - 提交前的本地验证：后端全量 1618 passed、ruff 全绿；前端 `tsc -b` / lint / 变异锚点
   19/19 / 构建通过；浏览器交互检查 287 PASS / 0 FAIL、页面意外报错 0 条。
 
+### 发布产物实下载复核
+
+- 从 Release 直接下载 `yikou-light-food-3.6.24-arm64.apk`：19,859,401 字节，与附件
+  登记的大小一致；
+- `sha256sum` 为 `07aed038392c2b5dfff64e6840a3df729b976cfed5ee15a8d221b7e3d785d952`，
+  与附件 `.apk.sha256` 逐字一致 —— 应用内更新的校验路径拿到的就是这份值；
+- `file` 识别为 Android package；包内抽查到 `classes.dex`、`lib/arm64-v8a/`（含随包
+  分发的 `libkdocs_cli.so`）与 Chaquopy 运行时，不是截断或空壳包。
+
 ## 3.6.23
 
 一次「与桌面端核心修复对齐」的版本：把平行维护的桌面端在 2026-10-12/13（v3.6.6–v3.6.10）
