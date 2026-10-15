@@ -62,6 +62,18 @@
 `README.md`、`docs/ARCHITECTURE.md`、`design/WPS-账本丢失与损坏的兜底.md`（第 7.1 节：
 已实现，且**永远不做自动抢救**）。
 
+### 发布与验证
+
+- 提交 `c30caaa`（功能）+ `205cee7`（版本），标签 `v3.6.24`；
+- CI 三条工作流全部 success：`Android APK`（tag v3.6.24，出包并发布 Release）、
+  `Android APK`（main 分支出包）、`Tests`（main，Python 3.11 / 3.13 矩阵）；
+- Release `v3.6.24` 非草稿、非预发布；产物 `yikou-light-food-3.6.24-arm64.apk`
+  （19,859,401 字节）与对应 `.apk.sha256`（124 字节）都已上传；
+- 应用内更新检查（GitHub `/releases/latest`）已能看到 v3.6.24 与上述两个附件，
+  文件名符合更新器的 APK / sha256 选取规则；
+- 提交前的本地验证：后端全量 1618 passed、ruff 全绿；前端 `tsc -b` / lint / 变异锚点
+  19/19 / 构建通过；浏览器交互检查 287 PASS / 0 FAIL、页面意外报错 0 条。
+
 ## 3.6.23
 
 一次「与桌面端核心修复对齐」的版本：把平行维护的桌面端在 2026-10-12/13（v3.6.6–v3.6.10）
