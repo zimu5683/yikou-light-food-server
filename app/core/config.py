@@ -21,19 +21,21 @@ _CONFIG_SAVE_LOCK = threading.RLock()
 #: （`load()` 会把磁盘上的旧值原样读回来）。因此用这个版本号做**一次性**迁移：
 #: 只把仍等于旧出厂默认的取值搬到新默认，用户显式改过的其它取值（2、6、12、20…）
 #: 一律保留。旧配置缺这个键 → 视为 0（迁移前）。
-DEFAULTS_REVISION = 3
+DEFAULTS_REVISION = 4
 
 #: v0 → v1：下单并发 4 → 8、读取超时 20 → 30 秒。
 #: v1 → v2：下单并发 8 → 4（读取超时 30 秒不变）。
 #: v2 → v3：下单并发 4 → 1（默认串行；读取超时 30 秒不变）。
+#: v3 → v4：下单并发 1 → 4，提交节流 2.5 秒 → 0（关闭节流），回到提速取向。
 #: 并发依据：平台的建单路径存在偶发内部异常（`IndexOutOfBoundsException` 等），
-#: 且失败比例与提交节奏无关——放慢提交并不能减少失败。串行把同时在建的单数压到
-#: 最少、日志更干净，也避免多路失败请求互相穿插；需要并发时把 `sss_max_workers`
-#: 配成 2/4/8 等即可（字段无界面入口，改 config.json 生效，上限 20）。
+#: 且失败比例与提交节奏无关——放慢提交并不能减少失败。因此出厂按并发 4 路、不限速；
+#: 需要串行或另行节流时把 `sss_max_workers` 配成 1、`sss_submit_min_interval_s`
+#: 配成非 0 即可（两个字段都没有界面入口，改 config.json 生效，上限分别 20 / 60）。
 _V1_DEFAULT_SSS_MAX_WORKERS = 8
 _V2_DEFAULT_SSS_MAX_WORKERS = 4
+_V3_DEFAULT_SSS_MAX_WORKERS = 1
 _LEGACY_DEFAULT_SSS_READ_TIMEOUT_S = 20.0
-_DEFAULT_SSS_MAX_WORKERS = 1
+_DEFAULT_SSS_MAX_WORKERS = 4
 _DEFAULT_SSS_READ_TIMEOUT_S = 30.0
 #: 并发路数上限（夹紧用）。失败比例与提交节奏无关（见上），上限保留 20
 #: 供受控实验；放开上限前先看 ``design/SSS-对账提速与并发.md``。
@@ -41,8 +43,9 @@ _SSS_MAX_WORKERS_CEILING = 20
 #: 闪时送建单提交的全局最小间隔（秒）：相邻两次 POST 起点至少间隔该值。
 #: 用途是给平台建单留出固定节奏；间隔**只在运行期按这个配置值生效**，不会因为
 #: 平台返回内部异常（IndexOutOfBoundsException 等）自动放宽——内部异常只代表
-#: “结果待对账”，既不是受理超速的证据，也不代表订单未创建。出厂 2.5 秒；0 = 关闭节流。
-_DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S = 2.5
+#: “结果待对账”，既不是受理超速的证据，也不代表订单未创建。出厂 0（关闭节流）。
+_DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S = 0.0
+_V3_DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S = 2.5
 _SSS_SUBMIT_MIN_INTERVAL_CEILING_S = 60.0
 
 # 本地排单子表 -> 云端排单表（WPS 云文档 file_id）。
@@ -249,10 +252,10 @@ class AppConfig:
     # 门店 id 缓存：按门店名命中后跳过门店列表查询（门店几乎不变）。
     sss_store_id: int | None = None
     sss_store_name_cached: str = ""
-    # 批量下单并发 worker 数（1 = 串行；v3 起出厂 1，需要并发时配成 2/4/8，上限 20）；
+    # 批量下单并发 worker 数（1 = 串行；v4 起出厂 4，需要串行时配成 1，上限 20）；
     # 提交节奏另由下方 sss_submit_min_interval_s 节流。
     sss_max_workers: int = _DEFAULT_SSS_MAX_WORKERS
-    # 建单最小间隔（秒）：相邻两次 POST 起点的全局最小间隔；0 = 关闭节流。
+    # 建单最小间隔（秒）：相邻两次 POST 起点的全局最小间隔；0 = 关闭节流（v4 起出厂值）。
     sss_submit_min_interval_s: float = _DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S
     # 闪时送 API 读取超时（秒）；慢响应不会被误判成失败。3.6.15 起出厂 30。
     sss_read_timeout_s: float = _DEFAULT_SSS_READ_TIMEOUT_S
@@ -379,8 +382,8 @@ class AppConfig:
             submit_interval = _DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S
         if submit_interval != submit_interval:  # NaN
             submit_interval = _DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S
-        # 新字段无需迁移：旧 config.json 没有这个键时，构造默认值（出厂 2.5 秒）
-        # 直接生效；显式写入的 0（关闭节流）会按原值保留。
+        # 旧 config.json 没有这个键时，构造默认值直接生效；显式写入的值按原值保留
+        # （仍在 v3 出厂默认 2.5 上的取值由下方逐代迁移搬到 v4 的 0）。
         self.sss_submit_min_interval_s = max(
             0.0, min(_SSS_SUBMIT_MIN_INTERVAL_CEILING_S, submit_interval))
         try:
@@ -395,7 +398,12 @@ class AppConfig:
                 if self.sss_read_timeout_s == _LEGACY_DEFAULT_SSS_READ_TIMEOUT_S:
                     self.sss_read_timeout_s = _DEFAULT_SSS_READ_TIMEOUT_S
             if revision < 3 and self.sss_max_workers == _V2_DEFAULT_SSS_MAX_WORKERS:
-                self.sss_max_workers = _DEFAULT_SSS_MAX_WORKERS  # v2 出厂值 4 → 1
+                self.sss_max_workers = _V3_DEFAULT_SSS_MAX_WORKERS  # v2 出厂值 4 → 1
+            if revision < 4:
+                if self.sss_max_workers == _V3_DEFAULT_SSS_MAX_WORKERS:
+                    self.sss_max_workers = _DEFAULT_SSS_MAX_WORKERS  # v3 出厂值 1 → 4
+                if self.sss_submit_min_interval_s == _V3_DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S:
+                    self.sss_submit_min_interval_s = _DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S
         self.defaults_revision = DEFAULTS_REVISION
         try:
             self.sss_unit_price = max(0.0, float(sss_unit_price))

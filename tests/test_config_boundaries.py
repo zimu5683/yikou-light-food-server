@@ -107,11 +107,11 @@ def test_order_date_is_also_trimmed():
 # ----------------------------------------------------------------------
 @pytest.mark.parametrize("given,expected", [
     (0, 1), (-5, 1), (1, 1), (4, 4), (20, 20), (99, 20),
-    (None, 1), ("abc", 1), ("7", 7),
+    (None, 4), ("abc", 4), ("7", 7),
 ])
 def test_sss_max_workers_is_clamped(given, expected):
-    # 读不出来时回落到**出厂默认 1（串行）**（v3 起）；显式 2/4/6/12 等原样保留，
-    # 只有「旧配置里等于上一代出厂默认的 8 / 4」才由逐代迁移搬走（见下面的迁移用例）。
+    # 读不出来时回落到**出厂默认 4**（v4 起）；显式 1/2/6/12 等原样保留，
+    # 只有「旧配置里等于上一代出厂默认的 8 / 4 / 1」才由逐代迁移搬走（见下面的迁移用例）。
     assert AppConfig(sss_max_workers=given).sss_max_workers == expected
 
 
@@ -124,32 +124,38 @@ def test_sss_read_timeout_is_clamped(given, expected):
 
 @pytest.mark.parametrize("given,expected", [
     (0, 0.0), (-5, 0.0), (2.5, 2.5), (10, 10.0), (999, 60.0),
-    (None, 2.5), ("abc", 2.5), ("3.5", 3.5),
+    (None, 0.0), ("abc", 0.0), ("3.5", 3.5),
 ])
 def test_sss_submit_min_interval_is_clamped(given, expected):
-    # 出厂 2.5 秒（平台建单受理节奏约 1 单 / 2.1 秒 + 余量）；显式 0 = 关闭节流。
+    # 出厂 0 = 关闭节流（v4 起）；显式写入的 2.5 / 10 等按原值保留，上限 60 秒。
     assert AppConfig(sss_submit_min_interval_s=given).sss_submit_min_interval_s == expected
 
 
 def test_sss_submit_min_interval_nan_falls_back_to_default():
-    assert AppConfig(sss_submit_min_interval_s=float("nan")).sss_submit_min_interval_s == 2.5
+    assert AppConfig(sss_submit_min_interval_s=float("nan")).sss_submit_min_interval_s == 0.0
 
 
-def test_legacy_config_without_the_interval_gets_the_paced_default(tmp_path):
-    """旧 config.json 没有 sss_submit_min_interval_s：加载即按出厂默认 2.5 秒节流。"""
+def test_legacy_config_without_the_interval_gets_the_unthrottled_default(tmp_path):
+    """旧 config.json 没有 sss_submit_min_interval_s：加载即按出厂默认 0（关闭节流）。"""
     path = tmp_path / "config.json"
-    path.write_text(json.dumps({"sss_max_workers": 4,
+    path.write_text(json.dumps({"sss_max_workers": 6,
                                 "defaults_revision": DEFAULTS_REVISION},
                                ensure_ascii=False), encoding="utf-8")
     loaded = AppConfig.load(path)
-    assert loaded.sss_submit_min_interval_s == 2.5
+    assert loaded.sss_submit_min_interval_s == 0.0
     loaded.save()
-    assert AppConfig.load(path).sss_submit_min_interval_s == 2.5
+    assert AppConfig.load(path).sss_submit_min_interval_s == 0.0
 
 
-def test_explicit_zero_interval_survives_a_save_load_roundtrip(tmp_path):
-    """0 = 显式关闭节流，保存后不能被出厂默认覆盖回 2.5。"""
+def test_explicit_interval_survives_a_save_load_roundtrip(tmp_path):
+    """显式节流值保存后不能被出厂默认（0）覆盖，0 也要能往返。"""
     path = tmp_path / "config.json"
+    AppConfig(sss_submit_min_interval_s=3.0).save(path)
+    assert AppConfig.load(path).sss_submit_min_interval_s == 3.0
+    # 已是当前修订版时，用户显式写下的 2.5（= 上一代出厂默认）同样不再被搬走。
+    AppConfig(defaults_revision=DEFAULTS_REVISION,
+              sss_submit_min_interval_s=2.5).save(path)
+    assert AppConfig.load(path).sss_submit_min_interval_s == 2.5
     AppConfig(sss_submit_min_interval_s=0.0).save(path)
     assert AppConfig.load(path).sss_submit_min_interval_s == 0.0
 
@@ -158,23 +164,30 @@ def test_explicit_zero_interval_survives_a_save_load_roundtrip(tmp_path):
 # 出厂默认迁移：v0 → v1（并发 4 → 8、读取超时 20 → 30 秒）
 #           v1 → v2（并发 8 → 4、读取超时 30 秒不变）
 #           v2 → v3（并发 4 → 1，默认串行；读取超时 30 秒不变）
+#           v3 → v4（并发 1 → 4、提交节流 2.5 秒 → 0，回到提速取向）
 # ----------------------------------------------------------------------
 def test_legacy_factory_defaults_are_migrated_once():
     """旧配置里等于旧出厂默认的取值逐代搬；用户显式改过的取值一律不动。"""
-    # v1 时代写下的配置：并发就是那一代的出厂默认 8 → 4 → 1（逐代迁移）。
+    # v1 时代写下的配置：并发就是那一代的出厂默认 8 → 4 → 1 → 4（逐代迁移）。
     migrated = AppConfig(defaults_revision=1, sss_max_workers=8, sss_read_timeout_s=20.0)
-    assert migrated.sss_max_workers == 1
+    assert migrated.sss_max_workers == 4
     assert migrated.sss_read_timeout_s == 30.0
     assert migrated.defaults_revision == DEFAULTS_REVISION
 
-    # v0 的老配置（那一代出厂默认也是 4）：搬成 1，读取超时 20 → 30。
+    # v0 的老配置（那一代出厂默认也是 4）：逐代搬到最后仍是 4，读取超时 20 → 30。
     oldest = AppConfig(defaults_revision=0, sss_max_workers=4, sss_read_timeout_s=20.0)
-    assert oldest.sss_max_workers == 1
+    assert oldest.sss_max_workers == 4
     assert oldest.sss_read_timeout_s == 30.0
 
-    # v2 时代的出厂默认 4 → 1。
+    # v2 时代的出厂默认 4 → 1 → 4。
     v2 = AppConfig(defaults_revision=2, sss_max_workers=4, sss_read_timeout_s=30.0)
-    assert v2.sss_max_workers == 1
+    assert v2.sss_max_workers == 4
+
+    # v3 时代的出厂默认 1 → 4；那一代的节流默认 2.5 秒 → 0。
+    v3 = AppConfig(defaults_revision=3, sss_max_workers=1, sss_read_timeout_s=30.0,
+                   sss_submit_min_interval_s=2.5)
+    assert v3.sss_max_workers == 4
+    assert v3.sss_submit_min_interval_s == 0.0
 
     kept = AppConfig(defaults_revision=1, sss_max_workers=2, sss_read_timeout_s=45.0)
     assert kept.sss_max_workers == 2
@@ -183,6 +196,13 @@ def test_legacy_factory_defaults_are_migrated_once():
     # v2 时代用户显式改成 8：不属于任何一代出厂默认，原样保留。
     explicit = AppConfig(defaults_revision=2, sss_max_workers=8, sss_read_timeout_s=30.0)
     assert explicit.sss_max_workers == 8
+
+    # v3 时代用户显式改成 1 路串行 + 10 秒节流：那个 1 与出厂默认重合，会被搬走；
+    # 但显式写下的 10 秒节流不属于任何一代出厂默认，必须原样保留。
+    throttled = AppConfig(defaults_revision=3, sss_max_workers=1,
+                          sss_submit_min_interval_s=10.0)
+    assert throttled.sss_max_workers == 4
+    assert throttled.sss_submit_min_interval_s == 10.0
 
 
 def test_current_revision_never_rewrites_explicit_values():
@@ -200,12 +220,12 @@ def test_load_migrates_an_old_file_without_the_revision_key(tmp_path):
                                ensure_ascii=False), encoding="utf-8")
 
     loaded = AppConfig.load(path)
-    assert loaded.sss_max_workers == 1
+    assert loaded.sss_max_workers == 4
     assert loaded.sss_read_timeout_s == 30.0
     assert loaded.defaults_revision == DEFAULTS_REVISION
 
     loaded.save()
-    assert AppConfig.load(path).sss_max_workers == 1
+    assert AppConfig.load(path).sss_max_workers == 4
 
 
 def test_explicit_transport_values_survive_a_save_load_roundtrip(tmp_path):

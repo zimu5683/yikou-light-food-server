@@ -66,10 +66,10 @@ from app.ordering.workbook import (
     load_sss_orders,
 )
 
-#: 配置对象缺 ``sss_max_workers`` 字段（或取值无法解析）时的保守回退：串行。
+#: 配置对象缺 ``sss_max_workers`` 字段（或取值无法解析）时的回退：与出厂默认一致。
 #: 正常路径上 ``AppConfig`` 始终带该字段（默认 4 路），因此这条只保护传了残缺
-#: config 的调用方——宁可慢，也不要在拿不准并发语义时同时发多个非幂等 POST。
-_FALLBACK_SSS_CREATE_WORKERS = 1
+#: config 的调用方。
+_FALLBACK_SSS_CREATE_WORKERS = 4
 
 
 def resolve_create_workers(config: Any) -> int:
@@ -92,8 +92,8 @@ def resolve_submit_min_interval_s(config: Any) -> float:
     （``IndexOutOfBoundsException`` 等）既不是“受理超速”的证据，也不能被当成
     “没有落单”，因此不据此自动放宽或收紧（当晚实测已推翻“受理上限约 1 单 /
     2.1 秒”的推断，见 docs/SSS-下单失败与重试排查.md 的修正段）。拿不到配置
-    （缺字段或取值不可解析）时按出厂默认（2.5 秒）保守节流——它只错开发送起点、
-    把快速失败的兜圈速度限制在可预期范围内，不改变结果分类与重发语义。
+    （缺字段或取值不可解析）时按出厂默认（0，关闭节流）——节流只错开发送起点，
+    不改变结果分类与重发语义。
     """
     try:
         interval = float(getattr(config, "sss_submit_min_interval_s",
@@ -316,7 +316,7 @@ def run_sss_job(config: Any, stop_event: Any,
     common_address = str(getattr(config, "sss_common_address", "") or "")
     use_fixed_address = bool(getattr(config, "sss_use_fixed_address", False))
     goods_name = str(getattr(config, "sss_product_name", "") or "轻食")
-    # 出厂并发 1（v3 起，串行）；旧配置里等于历史出厂默认的 8 / 4 由 AppConfig 的
+    # 出厂并发 4（v4 起）；旧配置里等于历史出厂默认的 8 / 4 / 1 由 AppConfig 的
     # 逐代迁移搬过来，用户显式改过的其它取值原样生效。
     max_workers = resolve_create_workers(config)
     submit_min_interval_s = resolve_submit_min_interval_s(config)

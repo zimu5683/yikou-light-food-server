@@ -2153,8 +2153,8 @@ def test_resolve_create_workers_takes_the_config_value_clamped():
     assert resolve_create_workers(_Config("6")) == 6
 
 
-def test_resolve_create_workers_falls_back_to_serial_for_broken_config():
-    """残缺 config（缺字段/取值不可解析）→ 串行：拿不准就先别并发发非幂等 POST。"""
+def test_resolve_create_workers_falls_back_to_factory_default_for_broken_config():
+    """残缺 config（缺字段/取值不可解析）→ 回落到出厂并发（4 路）。"""
     from app.ordering.runner import resolve_create_workers
 
     class _Empty:
@@ -2163,8 +2163,8 @@ def test_resolve_create_workers_falls_back_to_serial_for_broken_config():
     class _Broken:
         sss_max_workers = "abc"
 
-    assert resolve_create_workers(_Empty()) == 1
-    assert resolve_create_workers(_Broken()) == 1
+    assert resolve_create_workers(_Empty()) == 4
+    assert resolve_create_workers(_Broken()) == 4
 
 
 # ----------------------------------------------------------------------
@@ -2177,7 +2177,7 @@ def test_resolve_submit_min_interval_takes_the_config_value_clamped():
         def __init__(self, interval):
             self.sss_submit_min_interval_s = interval
 
-    # 出厂默认 2.5 秒；0 = 显式关闭节流；上限 60（与 AppConfig 的夹紧同口径）。
+    # 出厂默认 0（关闭节流）；显式 2.5 / 3 秒按原值保留；上限 60（与 AppConfig 同口径）。
     assert resolve_submit_min_interval_s(_Config(2.5)) == 2.5
     assert resolve_submit_min_interval_s(_Config(0)) == 0.0
     assert resolve_submit_min_interval_s(_Config(3)) == 3.0
@@ -2186,8 +2186,8 @@ def test_resolve_submit_min_interval_takes_the_config_value_clamped():
     assert resolve_submit_min_interval_s(_Config("4.5")) == 4.5
 
 
-def test_resolve_submit_min_interval_falls_back_to_paced_default():
-    """残缺 config（缺字段/取值不可解析）→ 按出厂默认 2.5 秒保守节流。"""
+def test_resolve_submit_min_interval_falls_back_to_unthrottled_default():
+    """残缺 config（缺字段/取值不可解析）→ 按出厂默认 0（关闭节流）。"""
     from app.ordering.runner import resolve_submit_min_interval_s
 
     class _Empty:
@@ -2196,8 +2196,8 @@ def test_resolve_submit_min_interval_falls_back_to_paced_default():
     class _Broken:
         sss_submit_min_interval_s = "abc"
 
-    assert resolve_submit_min_interval_s(_Empty()) == 2.5
-    assert resolve_submit_min_interval_s(_Broken()) == 2.5
+    assert resolve_submit_min_interval_s(_Empty()) == 0.0
+    assert resolve_submit_min_interval_s(_Broken()) == 0.0
 
 
 # ----------------------------------------------------------------------

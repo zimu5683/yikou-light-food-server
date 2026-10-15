@@ -251,7 +251,7 @@ _SEND_MARKER_LEGEND = ("✔ 成功响应；✖ 技术异常/结果待对账；�
 class _SubmitPacer:
     """提交节流：令相邻两次 POST 的起点至少间隔配置的 ``interval`` 秒。
 
-    间隔**只来自配置**（``sss_submit_min_interval_s``，出厂 2.5 秒，0 = 关闭节流），
+    间隔**只来自配置**（``sss_submit_min_interval_s``，出厂 0 = 关闭节流），
     运行期不因任何响应特征自动放宽或收紧：平台的建单内部异常（如
     ``IndexOutOfBoundsException``）只代表“结果待对账”，既不是受理超速的证据，
     也不能被当成“没有落单”，节奏因此只由配置固定。节流只错开发送起点，不改变
