@@ -179,5 +179,6 @@ cd frontend && pnpm install && pnpm build
 ## 数据与安全
 
 配置、失败快照保存在用户配置目录（Android：App 私有目录；Termux/Linux：`$XDG_CONFIG_HOME`
-下的 `yikou-light-food`），Excel 只在用户选择的位置读写，运行前会创建 `backups/` 时间戳备份。请不要把真实 Excel、日志、密码或浏览器
-缓存提交到 Git。
+下的 `yikou-light-food`），Excel 只在用户选择的位置读写（**不再自动创建 `backups/`
+副本**：写表走原子替换，中止/失败时不落地任何修改，原文件保持未修改）。请不要把真实
+Excel、日志、密码或浏览器缓存提交到 Git。

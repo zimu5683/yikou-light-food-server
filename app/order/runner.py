@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import datetime as _dt
 
-import shutil
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -113,14 +112,10 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
     historical_mode = selected_date < today
     if password is None:
         password = getattr(config, "password", "")
-    # Validate aliases before backing up or touching the workbook.
+    # Validate aliases before touching the workbook.
     user_aliases = load_aliases()
     _emit(progress_callback,
           f"地址别名：{aliases_path()}（用户 {len(user_aliases)} 条，内置 {len(DEFAULT_ALIASES)} 条）")
-    backup_dir = excel_path.parent / "backups"
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    shutil.copy2(excel_path, backup_dir / f"{excel_path.stem}_{stamp}{excel_path.suffix}")
     # Preserve embedded VBA when the user explicitly selects an .xlsm file.
     wb = _load_order_workbook(excel_path)
     processed = 0

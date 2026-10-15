@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import datetime as _dt
 import re
-import shutil
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple
 
@@ -195,19 +194,6 @@ def write_order_row(sheet: Any, order: OrderInfo | Mapping[str, Any], meal: Meal
         if f"{col}{row}" not in merged_ranges:
             sheet[f"{col}{row}"] = value
     return row
-
-
-def backup_excel(path: str | Path, backup_dir: str | Path | None = None) -> Path:
-    """把排单表复制一份到 ``backups/``（带时间戳）；源文件不存在时抛 ``FileNotFoundError``。返回备份文件路径。"""
-    source = Path(path)
-    if not source.exists():
-        raise FileNotFoundError(source)
-    folder = Path(backup_dir) if backup_dir else source.parent / "backups"
-    folder.mkdir(parents=True, exist_ok=True)
-    stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    target = folder / f"{source.stem}_{stamp}{source.suffix}"
-    shutil.copy2(source, target)
-    return target
 
 
 def save_excel_with_retry(workbook: Any, excel_path: str | Path, retries: int = 1) -> bool:

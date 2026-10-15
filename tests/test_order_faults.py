@@ -121,8 +121,8 @@ def test_clear_failure_aborts_without_saving_polluted_workbook(tmp_path, monkeyp
     assert result["summary"]["failed"] == 1
     assert "原文件未被修改" in result["next_action"]
     assert saves == []
-    backups = list((tmp_path / "backups").glob("排单_*.xlsx"))
-    assert backups, "清表失败中止前也应保留原文件备份"
+    # 不再复制 backups/ 时间戳备份；原文件保持不动靠的是「中止时不保存」。
+    assert not (tmp_path / "backups").exists()
     wb = load_workbook(excel)
     ws = wb["东湖中餐"]
     assert [ws["A3"].value, ws["C3"].value] == ["OLD", "原数据"]
@@ -313,10 +313,13 @@ def test_run_job_partial_fetch_failure_writes_success_and_reports_partial(tmp_pa
     assert result["failed_orders"] == ["W1"]
     assert result["summary"]["confirmed"] == 1
     assert result["summary"]["unconfirmed"] == 1
+    # 真正写进表里了（下面那条「没有 backups/」才不是空断言）……
     wb = load_workbook(excel)
     values = [cell.value for ws in wb.worksheets for row in ws.iter_rows() for cell in row]
     wb.close()
     assert "W2" in values and "W1" not in values
+    # ……而全程不再复制 backups/ 时间戳备份。
+    assert not (tmp_path / "backups").exists()
 
 
 def test_run_job_all_details_failed_preserves_original(tmp_path, monkeypatch):
