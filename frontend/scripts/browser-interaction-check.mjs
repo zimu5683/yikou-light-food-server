@@ -2135,18 +2135,18 @@ async function main() {
     record('恢复查询被 403 拒绝后不反复请求', forbiddenDelta === 1, `delta=${forbiddenDelta}`)
     mock.wpsRecoveryForbidden = false
 
-    // 只读查询到没有明细的 pending 时只显示安全提示，不打开输入、不自动提交
+    // 服务端返回了 pending 项、但 request 明细为空：不打开任何输入、不自动提交。
     mock.pendingItems = [{
       interaction_id: 'x1', operation_id: 'op-x', kind: 'order_retry', status: 'pending',
-      created_at: 1, expires_at: Date.now() / 1000 + 300, request: {}, request_redacted: true,
+      created_at: 1, expires_at: Date.now() / 1000 + 300, request: {},
     }]
     mock.resolveDecisionCalls = 0
     await cdp.send('Page.reload', { ignoreCache: true })
     await cdp.waitFor(`document.body && document.body.innerText.includes('任务工作台')`)
-    await cdp.waitFor(`document.body.innerText.includes('未返回明细')`)
-    const redactedState = await cdp.eval(`({ dialogs: document.querySelectorAll('[role="alertdialog"]').length, text: document.body.innerText })`)
-    record('pending 脱敏只显示元数据提示，不打开输入', redactedState.dialogs === 0 && redactedState.text.includes('未返回明细') && redactedState.text.includes('不会自动提交'), JSON.stringify({ dialogs: redactedState.dialogs }))
-    record('pending 脱敏不自动提交', mock.resolveDecisionCalls === 0, `resolveCalls=${mock.resolveDecisionCalls}`)
+    await new Promise((r) => setTimeout(r, 800))
+    const emptyRequestState = await cdp.eval(`({ dialogs: document.querySelectorAll('[role="alertdialog"]').length, text: document.body.innerText })`)
+    record('pending 明细为空时不打开输入', emptyRequestState.dialogs === 0, JSON.stringify({ dialogs: emptyRequestState.dialogs }))
+    record('pending 明细为空时不自动提交', mock.resolveDecisionCalls === 0, `resolveCalls=${mock.resolveDecisionCalls}`)
     mock.pendingItems = []
 
     // ---------- 5b. W6：计划口径 vs 已核实完成 ----------
@@ -4253,28 +4253,28 @@ async function main() {
       JSON.stringify(chromeShown?.status),
     )
 
-    // 9.3 失败原因横幅（真实渲染：未返回明细的待处理交互）不被遮挡
+    // 9.3 失败原因横幅（真实渲染：本地留有交互元数据、服务端查不到该项）不被遮挡
     enterScenario('9b 提示不遮失败原因横幅')
-    mock.pendingItems = [{
-      interaction_id: 'notice-r1', operation_id: 'op-notice', kind: 'captcha', status: 'pending',
-      created_at: 1, expires_at: Date.now() / 1000 + 300, request: {}, request_redacted: true,
-    }]
+    mock.pendingItems = []
     await cdp.viewport(390, 844)
+    // 会话里留一条交互元数据、服务端却查不到它 → 渲染「需要重新核对」横幅。
+    await cdp.eval(`sessionStorage.setItem('yikou.pending-interaction.v1', JSON.stringify({kind:'captcha', id:'notice-r1', operationId:'op-notice', updatedAt: Date.now()}))`)
     await reloadApp(cdp)
     assert.ok(
-      await cdp.waitFor(`document.body.innerText.includes('未返回明细')`, 6000),
-      '失败原因横幅（脱敏待处理）未出现',
+      await cdp.waitFor(`document.body.innerText.includes('需要重新核对')`, 6000),
+      '失败原因横幅（交互元数据待核对）未出现',
     )
     await toastThenCloseLog()
     const bannerNotice = await cdp.eval(noticeRegionProbeJs)
     const bannerChrome = await cdp.eval(phoneChromeProbeJs)
     record(
       '提示不遮失败原因横幅（不相交 + 横幅文案仍在 + 中心命中横幅自身）',
-      bannerChrome?.banner?.found === true && bannerChrome.banner.text.includes('未返回明细')
+      bannerChrome?.banner?.found === true && bannerChrome.banner.text.includes('需要重新核对')
         && overlaps(bannerNotice?.rect, bannerChrome.banner.rect) === false
         && bannerChrome.banner.hitSelf === true,
       JSON.stringify({ banner: bannerChrome?.banner, region: bannerNotice?.rect }),
     )
+    await cdp.eval(`sessionStorage.removeItem('yikou.pending-interaction.v1')`)
     mock.pendingItems = []
 
     // 9.4 日志层内的待处理输入（待确认地址）不被遮挡：提示区域不会盖住它

@@ -122,7 +122,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [pendingRecoveryMeta, setPendingRecoveryMeta] = useState<PendingInteractionMeta | null>(
     () => readPendingInteractionMeta(readSessionStorage()),
   )
-  const [redactedPendingCount, setRedactedPendingCount] = useState(0)
   const logId = useRef(0)
   const operationRef = useRef('')
   const localInteractionIdsRef = useRef({ decision: '', captcha: '', address: '' })
@@ -190,7 +189,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
       const items = dedupePendingInteractions(
         Array.isArray(result.interactions) ? result.interactions : [],
       )
-      setRedactedPendingCount(items.filter((item) => item.request_redacted).length)
       if (items.length === 0) return false
 
       const currentIds = localInteractionIdsRef.current
@@ -368,7 +366,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
           setCaptcha(null)
           setAddressInput(null)
           clearPendingRecovery()
-          setRedactedPendingCount(0)
           setLastTaskMessage(payload.message)
           void refreshOperation()
           if (outcome.toast === 'success') toast.success(outcome.message)
@@ -390,7 +387,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
           setCaptcha(null)
           setAddressInput(null)
           clearPendingRecovery()
-          setRedactedPendingCount(0)
           setLastTaskMessage(payload.message)
           // R6-9：blocked_concurrent 是「另一个任务正在运行」，本次没发任何请求；
           // 必须按 WARN 展示，不能写成任务失败，也不需要站内对账。
@@ -858,7 +854,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
       dismissRequestIssue,
       pendingRecoveryMeta,
       dismissPendingRecovery,
-      redactedPendingCount,
       reconnect,
     }),
     [ready, mocked, transport, authError, hasValidToken, version, status, platform,
@@ -868,7 +863,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       updateProgress, updatePermissionRequired, updateError, installUpdate, cancelUpdate,
       openInstallSettings, openExternal, requestClose, setSplitRatio, clearLogs,
       resolveDecision, resolveCaptcha, resolveAddressInput, requestIssues, dismissRequestIssue,
-      pendingRecoveryMeta, dismissPendingRecovery, redactedPendingCount, reconnect],
+      pendingRecoveryMeta, dismissPendingRecovery, reconnect],
   )
 
   const updateAvailableValue = useMemo(

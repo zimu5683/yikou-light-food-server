@@ -240,23 +240,8 @@ export default function App() {
 function PendingInteractionRecoveryBanner() {
   const {
     decision, captcha, addressInput, pendingRecoveryMeta, dismissPendingRecovery,
-    redactedPendingCount, connection, recovery, operationActive, reconnect, stopTask,
+    connection, recovery, operationActive, reconnect, stopTask,
   } = useApp()
-  if (redactedPendingCount > 0 && !decision && !captcha && !addressInput) {
-    return (
-      <div role="status" className="shrink-0 border-b border-warning/50 bg-warning/10 px-3 py-2 sm:px-4">
-        <div className="flex items-start gap-2">
-          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-warning" />
-          <div className="min-w-0 flex-1">
-            <p className="text-xs font-medium text-foreground">有 {redactedPendingCount} 个待处理交互未返回明细</p>
-            <p className="mt-0.5 break-words text-[11px] text-muted-foreground">
-              服务端只给了元数据，这里打不开验证码/地址/决策输入，也不会自动提交；请等待任务自行结束或到任务所在设备处理。
-            </p>
-          </div>
-        </div>
-      </div>
-    )
-  }
   if (decision || captcha || addressInput || !pendingRecoveryMeta) return null
   const view = interactionRecoveryView({
     hasLocalRequest: false,

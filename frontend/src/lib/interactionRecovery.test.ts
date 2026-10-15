@@ -157,10 +157,10 @@ test('pending_interactions 不可用/无权限/过期结果是安全降级，不
   assert.match(view.detail, /已解决|过期|取消|无权限|不会自动提交/)
 })
 
-test('request_redacted 的空 request 不会被拿来伪造恢复输入', () => {
+test('空 request 不会被拿来伪造恢复输入', () => {
   const item = {
     interaction_id: 'x1', operation_id: 'op-x', kind: 'address_input', status: 'pending' as const,
-    created_at: 1, expires_at: 2, request: {}, request_redacted: true,
+    created_at: 1, expires_at: 2, request: {},
   }
   assert.equal(decisionFromPendingItem(item), null)
   assert.equal(captchaFromPendingItem(item), null)

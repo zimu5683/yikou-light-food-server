@@ -118,8 +118,6 @@ export interface AppStateBundle {
    */
   pendingRecoveryMeta: PendingInteractionMeta | null
   dismissPendingRecovery: () => void
-  /** 管理员只读查询到「属于其他账号」的 pending 交互数量；只能看元数据，不能打开输入。 */
-  redactedPendingCount: number
   /** 主动重新查询 bridge_ready/operation_status；失败时保持可核对状态。 */
   reconnect: () => Promise<boolean>
 }

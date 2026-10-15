@@ -446,8 +446,6 @@ export interface PendingInteractionItem {
   expires_at: number
   status: 'pending'
   request: Record<string, unknown>
-  /** 管理员非 owner 时 request 被脱敏为空；不要尝试用空 request 恢复客户输入。 */
-  request_redacted?: boolean
 }
 
 export interface PendingInteractionsResult {
