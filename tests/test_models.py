@@ -164,7 +164,7 @@ def test_bridge_save_order_config_preserves_sss_side(tmp_path):
     from app.api.bridge import Bridge
 
     path = tmp_path / "config.json"
-    bridge = Bridge(config_path=str(path), is_admin=True)
+    bridge = Bridge(config_path=str(path))
     bridge._config.sss_account = "keep-sss"
     bridge._config.sss_fixed_lnt = 119.7
     bridge._config.save()
@@ -190,7 +190,7 @@ def test_bridge_save_sss_config_preserves_order_side(tmp_path):
     from app.api.bridge import Bridge
 
     path = tmp_path / "config.json"
-    bridge = Bridge(config_path=str(path), is_admin=True)
+    bridge = Bridge(config_path=str(path))
     bridge._config.order_date = "2026-09-07"
     bridge._config.order_count = 3
     bridge._config.target_url = "https://order.example.com"
@@ -215,7 +215,7 @@ def test_bridge_save_sss_config_preserves_order_side(tmp_path):
 def test_bridge_reports_stopped_sss_task_as_reconciled(tmp_path, monkeypatch):
     import app.api.bridge as bridge_mod
 
-    bridge = bridge_mod.Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = bridge_mod.Bridge(config_path=str(tmp_path / "config.json"))
     captured = {}
     monkeypatch.setattr(bridge_mod, "run_sss_job", lambda *args, **kwargs: {
         "processed": 3, "created": 2, "stopped": True, "reconciled": True,
@@ -229,7 +229,7 @@ def test_bridge_reports_stopped_sss_task_as_reconciled(tmp_path, monkeypatch):
 def test_bridge_reports_partial_sss_task_without_success_state(tmp_path, monkeypatch):
     import app.api.bridge as bridge_mod
 
-    bridge = bridge_mod.Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = bridge_mod.Bridge(config_path=str(tmp_path / "config.json"))
     monkeypatch.setattr(bridge_mod, "run_sss_job", lambda *args, **kwargs: {
         "processed": 3, "created": 2, "stopped": False,
         "partial": True, "reconciled": True,
@@ -249,7 +249,7 @@ def test_bridge_start_sss_preserves_store_cache_written_by_worker(tmp_path, monk
     path = tmp_path / "config.json"
     workbook = tmp_path / "闪时送.xlsx"
     workbook.touch()
-    bridge = Bridge(config_path=str(path), is_admin=True)
+    bridge = Bridge(config_path=str(path))
     # 模拟 worker 使用配置快照查询到门店后，通过 callback 回写常驻配置。
     bridge._remember_sss_store_cache("一口轻食", 211053)
     monkeypatch.setattr(bridge, "_launch", lambda *args: None)
@@ -339,7 +339,7 @@ def test_config_save_uses_atomic_backup(tmp_path):
 def test_bridge_reports_reconciliation_failure_as_uncertain(tmp_path, monkeypatch):
     import app.api.bridge as bridge_mod
 
-    bridge = bridge_mod.Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = bridge_mod.Bridge(config_path=str(tmp_path / "config.json"))
     monkeypatch.setattr(bridge_mod, "run_sss_job", lambda *args, **kwargs: {
         "processed": 2, "created": 0, "stopped": False,
         "partial": False, "reconciled": False, "uncertain": True,

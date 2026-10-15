@@ -236,11 +236,11 @@ test('W3：确认失败保留阻断，不显示成功', () => {
   }
 })
 
-test('W3：权限不足提示准确且保持阻断', () => {
+test('W3：服务端 403 拒绝时提示准确且保持阻断', () => {
   const view = recoveryResolveView(resolveResult({ ok: false, status: 'forbidden', code: 'forbidden', changed: false }))
   assert.equal(view.ok, false)
   assert.equal(view.tone, 'warning')
-  assert.match(view.title, /当前账号没有该权限/)
+  assert.match(view.title, /被服务端拒绝/)
   assert.equal(view.blockingRetained, true)
 })
 

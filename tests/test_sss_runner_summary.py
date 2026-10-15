@@ -503,7 +503,7 @@ def test_end_to_end_runner_counts_reach_bridge_message_and_operation_summary(
 
     from app.api.bridge import Bridge
 
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     reservation = bridge._operations.try_reserve("sss")
     assert reservation.granted
     bridge._task_operation_id = reservation.operation.operation_id

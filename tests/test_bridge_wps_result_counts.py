@@ -56,7 +56,7 @@ def _plan() -> SheetPlan:
 def counts_env(tmp_path, monkeypatch):
     excel = tmp_path / "排单.xlsx"
     excel.write_bytes(b"v1")
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     bridge._config.excel_path = excel
     bridge._config.wps_enabled = True
     bridge._config.wps_marker_enabled = False

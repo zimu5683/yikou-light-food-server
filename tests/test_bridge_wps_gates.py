@@ -25,7 +25,7 @@ class _Cli:
 
 
 def _bridge(tmp_path) -> Bridge:
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     return bridge
 
 

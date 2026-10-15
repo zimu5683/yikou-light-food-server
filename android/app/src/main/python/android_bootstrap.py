@@ -204,7 +204,6 @@ def _import_business_modules() -> str:
         "app.ordering.sss",
         "app.ordering.cloud_import",
         "app.wps.sync",
-        "app.web.auth",
         "app.web.server",
     )
     for module in modules:

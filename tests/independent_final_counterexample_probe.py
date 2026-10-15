@@ -277,23 +277,19 @@ def probe_recovery_status_name_leak() -> bool:
             markers = ("张三", "13800000001", "总餐次应为", "SECRET_FILE",
                        "东湖中餐", "学3-101", td)
             leaks: list[str] = []
-            for is_admin in (False, True):
-                bridge = Bridge(config_path=str(Path(td) / "config.json"),
-                                is_admin=is_admin)
-                bridge.set_request_identity("admin" if is_admin else "bob")
-                got = bridge.wps_recovery_status()
-                if not got.get("ok"):
-                    leaks.append(f"authorized_query_rejected(admin={is_admin})")
-                    continue
-                if is_admin and not isinstance(got.get("operations"), list):
-                    leaks.append("admin_query_missing_operations")
+            bridge = Bridge(config_path=str(Path(td) / "config.json"))
+            got = bridge.wps_recovery_status()
+            if not got.get("ok"):
+                leaks.append("authorized_query_rejected")
+            else:
+                if not isinstance(got.get("operations"), list):
+                    leaks.append("query_missing_operations")
                 text = json.dumps(got, ensure_ascii=False)
                 hits = [marker for marker in markers if marker in text]
                 if hits:
-                    leaks.append(f"admin={is_admin}:markers={hits}")
-                scope = got.get("scope")
-                print(f"[probe] recovery query admin={is_admin} ok=true "
-                      f"scope={scope} leaks={hits}")
+                    leaks.append(f"markers={hits}")
+                print(f"[probe] recovery query ok=true scope={got.get('scope')} "
+                      f"leaks={hits}")
             return bool(leaks)
         finally:
             if old is None:
@@ -314,9 +310,7 @@ def probe_recovery_exception_leak() -> bool:
                 json.dumps({"version": 1, "batches": {}}), encoding="utf-8")
             Path(td, "wps_sync_state.json.journal").write_text(
                 "{not-json 张三 13800000001 总餐次应为9", encoding="utf-8")
-            bridge = Bridge(config_path=str(Path(td) / "config.json"),
-                            is_admin=False)
-            bridge.set_request_identity("bob")
+            bridge = Bridge(config_path=str(Path(td) / "config.json"))
             got = bridge.wps_recovery_status()
             text = json.dumps(got, ensure_ascii=False)
             hits = [marker for marker in
@@ -370,8 +364,7 @@ def probe_legal_order_and_authorized_recovery_not_disabled() -> bool:
                       "reason": "", "next_action": "none"},
             }, target_date="2026-09-20")
             journal.save()
-            bridge = Bridge(config_path=str(Path(td) / "config.json"),
-                            is_admin=True)
+            bridge = Bridge(config_path=str(Path(td) / "config.json"))
             got = bridge.wps_recovery_status()
             if not got.get("ok"):
                 defects.append("authorized_recovery_rejected")

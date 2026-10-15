@@ -171,7 +171,7 @@ def _write_local(excel, target: _dt.date, *, name: str, phone: str, meals: int,
 @pytest.fixture
 def wps_e2e(tmp_path, monkeypatch):
     """生产接线的离线复刻：真实 build_plan/apply_plan + 临时账本 + 合成云表。"""
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     target = target_date_for(start_hour=bridge._config.wps_target_hour_start,
                              end_hour=bridge._config.wps_target_hour_end)
 

@@ -14,7 +14,7 @@ from app.wps.errors import LedgerCorruptError
 
 
 def _bridge(tmp_path) -> Bridge:
-    return Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    return Bridge(config_path=str(tmp_path / "config.json"))
 
 
 RAW_LEAK_MARKERS = ("张三", "13800000000", "浙江农林大学", "豪华餐",
@@ -61,33 +61,7 @@ def _assert_no_leak(payload) -> None:
         assert marker not in text, f"响应泄漏敏感标记：{marker}\n{text}"
 
 
-def test_wps_recovery_status_non_admin_gets_whitelisted_safe_summary(
-        tmp_path, monkeypatch):
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=False)
-    monkeypatch.setattr(
-        bridge_module, "_wps_recovery_status_contract",
-        lambda ledger: _raw_leaky_recovery_result())
-    monkeypatch.setattr(
-        bridge_module, "SyncLedger",
-        lambda *a, **k: types.SimpleNamespace(
-            path=tmp_path / "ledger.json",
-            journal_path=tmp_path / "ledger.json.journal"))
-
-    got = bridge.wps_recovery_status()
-
-    _assert_no_leak(got)
-    assert got["ok"] is True
-    assert got["scope"] == "summary"
-    assert "operations" not in got
-    assert "pending_operations" not in got
-    assert got["counts"]["uncertain"] == 1
-    assert "future_unknown_count" not in got["counts"]
-    assert got["next_action"] == "manual_reconcile"
-    assert got["summary"]["needs_review"] is True
-    assert "只读核对" in got["summary"]["guidance"]
-
-
-def test_wps_recovery_status_admin_gets_only_whitelisted_safe_dto(
+def test_wps_recovery_status_gets_only_whitelisted_safe_dto(
         tmp_path, monkeypatch):
     bridge = _bridge(tmp_path)
     monkeypatch.setattr(
@@ -105,6 +79,10 @@ def test_wps_recovery_status_admin_gets_only_whitelisted_safe_dto(
     assert got["scope"] == "admin"
     assert "future_secret" not in got
     assert "journal_path" not in got
+    assert got["counts"]["uncertain"] == 1
+    assert "future_unknown_count" not in got["counts"]
+    assert got["summary"]["needs_review"] is True
+    assert "只读核对" in got["summary"]["guidance"]
     assert "pending_operations" in got
     operation = got["operations"][0]
     assert operation["operation_id"] == ""       # 非白名单格式必须置空
@@ -124,32 +102,27 @@ def test_wps_recovery_status_admin_gets_only_whitelisted_safe_dto(
     }
 
 
-def test_wps_recovery_status_failure_hides_exception_text_for_all_viewers(
+def test_wps_recovery_status_failure_hides_exception_text(
         tmp_path, monkeypatch):
-    for is_admin in (False, True):
-        bridge = Bridge(config_path=str(tmp_path / f"config-{is_admin}.json"),
-                        is_admin=is_admin)
-        monkeypatch.setattr(
-            bridge_module, "SyncLedger",
-            lambda *a, **k: types.SimpleNamespace(
-                path=tmp_path / "ledger.json",
-                journal_path=tmp_path / "ledger.json.journal"))
+    bridge = _bridge(tmp_path)
+    monkeypatch.setattr(
+        bridge_module, "SyncLedger",
+        lambda *a, **k: types.SimpleNamespace(
+            path=tmp_path / "ledger.json",
+            journal_path=tmp_path / "ledger.json.journal"))
 
-        def boom(_ledger):
-            raise RuntimeError("异常原文 SENSITIVE_FUTURE_FIELD 张三 13800000000")
+    def boom(_ledger):
+        raise RuntimeError("异常原文 SENSITIVE_FUTURE_FIELD 张三 13800000000")
 
-        monkeypatch.setattr(bridge_module, "_wps_recovery_status_contract", boom)
-        got = bridge.wps_recovery_status()
+    monkeypatch.setattr(bridge_module, "_wps_recovery_status_contract", boom)
+    got = bridge.wps_recovery_status()
 
-        _assert_no_leak(got)
-        assert got["ok"] is False
-        assert got["error_code"] == "wps_recovery_internal_error"
-        assert got["next_action"] == "fix_journal"
-        assert "reason" not in got
-        if not is_admin:
-            assert "operations" not in got
-        else:
-            assert got["operations"] == []
+    _assert_no_leak(got)
+    assert got["ok"] is False
+    assert got["error_code"] == "wps_recovery_internal_error"
+    assert got["next_action"] == "fix_journal"
+    assert "reason" not in got
+    assert got["operations"] == []
 
 
 def test_wps_recovery_status_corrupt_ledger_is_safe_failure(tmp_path, monkeypatch):
@@ -191,38 +164,32 @@ def test_wps_recovery_status_contract_failure_shape_is_safe(tmp_path, monkeypatc
     assert got["scope"] == "admin"
 
 
-def test_pending_admin_non_owner_gets_redacted_request_without_leaks(tmp_path):
+def test_pending_decision_request_drops_unknown_fields(tmp_path):
     bridge = _bridge(tmp_path)
-    bridge._task_owner = "alice"
-    bridge._task_owner_is_admin = False
     interaction_id, _entry = bridge._register_interaction(
         "decision", request={
-            "title": "请选择 张三 13800000000",
-            "message": "浙江农林大学 豪华餐 总餐次应为 9",
-            "choices": [{"value": "a", "label": "张三 13800000000"}],
+            "title": "请选择",
+            "message": "请选择一个地址",
+            "choices": [{"value": "a", "label": "东湖校区"}],
             "nested_secret": {"future": "SENSITIVE_FUTURE_FIELD"},
         })
-    bridge._task_owner = ""
-    try:
-        bridge.set_request_is_admin(True)
-        bridge.set_request_identity("root-admin")
-        got = bridge.pending_interactions()
-    finally:
-        bridge.set_request_is_admin(None)
-        bridge.set_request_identity(None)
+
+    got = bridge.pending_interactions()
 
     assert got["count"] == 1
     item = got["interactions"][0]
     assert item["interaction_id"] == interaction_id
-    assert item["request"] == {}
-    assert item.get("request_redacted") is True
-    _assert_no_leak(got)
+    assert item["request"] == {
+        "title": "请选择",
+        "message": "请选择一个地址",
+        "choices": [{"value": "a", "label": "东湖校区", "style": ""}],
+    }
+    assert "nested_secret" not in item["request"]
+    assert "SENSITIVE_FUTURE_FIELD" not in json.dumps(got, ensure_ascii=False)
 
 
 def test_pending_owner_gets_only_whitelisted_request_fields(tmp_path):
     bridge = _bridge(tmp_path)
-    bridge._task_owner = "alice"
-    bridge._task_owner_is_admin = False
     interaction_id, _entry = bridge._register_interaction(
         "address_input", request={
             "title": "地址待确认",
@@ -238,14 +205,8 @@ def test_pending_owner_gets_only_whitelisted_request_fields(tmp_path):
             }],
             "future_top": "SENSITIVE_FUTURE_FIELD",
         })
-    bridge._task_owner = ""
-    try:
-        bridge.set_request_is_admin(False)
-        bridge.set_request_identity("alice")
-        got = bridge.pending_interactions()
-    finally:
-        bridge.set_request_is_admin(None)
-        bridge.set_request_identity(None)
+
+    got = bridge.pending_interactions()
 
     item = got["interactions"][0]
     assert item["interaction_id"] == interaction_id
@@ -261,88 +222,47 @@ def test_pending_owner_gets_only_whitelisted_request_fields(tmp_path):
     assert "SECRET-PW" not in json.dumps(got, ensure_ascii=False)
 
 
-def test_pending_interactions_admin_sees_all_but_filters_secrets(tmp_path):
+def test_pending_interactions_filters_secrets_and_is_read_only(tmp_path):
     bridge = _bridge(tmp_path)
-    bridge._task_owner = "alice"
-    bridge._task_owner_is_admin = False
-    bridge._task_operation_id = "op-owner-1"
+    bridge._task_operation_id = "op-1"
     interaction_id, entry = bridge._register_interaction(
         "decision", request={
             "title": "需要选择", "message": "请选择一个地址",
             "choices": [{"value": "a", "label": "A"}],
             "password": "SECRET-PW", "token": "SECRET-TOKEN",
         })
-    bridge._task_owner = ""
     bridge._task_operation_id = ""
 
-    try:
-        got = bridge.pending_interactions()
-    finally:
-        bridge.set_request_is_admin(None)
-        bridge.set_request_identity(None)
+    got = bridge.pending_interactions()
 
     assert got["ok"] is True
     assert got["count"] == 1
     item = got["interactions"][0]
     assert item["interaction_id"] == interaction_id
-    assert item["operation_id"] == "op-owner-1"
+    assert item["operation_id"] == "op-1"
     assert item["status"] == "pending"
     assert item["kind"] == "decision"
-    assert item["request"] == {}
-    assert item.get("request_redacted") is True
+    assert "SECRET-PW" not in json.dumps(got, ensure_ascii=False)
+    assert "SECRET-TOKEN" not in json.dumps(got, ensure_ascii=False)
     # 只读：没有消费、唤醒或修改 holder。
     assert not entry.event.is_set()
     assert entry.holder == []
     assert interaction_id in bridge._decisions
 
 
-def test_pending_interactions_non_owner_cannot_see_or_resolve(tmp_path):
-    bridge = _bridge(tmp_path)
-    bridge._task_owner = "alice"
-    bridge._task_owner_is_admin = False
-    interaction_id, entry = bridge._register_interaction(
-        "decision", request={"title": "t", "message": "m", "choices": []})
-    bridge._task_owner = ""
-
-    try:
-        bridge.set_request_is_admin(False)
-        bridge.set_request_identity("bob")
-        hidden = bridge.pending_interactions()
-        denied = bridge.resolve_decision(interaction_id, "retry")
-
-        bridge.set_request_identity("alice")
-        visible = bridge.pending_interactions()
-    finally:
-        bridge.set_request_is_admin(None)
-        bridge.set_request_identity(None)
-
-    assert hidden["interactions"] == []
-    assert denied["ok"] is False
-    assert denied["status"] == "forbidden"
-    assert denied["reason"] == "interaction_not_owned_by_caller"
-    assert [item["interaction_id"] for item in visible["interactions"]] == [
-        interaction_id]
-    assert not entry.event.is_set()
-
-
 def test_pending_interactions_can_filter_by_operation_id(tmp_path):
     bridge = _bridge(tmp_path)
-    bridge._task_owner = "alice"
     bridge._task_operation_id = "op-a"
     a_id, _a_entry = bridge._register_interaction(
         "decision", request={"title": "A", "message": "a", "choices": []})
     bridge._task_operation_id = "op-b"
     b_id, _b_entry = bridge._register_interaction(
         "decision", request={"title": "B", "message": "b", "choices": []})
-    bridge._task_owner = ""
     bridge._task_operation_id = ""
-    try:
-        bridge.set_request_is_admin(True)
-        only_a = bridge.pending_interactions("op-a")
-        only_b = bridge.pending_interactions("op-b")
-        unknown = bridge.pending_interactions("op-missing")
-    finally:
-        bridge.set_request_is_admin(None)
+
+    only_a = bridge.pending_interactions("op-a")
+    only_b = bridge.pending_interactions("op-b")
+    unknown = bridge.pending_interactions("op-missing")
 
     assert [item["interaction_id"] for item in only_a["interactions"]] == [a_id]
     assert [item["interaction_id"] for item in only_b["interactions"]] == [b_id]
@@ -352,35 +272,27 @@ def test_pending_interactions_can_filter_by_operation_id(tmp_path):
 def test_pending_interactions_query_is_repeatable_and_expired_items_are_hidden(
         tmp_path):
     bridge = _bridge(tmp_path)
-    bridge._task_owner = "alice"
     interaction_id, entry = bridge._register_interaction(
         "decision", request={"title": "t", "message": "m", "choices": []})
-    bridge._task_owner = ""
-    try:
-        bridge.set_request_is_admin(True)
-        first = bridge.pending_interactions()
-        second = bridge.pending_interactions()
-        assert first["count"] == 1 and second["count"] == 1
-        assert not entry.event.is_set()
+    first = bridge.pending_interactions()
+    second = bridge.pending_interactions()
+    assert first["count"] == 1 and second["count"] == 1
+    assert not entry.event.is_set()
 
-        entry.expires_at = time.time() - 1
-        assert bridge.pending_interactions()["interactions"] == []
-        # 过期后 resolve 必须明确拒绝，不得激活。
-        expired = bridge.resolve_decision(interaction_id, "retry")
-        assert expired["ok"] is False
-        assert expired["status"] == "expired"
-    finally:
-        bridge.set_request_is_admin(None)
+    entry.expires_at = time.time() - 1
+    assert bridge.pending_interactions()["interactions"] == []
+    # 过期后 resolve 必须明确拒绝，不得激活。
+    expired = bridge.resolve_decision(interaction_id, "retry")
+    assert expired["ok"] is False
+    assert expired["status"] == "expired"
 
 
 def test_resolve_duplicate_and_stop_race_are_explicit(tmp_path):
     bridge = _bridge(tmp_path)
-    bridge._task_owner = "alice"
     first_id, first_entry = bridge._register_interaction(
         "decision", request={"title": "t", "message": "m", "choices": []})
     second_id, _second_entry = bridge._register_interaction(
         "decision", request={"title": "t2", "message": "m2", "choices": []})
-    bridge._task_owner = ""
 
     first = bridge.resolve_decision(first_id, "retry")
     duplicate = bridge.resolve_decision(first_id, "skip")

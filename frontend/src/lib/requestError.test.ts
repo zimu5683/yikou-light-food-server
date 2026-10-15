@@ -17,8 +17,8 @@ test('超时与断网分类为可重试，且不把整批任务失败当成网�
   assert.match(classifyRequestError(new TypeError('Failed to fetch')).title, /网络已断开/)
 })
 
-test('toRequestError 保留状态码与不可重试权限错误', () => {
-  const e = new RequestError('permission', '仅管理员')
+test('toRequestError 保留状态码与不可重试的 403', () => {
+  const e = new RequestError('permission', '服务端拒绝了本次请求')
   assert.equal(toRequestError(e).retryable, false)
   assert.equal(toRequestError(new RequestError('client', 'bad'), 400).status, 400)
   assert.match(classifyRequestError({ status: 404 }).nextStep, /字段提示/)

@@ -132,7 +132,7 @@ def test_download_asset_can_be_cancelled(monkeypatch, tmp_path):
 
 
 def _bridge(tmp_path) -> Bridge:
-    return Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    return Bridge(config_path=str(tmp_path / "config.json"))
 
 
 def test_install_update_rejects_non_android(tmp_path, monkeypatch):

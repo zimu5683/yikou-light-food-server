@@ -6,6 +6,14 @@
 - 只描述**已实现且已验证**的行为；证据命令见文末第 10 节。
 - 权威实现：`app/api/bridge.py`、`app/web/server.py`（R6 之前的优化记录未随仓库保留）。
 
+> **2026-10-15 修正（只影响权限，字段契约与「铁律」不变）**：整套账号体系已删除，
+> 本文件里凡是提到「普通用户 / 管理员 / 会话 Cookie / `login_required` / `admin_only` /
+> `scope="summary"`」的表述都只反映当时的历史状态。现在只有**访问令牌**一种凭据：
+> 除 `/healthz` 外所有路径都要求 `X-Yikou-Token` 或 `?token=`；经网关（带
+> `CF-Connecting-IP` / `X-Forwarded-*`）的请求一律 403 `remote_denied`；
+> `wps_recovery_status` 恒定返回 `scope="admin"` 的白名单 DTO（无管理员门槛，
+> 字段白名单不变）。
+
 ---
 
 ## 1. 调用约定与权限
@@ -442,8 +450,8 @@ python3 -m pytest -q tests/test_bridge_wps_result_counts.py
 # R6-9 blocked_concurrent 映射
 python3 -m pytest -q tests/test_bridge_task_results.py
 
-# HTTP 权限（普通用户 403 / 管理员恢复入口）
-python3 -m pytest -q tests/test_web_roles.py
+# HTTP 权限（令牌闸门 / 经网关的请求一律 403）
+python3 -m pytest -q tests/test_web_server.py
 
 # 全量（本轮实测 1348 passed, exit 0）
 python3 -m pytest -q

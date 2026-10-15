@@ -18,7 +18,7 @@ from app.api import bridge as bridge_module
 
 
 def _bridge(tmp_path) -> Bridge:
-    return Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    return Bridge(config_path=str(tmp_path / "config.json"))
 
 
 # ----------------------------------------------------------------------

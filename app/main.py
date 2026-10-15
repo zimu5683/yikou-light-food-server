@@ -34,7 +34,6 @@ def main() -> None:
             "app.ordering.sss",
             "app.ordering.cloud_import",
             "app.wps.sync",
-            "app.web.auth",
             "app.web.server",
             "cryptography.hazmat.primitives.asymmetric.ed25519",
         ):

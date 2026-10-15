@@ -14,7 +14,7 @@ from app.api.bridge import Bridge
 
 
 def _bridge(tmp_path) -> Bridge:
-    return Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    return Bridge(config_path=str(tmp_path / "config.json"))
 
 
 def _set_account(bridge: Bridge, kind: str, account: str) -> None:

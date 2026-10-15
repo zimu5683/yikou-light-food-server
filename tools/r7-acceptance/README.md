@@ -29,7 +29,7 @@ python3 tools/r7-acceptance/mutation_check_r6_4.py --json /tmp/r6-4.json --keep
 | `probe_w1_bridge_double_write.py` | W1 生产 Bridge 接线：`wps_preview` 后、`apply_plan` 锁前，另一进程提交账本+云端 | `判定 = REFUSED（零写入，安全）` |
 | `probe_w1_stale_plan.py` | W1 与 R6 `probe_double.py` 同形的旧计划竞争；`--mutate-r6-wiring` 关掉层 B 可复现 `DOUBLE WRITE` | `VERDICT: no double write` / 变异下 `DOUBLE WRITE` |
 | `probe_w2w3w4_journal_gate.py` | W2 未知版本/两层未知状态必须阻断且审计不得变 `verified`；W3 恢复路径可用且**有云端证据时不得清障**；W4 协作者占用新增行不得覆盖 | 七个 W3 子检查 + W2/W4 判定 |
-| `probe_http_gates.py` | 直接 HTTP：恢复入口非管理员 403、`wps_enabled=False` 拒绝预览+上传、只读云入口在占位期间 `operation_conflict` 且 0 次 kdocs-cli 调用 | 4 项 OK |
+| `probe_http_gates.py` | 直接 HTTP：令牌闸门（无/错令牌 401、经网关 403）、`wps_enabled=False` 拒绝预览+上传、只读云入口在占位期间 `operation_conflict` 且 0 次 kdocs-cli 调用 | 4 项 OK |
 | `probe_local_safety.py` | R6-1 Excel 无输出/0 字节/损坏/占用取消都必须保住原文件；ordering journal 落盘失败 0 POST；R6-5 不同 `TMPDIR` 锁仍互斥 | 7 项 OK |
 | `tests/independent_final_counterexample_probe.py` | 21 个场景：闪时送跨运行仍须照常提交且不破坏（journal 迁移/只读来源/批次锁/origin 权威范围），以及 R6-4 新增的 M4/M6/M8 | 21 `SAFE` / 0 `DEFECT`，exit 0（3.6.19：跨运行阻断已下线，报告词从 `BLOCKED` 改为 `SAFE`） |
 | `indep_sss_faulty_post_child.py` | R6-4 合成子进程：**POST 已落库后再抛** `ReadTimeout`/`ConnectionError`，复现“服务端可能已落单、客户端拿不到响应” | 供探针 M6 场景使用 |

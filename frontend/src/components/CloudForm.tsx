@@ -121,7 +121,7 @@ function CloudFlowStrip({ steps }: { steps: FlowSteps }) {
 
 export function CloudForm() {
   const {
-    config, isAdmin, hasValidToken, authError, operationActive, reconnect,
+    config, hasValidToken, authError, operationActive, reconnect,
   } = useApp()
 
   const [status, setStatus] = useState<WpsStatus | null>(null)
@@ -473,12 +473,12 @@ export function CloudForm() {
         ok: false,
         tone: permission ? 'warning' : 'danger',
         code: permission ? 'forbidden' : 'network_unknown',
-        title: permission ? '当前账号没有该权限' : '恢复请求结果未知（阻断保持）',
+        title: permission ? '恢复请求被服务端拒绝' : '恢复请求结果未知（阻断保持）',
         detail: permission
-          ? '该恢复入口仅管理员可用；服务端拒绝了本次请求，没有改任何文件。'
+          ? '服务端以 403 拒绝了本次请求，没有改任何文件。'
           : `网络失败：${view.detail}。服务端可能没有收到这次请求，也可能已经处理；本地状态未知。`,
         nextStep: permission
-          ? '请联系管理员处理；普通用户不需要也不应该能解除阻断。'
+          ? '确认访问地址与令牌正确后重试；不要在结果未知时重复提交。'
           : '不要重复提交：先点「刷新状态（只读）」核对本地日志与阻断状态，再决定下一步。',
         blockingRetained: true,
         cloudWrite: false,
@@ -742,12 +742,10 @@ export function CloudForm() {
             <Button variant="outline" size="sm" disabled={busy !== '' || operationActive} onClick={() => void refresh()} title="只读刷新：不会上传、不会解除阻断、不会自动重试">
               {busy === 'refresh' ? '刷新中…' : '刷新状态（只读）'}
             </Button>
-            {isAdmin && (
-              <Button variant="outline" size="sm" disabled={busy !== '' || operationActive} onClick={() => void onAuthorize()}>
-                {busy === 'auth' ? '处理中…' : '去授权'}
-              </Button>
-            )}
-            {isAdmin && status?.authenticated && (
+            <Button variant="outline" size="sm" disabled={busy !== '' || operationActive} onClick={() => void onAuthorize()}>
+              {busy === 'auth' ? '处理中…' : '去授权'}
+            </Button>
+            {status?.authenticated && (
               <Button variant="outline" size="sm" disabled={busy !== '' || operationActive} onClick={() => void onLogout()}>退出授权</Button>
             )}
             <Button variant="outline" size="sm" disabled={busy !== '' || operationActive} onClick={() => void onCheckCopies()}>
@@ -779,7 +777,6 @@ export function CloudForm() {
         <WpsRecoveryCard
           status={recoveryStatus}
           error={recoveryError}
-          isAdmin={Boolean(isAdmin)}
           busy={busy !== '' || operationActive || resolveBusy}
           onResolve={openResolve}
         />
@@ -943,7 +940,7 @@ function RecoveryResolveDialog({
           tabIndex={-1}
           className="text-sm font-semibold outline-none"
         >
-          管理员恢复/退场处置
+          旧任务恢复/退场处置
         </h2>
         <p className="mt-1 text-[11px] text-muted-foreground">
           本入口永不写云端（只改本地 journal 审计）；退场不会解除同一目标日期 + 云表的防重复闸门。
@@ -1087,17 +1084,16 @@ function recoveryNextActionText(nextAction: string): string {
     manual_reconcile: '先人工核对云端与日志；核对完成前不要重新上传或补发',
     recover_journal: '需要先按日志恢复/修复，再重新预览；刷新状态本身不会解除阻断',
     repreview: '需要重新预览并生成新的上传令牌；不要直接重传旧令牌',
-    fix_journal: '本地恢复日志不可用：请联系管理员修复，不要直接重试或重新上传',
+    fix_journal: '本地恢复日志不可用：先修复本地日志再重试，不要直接重新上传',
     wait_for_recovery_lock: '另一个恢复/上传操作正在进行：请稍后再查询，不要重试',
     none: '没有待恢复操作',
   }
-  return map[nextAction] || '恢复状态未知：请联系管理员只读核对，不要直接重试或重新上传'
+  return map[nextAction] || '恢复状态未知：先只读核对，不要直接重试或重新上传'
 }
 
-function WpsRecoveryCard({ status, error, isAdmin, busy, onResolve }: {
+function WpsRecoveryCard({ status, error, busy, onResolve }: {
   status: WpsRecoveryStatus | null
   error: { title: string; detail: string; nextStep: string } | null
-  isAdmin: boolean
   busy: boolean
   onResolve: (operation: RecoveryOperationView) => void
 }) {
@@ -1111,17 +1107,17 @@ function WpsRecoveryCard({ status, error, isAdmin, busy, onResolve }: {
   }
   if (!status) return null
   if (!status.ok) {
-    const guidance = status.summary?.guidance || '恢复状态不可用：请联系管理员只读核对，不要直接重试或重新上传'
+    const guidance = status.summary?.guidance || '恢复状态不可用：先只读核对，不要直接重试或重新上传'
     const code = status.error_code ? `（${status.error_code}）` : ''
     // journal 损坏 / 版本不受支持 / 不可读 各自的下一步不同，不能合并成一句“重试”。
     const reasonText = `${status.error_code || ''} ${guidance}`
     const issue = journalIssueOf(status.error_code || '', reasonText)
     const journalHint = issue === 'version_unsupported'
-      ? '本地日志版本不受支持：请升级到匹配版本或联系管理员迁移日志，不要删除日志，也不要直接重传。'
+      ? '本地日志版本不受支持：请升级到匹配版本或迁移日志，不要删除日志，也不要直接重传。'
       : issue === 'write_failed'
         ? '本地日志持久化失败：先修复磁盘/权限，再重新只读核对；确认前不要重复提交。'
         : issue === 'corrupt'
-          ? '本地账本/意图日志损坏：请联系管理员修复（可走恢复/退场入口），不要删除账本，也不要直接重传。'
+          ? '本地账本/意图日志损坏：先修复（可走恢复/退场入口），不要删除账本，也不要直接重传。'
           : issue === 'unreadable'
             ? '本地恢复日志不可读：请修复文件权限/磁盘后重试，不要删除账本，也不要直接重传。'
             : ''
@@ -1152,8 +1148,7 @@ function WpsRecoveryCard({ status, error, isAdmin, busy, onResolve }: {
     verified: '已验证', uncertain: '待核对', failed: '失败', not_started: '未开始',
     retired_guarded: '已带审计退场（闸门保留）',
   }
-  const isSummaryScope = status.scope === 'summary'
-  const shown = isSummaryScope ? [] : (pending.length ? pending : operations).slice(0, 4)
+  const shown = (pending.length ? pending : operations).slice(0, 4)
   return (
     <Callout tone={needsAttention ? 'warning' : 'success'} title={needsAttention ? '待核对批次（只读可见）' : '本地恢复记录：无待核对批次'}>
       <p className="text-muted-foreground">
@@ -1187,25 +1182,19 @@ function WpsRecoveryCard({ status, error, isAdmin, busy, onResolve }: {
               ) : null
             })}
           </div>
-          {isSummaryScope && (
-            <p className="mt-1.5 rounded-md border border-border bg-secondary/30 px-2 py-1.5 text-muted-foreground">
-              当前账号为安全摘要视图：不显示批次明细、操作引用或客户数据。摘要明确待核对时不会显示成功，也不会开放重传按钮。
-            </p>
-          )}
-          {!isSummaryScope && shown.length > 0 && (
+          {shown.length > 0 && (
             <div className="mt-2 space-y-2">
               {shown.map((operation) => (
                 <WpsRecoveryOperationCard
                   key={operation.operation_id || operation.operation_ref}
                   operation={operation}
-                  isAdmin={isAdmin}
                   busy={busy}
                   onResolve={onResolve}
                 />
               ))}
             </div>
           )}
-          {!isSummaryScope && shown.length === 0 && (
+          {shown.length === 0 && (
             <p className="mt-1.5 text-muted-foreground">没有可展示的批次明细；请勿凭摘要猜测，先完成人工只读核对。</p>
           )}
         </>
@@ -1217,16 +1206,15 @@ function WpsRecoveryCard({ status, error, isAdmin, busy, onResolve }: {
   )
 }
 
-function WpsRecoveryOperationCard({ operation, isAdmin, busy, onResolve }: {
+function WpsRecoveryOperationCard({ operation, busy, onResolve }: {
   operation: WpsRecoveryOperation
-  isAdmin: boolean
   busy: boolean
   onResolve: (view: RecoveryOperationView) => void
 }) {
   const view = recoveryOperationView(operation)
   const actionCodes = view?.allowedActions.join('、') || ''
   const actionLabels = view?.allowedActionLabels.join('；') || ''
-  const canResolve = isAdmin && (view?.decisions.length ?? 0) > 0
+  const canResolve = (view?.decisions.length ?? 0) > 0
   return (
     <details className="rounded-md border bg-card px-2.5 py-2 text-[11px]" open={Boolean(view?.blockingRetained)}>
       <summary className="cursor-pointer">
@@ -1264,12 +1252,10 @@ function WpsRecoveryOperationCard({ operation, isAdmin, busy, onResolve }: {
         <div className="mt-1.5">
           {canResolve ? (
             <Button variant="outline" size="sm" disabled={busy} onClick={() => onResolve(view)}>
-              管理员恢复处置…
+              恢复处置…
             </Button>
           ) : (
-            <p className="text-muted-foreground">
-              当前账号没有恢复处置权限（该入口仅管理员可用）；如需解除阻断请联系管理员。
-            </p>
+            <p className="text-muted-foreground">该批次当前没有允许的恢复处置动作，只能继续人工只读核对。</p>
           )}
         </div>
       )}

@@ -1,6 +1,6 @@
-"""R7 独立验收探针 4：直接 HTTP 调用下的 W5（WPS 禁用）、恢复权限、危险并发（W7）。
+"""R7 独立验收探针 4：直接 HTTP 调用下的 W5（WPS 禁用）、令牌闸门、危险并发（W7）。
 
-不是调 Python 方法，而是起真实 ``app.web.server``（loopback + 会话 cookie），
+不是调 Python 方法，而是起真实 ``app.web.server``（loopback + 访问令牌），
 用 HTTP POST 打这些端点，验证闸门在**服务端**生效：
 
     PYTHONPATH=<repo> python3 probe_http_gates.py [--mutate-open-gates]
@@ -16,28 +16,20 @@ import sys
 import tempfile
 import threading
 import urllib.error
-import urllib.parse
 import urllib.request
 from pathlib import Path
 
-ADMIN = "admin@example.com"
-ADMIN_PW = "adminpw123"
-USER = "worker@example.com"
-USER_PW = "workerpw123"
+TOKEN = "r7-probe-token"
 
 
-def _call(server, method, path, *, body=None, form=None, cookie=None):
-    from app.web.server import SESSION_COOKIE
+def _call(server, method, path, *, body=None, token=TOKEN, extra_headers=None):
     port = server.server_address[1]
-    data, headers = None, {}
-    if form is not None:
-        data = urllib.parse.urlencode(form).encode("utf-8")
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
-    elif body is not None:
+    data, headers = None, dict(extra_headers or {})
+    if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    if cookie:
-        headers["Cookie"] = f"{SESSION_COOKIE}={cookie}"
+    if token:
+        headers["X-Yikou-Token"] = token
     request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data,
                                      method=method, headers=headers)
     try:
@@ -45,37 +37,6 @@ def _call(server, method, path, *, body=None, form=None, cookie=None):
             return response.status, response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read().decode("utf-8")
-
-
-def _token(server, username, password):
-    port = server.server_address[1]
-    data = urllib.parse.urlencode({"action": "login", "username": username,
-                                   "password": password}).encode("utf-8")
-    request = urllib.request.Request(f"http://127.0.0.1:{port}/login", data=data,
-                                     method="POST")
-    request.add_header("Content-Type", "application/x-www-form-urlencoded")
-
-    class _NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, *args, **kwargs):
-            return None
-
-    opener = urllib.request.build_opener(_NoRedirect)
-    try:
-        opener.open(request, timeout=20)
-    except urllib.error.HTTPError:
-        pass
-    # 再登录一次拿 Set-Cookie（沿用项目既有测试的做法）
-    opener2 = urllib.request.build_opener(_NoRedirect)
-    try:
-        response = opener2.open(request, timeout=20)
-        raw = response.headers.get("Set-Cookie") or ""
-    except urllib.error.HTTPError as exc:
-        raw = exc.headers.get("Set-Cookie") or ""
-    from app.web.server import SESSION_COOKIE
-    for part in raw.split(";"):
-        if part.strip().startswith(f"{SESSION_COOKIE}="):
-            return part.strip().split("=", 1)[1]
-    return ""
 
 
 def _json(text: str):
@@ -90,7 +51,6 @@ def main() -> int:
     parser.add_argument("--mutate-open-gates", action="store_true")
     args = parser.parse_args()
 
-    from app.web.auth import AuthStore
     from app.web.server import create_server
 
     if args.mutate_open_gates:
@@ -107,39 +67,39 @@ def main() -> int:
     dist = tmp / "dist"
     dist.mkdir()
     (dist / "index.html").write_text("<!doctype html><title>app</title>", encoding="utf-8")
-    auth = AuthStore(tmp / "cfg")
-    auth.create_admin(ADMIN, ADMIN_PW)
-    auth.register(USER, USER_PW)
-    auth.approve(USER, by=ADMIN)
-
-    httpd = create_server("127.0.0.1", 0, dist_dir=dist, token="legacy",
-                          config_path=tmp / "config.json", auth=auth)
+    httpd = create_server("127.0.0.1", 0, dist_dir=dist, token=TOKEN,
+                          config_path=tmp / "config.json")
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
 
     checks: dict[str, bool] = {}
     try:
-        admin_cookie = _token(httpd, ADMIN, ADMIN_PW)
-        user_cookie = _token(httpd, USER, USER_PW)
-        print(f"[setup] admin cookie={'ok' if admin_cookie else 'MISSING'} "
-              f"user cookie={'ok' if user_cookie else 'MISSING'}")
+        # 1) 令牌闸门：无令牌/错令牌必须 401；经网关必须 403（令牌不生效）。
+        s_none, t_none = _call(httpd, "POST", "/api/bridge_ready", body=[],
+                               token=None)
+        s_bad, t_bad = _call(httpd, "POST", "/api/bridge_ready", body=[],
+                             token="not-the-token")
+        s_proxied, t_proxied = _call(
+            httpd, "POST", "/api/bridge_ready", body=[],
+            extra_headers={"CF-Connecting-IP": "203.0.113.7"})
+        print(f"[1] 无令牌 HTTP {s_none} code={_json(t_none).get('code')} | "
+              f"错令牌 HTTP {s_bad} code={_json(t_bad).get('code')} | "
+              f"经网关 HTTP {s_proxied} code={_json(t_proxied).get('code')}")
+        checks["token_gate_enforced"] = (
+            s_none == 401 and _json(t_none).get("code") == "token_required"
+            and s_bad == 401 and _json(t_bad).get("code") == "token_required"
+            and s_proxied == 403
+            and _json(t_proxied).get("code") == "remote_denied")
 
-        # 1) 恢复入口：普通用户必须 403
-        status, text = _call(httpd, "POST", "/api/wps_recovery_resolve",
-                             body=[{"operation_id": "wps-0123456789abcdef",
-                                    "decision": "retire_guarded"}], cookie=user_cookie)
-        print(f"[1] 普通用户 wps_recovery_resolve -> HTTP {status} body={text[:120]}")
-        checks["recovery_forbidden_for_non_admin"] = status == 403
-
-        # 2) 管理员坏请求：必须结构化拒绝，不能 500
+        # 2) 恢复入口坏请求：必须结构化拒绝，不能 500
         status, text = _call(httpd, "POST", "/api/wps_recovery_resolve",
                              body=[{"operation_id": "bad-id", "decision": "retire_guarded",
                                     "confirm": "retire_guarded", "note": "xxxx",
-                                    "confirm_structure_checked": True}], cookie=admin_cookie)
+                                    "confirm_structure_checked": True}])
         payload = _json(text)
-        print(f"[2] 管理员非法 operation_id -> HTTP {status} ok={payload.get('ok')} "
+        print(f"[2] 非法 operation_id -> HTTP {status} ok={payload.get('ok')} "
               f"code={payload.get('code')}")
-        checks["admin_bad_request_structured"] = status == 200 and payload.get("ok") is False
+        checks["bad_request_structured"] = status == 200 and payload.get("ok") is False
 
         # 3) WPS 禁用：HTTP 层必须拒绝预览与上传
         httpd.bridge._config.wps_enabled = False
@@ -150,10 +110,10 @@ def main() -> int:
             called["n"] += 1
             return real_cli()
         httpd.bridge._wps_cli = counting_cli
-        s_prev, t_prev = _call(httpd, "POST", "/api/wps_preview", body=[], cookie=user_cookie)
+        s_prev, t_prev = _call(httpd, "POST", "/api/wps_preview", body=[])
         p_prev = _json(t_prev)
         s_up, t_up = _call(httpd, "POST", "/api/wps_upload",
-                           body=[{"preview_id": "pv-x"}], cookie=user_cookie)
+                           body=[{"preview_id": "pv-x"}])
         p_up = _json(t_up)
         print(f"[3] wps_enabled=False: preview HTTP {s_prev} ok={p_prev.get('ok')} "
               f"code={p_prev.get('code')} | upload HTTP {s_up} ok={p_up.get('ok')} "
@@ -172,8 +132,7 @@ def main() -> int:
         results = {}
         for method, body in (("wps_preview", []), ("wps_check_copies", []),
                              ("sss_day_orders", [])):
-            status, text = _call(httpd, "POST", f"/api/{method}", body=body,
-                                 cookie=user_cookie)
+            status, text = _call(httpd, "POST", f"/api/{method}", body=body)
             payload = _json(text)
             results[method] = (status, payload.get("ok"), payload.get("code")
                                or payload.get("reason"))

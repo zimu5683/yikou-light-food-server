@@ -23,7 +23,7 @@ from app.api import bridge as bridge_module
 
 
 def _bridge(tmp_path) -> Bridge:
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     bridge._config.excel_path = tmp_path / "排单.xlsx"
     bridge._config.excel_path.write_bytes(b"x")
     # W5：云同步默认关闭（wps_enabled=False）时服务端直接拒绝预览/上传。

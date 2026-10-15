@@ -1,10 +1,8 @@
 /**
- * 纯本地预校验：只挡住明显无效输入，最终校验与权限强制仍由后端负责。
- * 非管理员不校验被隐藏/服务端强制的字段，避免前端误拦截。
+ * 纯本地预校验：只挡住明显无效输入，最终校验仍由后端负责。
  */
 
 export interface OrderDraft {
-  isAdmin: boolean
   url: string
   phone: string
   password: string
@@ -15,7 +13,6 @@ export interface OrderDraft {
 }
 
 export interface SssDraft {
-  isAdmin: boolean
   url: string
   account: string
   password: string
@@ -41,12 +38,10 @@ export function compareIsoDate(a: string, b: string): number {
 
 export function validateOrderDraft(draft: OrderDraft): DraftErrors {
   const errors: DraftErrors = {}
-  if (draft.isAdmin) {
-    if (!draft.url.trim()) errors.url = '请输入管理网址'
-    if (!draft.phone.trim()) errors.phone = '请输入手机号或账号'
-    if (!draft.password) errors.password = '请输入登录密码'
-    if (!draft.excel.trim()) errors.excel = '请选择排单 Excel 文件'
-  }
+  if (!draft.url.trim()) errors.url = '请输入管理网址'
+  if (!draft.phone.trim()) errors.phone = '请输入手机号或账号'
+  if (!draft.password) errors.password = '请输入登录密码'
+  if (!draft.excel.trim()) errors.excel = '请选择排单 Excel 文件'
   const date = draft.date.trim()
   if (date) {
     if (!isValidIsoDate(date)) {
@@ -65,13 +60,11 @@ export function validateOrderDraft(draft: OrderDraft): DraftErrors {
 
 export function validateSssDraft(draft: SssDraft): DraftErrors {
   const errors: DraftErrors = {}
-  if (draft.isAdmin) {
-    if (!draft.url.trim()) errors.url = '请输入闪时送网址'
-    if (!draft.account.trim()) errors.account = '请输入闪时送账号'
-    if (!draft.password) errors.password = '请输入登录密码'
-    if (draft.orderSource === 'excel' && !draft.excel.trim()) {
-      errors.excel = '本地 Excel 模式必须选择名单文件'
-    }
+  if (!draft.url.trim()) errors.url = '请输入闪时送网址'
+  if (!draft.account.trim()) errors.account = '请输入闪时送账号'
+  if (!draft.password) errors.password = '请输入登录密码'
+  if (draft.orderSource === 'excel' && !draft.excel.trim()) {
+    errors.excel = '本地 Excel 模式必须选择名单文件'
   }
   return errors
 }

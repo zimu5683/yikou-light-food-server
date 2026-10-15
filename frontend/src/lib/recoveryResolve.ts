@@ -317,9 +317,9 @@ export interface ResolveOutcomeView {
 
 const RESOLVE_FAILURE: Record<string, { title: string; detail: string; nextStep: string; tone: 'danger' | 'warning' }> = {
   forbidden: {
-    title: '当前账号没有该权限',
-    detail: '该恢复入口仅管理员可用（服务端 403 admin_only）；本次没有改任何文件。',
-    nextStep: '请联系管理员处理；普通用户不需要也不应该能解除阻断。',
+    title: '恢复请求被服务端拒绝',
+    detail: '服务端以 403 拒绝了本次恢复请求；本次没有改任何文件。',
+    nextStep: '确认访问地址与令牌正确后重试；不要在结果未知时重复提交。',
     tone: 'warning',
   },
   invalid_operation_id: {

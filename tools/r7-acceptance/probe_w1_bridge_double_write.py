@@ -133,7 +133,7 @@ def run(*, mutate_old_wiring: bool) -> int:
     from app.wps.sync import SyncLedger, target_date_for
 
     tmp = Path(tempfile.mkdtemp(prefix="r7-w1-"))
-    bridge = Bridge(config_path=str(tmp / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp / "config.json"))
     target = target_date_for(start_hour=bridge._config.wps_target_hour_start,
                              end_hour=bridge._config.wps_target_hour_end)
     excel = tmp / "排单.xlsx"

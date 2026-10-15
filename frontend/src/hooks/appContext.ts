@@ -59,8 +59,6 @@ export interface AppStateBundle {
   hasValidToken: boolean
   version: string
   status: StatusState
-  /** 当前账号是否管理员；非管理员只看到基础功能（后端另有强制拦截）。 */
-  isAdmin: boolean
   /** 运行平台：android = APK 自带 WebView；web = 纯浏览器访问。 */
   platform: 'android' | 'web'
   /** 是否支持应用内下载安装更新。 */

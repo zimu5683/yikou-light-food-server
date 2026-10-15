@@ -203,7 +203,7 @@ function ModeTab({
 /* ------------------------------------------------------------------ */
 
 function OrderForm() {
-  const { config, passwords, startOrder, workerAlive, operationActive, operationView, isAdmin, passwordReset } = useApp()
+  const { config, passwords, startOrder, workerAlive, operationActive, operationView, passwordReset } = useApp()
   const orderResetVersion = passwordResetVersion(passwordReset, 'order')
   const [url, setUrl] = useState(config?.target_url ?? '')
   const [phone, setPhone] = useState(config?.phone_number ?? '')
@@ -281,7 +281,7 @@ function OrderForm() {
   }
 
   function validateAndPreview() {
-    const errors = validateOrderDraft({ isAdmin, url, phone, password, excel, date, count, today: formatISO(new Date()) })
+    const errors = validateOrderDraft({ url, phone, password, excel, date, count, today: formatISO(new Date()) })
     if (Object.keys(errors).length > 0) {
       setFields(toFieldErrors(errors))
       if (errors.url || errors.phone || errors.password || errors.excel) setAdvancedOpen(true)
@@ -333,43 +333,36 @@ function OrderForm() {
           <FlowStrip steps={flow} label="订单处理流程" />
         )}
 
-        {isAdmin && (
-          <AdvancedSection
-            id="order-advanced"
-            title="管理网址与登录凭据"
-            summary={advancedMissing ? '首次使用需先补齐，否则无法启动' : '已配置，可展开修改'}
-            open={advancedOpen}
-            onOpenChange={setAdvancedOpen}
-            notice={advancedMissing ? '缺少网址、账号或排单表路径，首次使用需先补齐；最终以服务端校验为准。' : undefined}
-          >
-            <Field label="管理网址" htmlFor="order-url" error={modeError(fields, 'url')} helper="用于登录管理后台">
-              <TextInput id="order-url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://example.com/admin" autoComplete="url" />
-            </Field>
-            <Field label="手机号 / 账号" htmlFor="order-phone" error={modeError(fields, 'phone')} helper="用于登录管理后台">
-              <TextInput id="order-phone" value={phone} onChange={(e) => setPhone(e.target.value)} autoComplete="username" />
-            </Field>
-            <Field label="登录密码" htmlFor="order-password" error={modeError(fields, 'password')} helper="只保存在系统凭据管理器">
-              <TextInput id="order-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
-            </Field>
-            <Field label="Excel 排单文件" htmlFor="order-excel" error={excelError} helper="支持 .xlsx / .xlsm">
-              <div className="flex flex-wrap gap-1.5">
-                <TextInput id="order-excel" value={excel} onChange={(e) => setExcel(e.target.value)} className="min-w-[12rem] flex-1" placeholder="选择排单 .xlsx 文件" />
-                <GhostButton onClick={() => void chooseFile()}>选择文件</GhostButton>
-                <GhostButton onClick={() => void newTemplate()}>新建模板</GhostButton>
-              </div>
-            </Field>
-            {/* 低频设置：与闪时送页一致放进高级设置。默认值、保存语义与清除凭据行为都不变。 */}
-            <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
-              <Switch checked={remember} onCheckedChange={setRemember} aria-label="保存到系统凭据管理器" />
-              <span>保存到系统凭据管理器</span>
+        <AdvancedSection
+          id="order-advanced"
+          title="管理网址与登录凭据"
+          summary={advancedMissing ? '首次使用需先补齐，否则无法启动' : '已配置，可展开修改'}
+          open={advancedOpen}
+          onOpenChange={setAdvancedOpen}
+          notice={advancedMissing ? '缺少网址、账号或排单表路径，首次使用需先补齐；最终以服务端校验为准。' : undefined}
+        >
+          <Field label="管理网址" htmlFor="order-url" error={modeError(fields, 'url')} helper="用于登录管理后台">
+            <TextInput id="order-url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://example.com/admin" autoComplete="url" />
+          </Field>
+          <Field label="手机号 / 账号" htmlFor="order-phone" error={modeError(fields, 'phone')} helper="用于登录管理后台">
+            <TextInput id="order-phone" value={phone} onChange={(e) => setPhone(e.target.value)} autoComplete="username" />
+          </Field>
+          <Field label="登录密码" htmlFor="order-password" error={modeError(fields, 'password')} helper="只保存在系统凭据管理器">
+            <TextInput id="order-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
+          </Field>
+          <Field label="Excel 排单文件" htmlFor="order-excel" error={excelError} helper="支持 .xlsx / .xlsm">
+            <div className="flex flex-wrap gap-1.5">
+              <TextInput id="order-excel" value={excel} onChange={(e) => setExcel(e.target.value)} className="min-w-[12rem] flex-1" placeholder="选择排单 .xlsx 文件" />
+              <GhostButton onClick={() => void chooseFile()}>选择文件</GhostButton>
+              <GhostButton onClick={() => void newTemplate()}>新建模板</GhostButton>
             </div>
-          </AdvancedSection>
-        )}
-        {!isAdmin && (
-          <Callout tone="neutral" title="按管理员预设运行">
-            本账号使用管理员预设配置（真正的强制拦截在服务端），无需填写管理网址、账号、密码和文件路径。
-          </Callout>
-        )}
+          </Field>
+          {/* 低频设置：与闪时送页一致放进高级设置。默认值、保存语义与清除凭据行为都不变。 */}
+          <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
+            <Switch checked={remember} onCheckedChange={setRemember} aria-label="保存到系统凭据管理器" />
+            <span>保存到系统凭据管理器</span>
+          </div>
+        </AdvancedSection>
 
         <Field label="目标日期" htmlFor="order-date" error={modeError(fields, 'date')} helper="留空默认今天；只允许今天或过去日期">
           <DateField value={date} onChange={setDate} invalid={Boolean(modeError(fields, 'date'))} label="选择目标日期" />
@@ -428,7 +421,7 @@ type SssExecutionMode = 'dry_run' | 'preflight' | 'live'
 
 function SssForm() {
   const {
-    config, passwords, startSss, workerAlive, operationActive, operationView, isAdmin, passwordReset,
+    config, passwords, startSss, workerAlive, operationActive, operationView, passwordReset,
     connection, recovery, operations, operation,
   } = useApp()
   const sssResetVersion = passwordResetVersion(passwordReset, 'sss')
@@ -564,7 +557,7 @@ function SssForm() {
       void readDayOrders()
       return
     }
-    const errors = validateSssDraft({ isAdmin, url, account, password, excel, orderSource })
+    const errors = validateSssDraft({ url, account, password, excel, orderSource })
     if (Object.keys(errors).length > 0) {
       setFields(toFieldErrors(errors))
       if (errors.url || errors.account || errors.password || errors.excel) setAdvancedOpen(true)
@@ -666,42 +659,40 @@ function SssForm() {
           />
         )}
 
-        {isAdmin && (
-          <AdvancedSection
-            id="sss-advanced"
-            title="闪时送网址、账号与文件路径"
-            summary={advancedMissing ? '首次使用需先补齐' : '已配置，可展开修改'}
-            open={advancedOpen}
-            onOpenChange={setAdvancedOpen}
-            notice={advancedMissing ? '缺少网址、账号或本地 Excel 路径；云端模式可留空 Excel，本地模式必须选文件。' : undefined}
+        <AdvancedSection
+          id="sss-advanced"
+          title="闪时送网址、账号与文件路径"
+          summary={advancedMissing ? '首次使用需先补齐' : '已配置，可展开修改'}
+          open={advancedOpen}
+          onOpenChange={setAdvancedOpen}
+          notice={advancedMissing ? '缺少网址、账号或本地 Excel 路径；云端模式可留空 Excel，本地模式必须选文件。' : undefined}
+        >
+          <Field label="闪时送网址" htmlFor="sss-url" error={modeError(fields, 'url')} helper="闪时送下单平台地址">
+            <TextInput id="sss-url" value={url} onChange={(e) => setUrl(e.target.value)} autoComplete="url" />
+          </Field>
+          <Field label="闪时送账号" htmlFor="sss-account" error={modeError(fields, 'account')} helper="用于登录闪时送平台">
+            <TextInput id="sss-account" value={account} onChange={(e) => setAccount(e.target.value)} autoComplete="username" />
+          </Field>
+          <Field label="登录密码" htmlFor="sss-password" error={modeError(fields, 'password')} helper="只保存在系统凭据管理器">
+            <TextInput id="sss-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
+          </Field>
+          <Field
+            label="本地名单 Excel（本地模式必填）"
+            htmlFor="sss-excel"
+            error={excelError}
+            helper={orderSource === 'wps' ? '云端模式仅作为留档文件，可留空' : '午餐/晚餐两表：A=姓名 B=门牌号 C=电话'}
           >
-            <Field label="闪时送网址" htmlFor="sss-url" error={modeError(fields, 'url')} helper="闪时送下单平台地址">
-              <TextInput id="sss-url" value={url} onChange={(e) => setUrl(e.target.value)} autoComplete="url" />
-            </Field>
-            <Field label="闪时送账号" htmlFor="sss-account" error={modeError(fields, 'account')} helper="用于登录闪时送平台">
-              <TextInput id="sss-account" value={account} onChange={(e) => setAccount(e.target.value)} autoComplete="username" />
-            </Field>
-            <Field label="登录密码" htmlFor="sss-password" error={modeError(fields, 'password')} helper="只保存在系统凭据管理器">
-              <TextInput id="sss-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" />
-            </Field>
-            <Field
-              label="本地名单 Excel（本地模式必填）"
-              htmlFor="sss-excel"
-              error={excelError}
-              helper={orderSource === 'wps' ? '云端模式仅作为留档文件，可留空' : '午餐/晚餐两表：A=姓名 B=门牌号 C=电话'}
-            >
-              <div className="flex flex-wrap gap-1.5">
-                <TextInput id="sss-excel" value={excel} onChange={(e) => setExcel(e.target.value)} className="min-w-[12rem] flex-1" placeholder="选择闪时送 .xlsx 文件" />
-                <GhostButton onClick={() => void chooseFile()}>选择文件</GhostButton>
-                <GhostButton onClick={() => void newTemplate()}>新建模板</GhostButton>
-              </div>
-            </Field>
-            <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
-              <Switch checked={remember} onCheckedChange={setRemember} aria-label="保存到系统凭据管理器" />
-              <span>保存到系统凭据管理器</span>
+            <div className="flex flex-wrap gap-1.5">
+              <TextInput id="sss-excel" value={excel} onChange={(e) => setExcel(e.target.value)} className="min-w-[12rem] flex-1" placeholder="选择闪时送 .xlsx 文件" />
+              <GhostButton onClick={() => void chooseFile()}>选择文件</GhostButton>
+              <GhostButton onClick={() => void newTemplate()}>新建模板</GhostButton>
             </div>
-          </AdvancedSection>
-        )}
+          </Field>
+          <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
+            <Switch checked={remember} onCheckedChange={setRemember} aria-label="保存到系统凭据管理器" />
+            <span>保存到系统凭据管理器</span>
+          </div>
+        </AdvancedSection>
 
         <Field label="执行方式" helper="正式与模拟使用不同确认文字，不能仅靠按钮颜色">
           <SegmentedControl
@@ -1063,7 +1054,7 @@ function ConfirmStopDialog({
 }
 
 function ToolsMenu({ mode }: { mode: TaskMode }) {
-  const { clearPassword, checkUpdates, isAdmin } = useApp()
+  const { clearPassword, checkUpdates } = useApp()
   const isSss = mode === 'sss'
   const passwordLabel = isSss ? '清除闪时送密码' : '清除管理后台密码'
   const toolsLabel = isSss ? '闪时送更多工具' : '订单处理更多工具'
@@ -1072,10 +1063,6 @@ function ToolsMenu({ mode }: { mode: TaskMode }) {
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false)
   const [clearing, setClearing] = useState(false)
   const [clearError, setClearError] = useState('')
-
-  // 闪时送页的「更多」对所有会话可用（诊断日志不再要求管理员）；
-  // 订单页只有管理员才有内容（清除密码/检查更新）。
-  if (!isAdmin && !isSss) return null
 
   async function doClear() {
     setClearing(true)
@@ -1100,9 +1087,9 @@ function ToolsMenu({ mode }: { mode: TaskMode }) {
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" className="rounded-md text-xs">
-          {isAdmin && <DropdownMenuItem onClick={() => { setClearError(''); setClearOpen(true) }}>{passwordLabel}</DropdownMenuItem>}
+          <DropdownMenuItem onClick={() => { setClearError(''); setClearOpen(true) }}>{passwordLabel}</DropdownMenuItem>
           {isSss && <DropdownMenuItem onClick={() => setDiagnosticsOpen(true)}>闪时送诊断日志</DropdownMenuItem>}
-          {isAdmin && <DropdownMenuItem onClick={() => checkUpdates(true)}>检查更新</DropdownMenuItem>}
+          <DropdownMenuItem onClick={() => checkUpdates(true)}>检查更新</DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
       <DiagnosticsDialog open={diagnosticsOpen} onOpenChange={setDiagnosticsOpen} />

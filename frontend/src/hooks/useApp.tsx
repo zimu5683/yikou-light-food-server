@@ -96,8 +96,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [hasValidToken, setHasValidToken] = useState(false)
   const [version, setVersion] = useState('')
   const [status, setStatus] = useState<StatusState>('ready')
-  // 默认 false（受限）：握手失败时退化为「看不到敏感项」，而不是「全都能看」
-  const [isAdmin, setIsAdmin] = useState(false)
   const [config, setConfig] = useState<AppState['config'] | null>(null)
   const [passwords, setPasswords] = useState({ order: '', sss: '' })
   const [passwordReset, setPasswordReset] = useState<{ mode: 'order' | 'sss' | null; nonce: number }>({
@@ -256,7 +254,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const applyState = useCallback((state: AppState, withMock = false) => {
     setVersion(state.version)
     setStatus(state.status)
-    setIsAdmin(state.is_admin === true)
     setPlatform(state.platform === 'android' ? 'android' : 'web')
     setCanSelfUpdate(state.can_self_update === true)
     setConfig(state.config)
@@ -819,7 +816,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
       hasValidToken,
       version,
       status,
-      isAdmin,
       platform,
       canSelfUpdate,
       config,
@@ -865,7 +861,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       redactedPendingCount,
       reconnect,
     }),
-    [ready, mocked, transport, authError, hasValidToken, version, status, isAdmin, platform,
+    [ready, mocked, transport, authError, hasValidToken, version, status, platform,
       canSelfUpdate, config, passwords, passwordReset, logs, decision, captcha, addressInput,
       connection, recovery, operation, operations, operationView, operationActive, workerAlive,
       mode, startOrder, startSss, stopTask, chooseExcel, newTemplate, clearPassword, checkUpdates,

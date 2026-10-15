@@ -318,7 +318,7 @@ def test_server_dist_dir_honours_override(monkeypatch, tmp_path):
 def test_bridge_open_external_uses_android_native(fake_runtime, monkeypatch):
     from app.api.bridge import Bridge
 
-    bridge = Bridge(config_path=None, is_admin=True)
+    bridge = Bridge(config_path=None)
     monkeypatch.setattr(android_runtime, "open_external", lambda url: True)
     assert bridge.open_external("https://example.invalid") == {"ok": True}
 
@@ -332,7 +332,7 @@ def test_bridge_android_authorize_worker_reports_url_and_status(fake_runtime, mo
         {"running": True, "url": "https://example.invalid/oauth", "authenticated": False},
         {"running": False, "finished": True, "ok": True, "authenticated": True},
     ]
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     monkeypatch.setattr(type(bridge), "_wps_authorize_worker_android",
                         lambda self: bridge.log("[云文档授权] 授权成功", "OK"))
     # 只验证按平台分派；Android worker 内部逻辑由 authorize() 单测覆盖。
@@ -344,7 +344,7 @@ def test_bridge_android_authorize_dispatch(monkeypatch, android):
     from app.api.bridge import Bridge
 
     calls: list[str] = []
-    bridge = Bridge(config_path=None, is_admin=True)
+    bridge = Bridge(config_path=None)
     monkeypatch.setattr(Bridge, "_wps_authorize_worker_android",
                         lambda self: calls.append("android"))
     monkeypatch.setattr(Bridge, "_wps_authorize_worker_desktop",
@@ -371,7 +371,7 @@ def test_bridge_notifies_native_interaction_in_android_mode(android, monkeypatch
     calls: list[str] = []
     monkeypatch.setattr(android_runtime, "notify_interaction",
                         lambda kind: calls.append(kind) or True)
-    bridge = Bridge(config_path=None, is_admin=True)
+    bridge = Bridge(config_path=None)
     bridge._notify_android_interaction("address")
     bridge._clear_android_interaction_notification()
     assert calls == ["address"]
@@ -405,7 +405,7 @@ def test_bridge_wps_logout_android_returns_native_result(android, monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(android_runtime, "logout",
                         lambda: (calls.append("logout"), android_runtime.ExecResult(exit_code=0))[1])
-    bridge = Bridge(config_path=None, is_admin=True)
+    bridge = Bridge(config_path=None)
     result = bridge.wps_logout()
     assert result == {"ok": True, "reason": ""}
     assert calls == ["logout"]
@@ -417,7 +417,7 @@ def test_bridge_wps_logout_android_error_shape(android, monkeypatch):
     monkeypatch.setattr(
         android_runtime, "logout",
         lambda: android_runtime.ExecResult(exit_code=1, stderr="boom", error_code="RUNTIME_CRASHED"))
-    assert Bridge(config_path=None, is_admin=True).wps_logout() == {
+    assert Bridge(config_path=None).wps_logout() == {
         "ok": False, "reason": "RUNTIME_CRASHED"}
 
 

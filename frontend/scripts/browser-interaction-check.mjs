@@ -146,7 +146,7 @@ const EXPECTED_PAGE_ERRORS = [
     url: /\/api\/wps_recovery_status$/,
     content: /status of 403/,
     max: 1,
-    reason: '「恢复查询无权限」场景要求服务端返回 403（验证准确的权限提示、不误报网络故障、不反复请求）；这条 403 是该场景的预期结果。',
+    reason: '「恢复查询被服务端拒绝」场景要求服务端返回 403（验证拒绝提示准确、不误报网络故障、不反复请求）；这条 403 是该场景的预期结果。',
   },
   {
     scenario: /断线恢复|FE-1/,
@@ -162,7 +162,7 @@ const EXPECTED_PAGE_ERRORS = [
     url: /\/api\/wps_recovery_resolve$/,
     content: /status of 403/,
     max: 1,
-    reason: '「管理员恢复处置权限不足」场景要求 403（验证阻断保持、不显示成功、不自动重试）。',
+    reason: '「恢复处置权限不足」场景要求 403（验证阻断保持、不显示成功、不自动重试）。',
   },
   {
     scenario: /恢复处置/,
@@ -282,7 +282,6 @@ const mock = {
   resolveCaptchaCalls: 0,
   resolveCaptchaNetwork: false,
   resolveAddressCalls: 0,
-  isAdmin: true,
   operationStatus: null,
   /** 覆盖合成配置的字段（例如把闪时送执行方式从默认「模拟」切到「正式下单」）。 */
   configOverride: null,
@@ -461,7 +460,7 @@ function createMockServer() {
       case 'bridge_ready':
         return json(res, {
           version: 'mock-1', status: 'ready', event_producer_id: 'mock-producer',
-          is_admin: mock.isAdmin, platform: 'web', can_self_update: false,
+          platform: 'web', can_self_update: false,
           operation: mock.operationStatus || idleOperation(), operations: [],
           config: { ...syntheticConfig(), ...(mock.configOverride || {}) },
           passwords: { order: '', sss: '' },
@@ -561,7 +560,7 @@ function createMockServer() {
       case 'wps_recovery_status':
         mock.wpsRecoveryCalls += 1
         if (mock.wpsRecoveryForbidden) {
-          return json(res, { error: '该操作仅管理员可用', code: 'admin_only' }, 403)
+          return json(res, { error: '服务端拒绝了本次请求', code: 'refused' }, 403)
         }
         return json(res, mock.wpsRecovery)
       case 'wps_recovery_resolve': {
@@ -583,11 +582,11 @@ function createMockServer() {
         const respondResolve = () => {
           mock.wpsResolveActive = Math.max(0, mock.wpsResolveActive - 1)
           if (mock.wpsResolveForbidden) {
-            return json(res, { ok: false, status: 'forbidden', code: 'forbidden', reason: '仅管理员可用', changed: false }, 403)
+            return json(res, { ok: false, status: 'refused', code: 'refused', reason: '服务端拒绝了本次请求', changed: false }, 403)
           }
           return json(res, mock.wpsResolveResult || {
             ok: true, status: 'retired_guarded', code: 'retired_guarded',
-            reason: '已按管理员决策处理，本地 journal 已写入审计',
+            reason: '已按处置决策处理，本地 journal 已写入审计',
             next_action: 'manual_reconcile', contract_version: 1, read_only: false,
             cloud_write: false, operation_id: 'wps-1234567890abcdef',
             operation_ref: 'wps-op:abcdef123456', changed: true, verified_on_disk: true,
@@ -2095,8 +2094,8 @@ async function main() {
     await new Promise((r) => setTimeout(r, 600))
     const recoveryText = await cdp.eval(`document.body.innerText`)
     record('WPS 只读恢复卡片可见且标明下一步', recoveryText.includes('待核对批次（只读可见）') && recoveryText.includes('只读核对云端与日志') && recoveryText.includes('不会上传、不会解除阻断、不会自动重试'), '')
-    record('管理员最小 DTO 不出现 problems/risk_reason/客户明细', !recoveryText.includes('risk_reason') && !recoveryText.includes('problems') && !recoveryText.includes('合成待核对'), '')
-    record('管理员恢复卡片显示 allowed_next_actions 安全动作', documentTextIncludes(await cdp.eval('document.body.textContent'), ['允许动作', 'manual_reconcile']), '')
+    record('恢复状态最小 DTO 不出现 problems/risk_reason/客户明细', !recoveryText.includes('risk_reason') && !recoveryText.includes('problems') && !recoveryText.includes('合成待核对'), '')
+    record('恢复卡片显示 allowed_next_actions 安全动作', documentTextIncludes(await cdp.eval('document.body.textContent'), ['允许动作', 'manual_reconcile']), '')
     await captureScreenshot(cdp, 'fe-c3-wps-recovery-390x844.png')
     record('刷新状态不触发 wps_upload', mock.wpsUploadCalls === uploadBefore && mock.wpsUploadCalls === 0, `uploads=${mock.wpsUploadCalls}`)
     record('纯刷新回填不触发无意义自动保存', mock.saveWpsPayloads.length === 0, `savePayloads=${mock.saveWpsPayloads.length}`)
@@ -2115,43 +2114,28 @@ async function main() {
       queried_cloud: false, contains_cloud_checked_records: false, scope: 'admin',
       counts: { planned: 0, writing: 0, ledger_pending: 0, uncertain: 0, verified: 0, failed: 0, not_started: 0 },
       next_action: 'fix_journal', error_code: 'wps_recovery_journal_unreadable',
-      summary: { needs_review: true, guidance: '恢复状态不可用：请联系管理员只读核对，不要直接重试或重新上传' },
+      summary: { needs_review: true, guidance: '恢复状态不可用：先只读核对，不要直接重试或重新上传' },
     }
     assert.ok(await cdp.eval(clickByTextJs('button', '刷新状态（只读）')), '找不到刷新状态按钮')
     await cdp.waitFor(`document.body.innerText.includes('本地恢复记录不可读')`)
     const brokenText = await cdp.eval('document.body.innerText')
     record('recovery_status 损坏失败关闭，不伪装成无待恢复', brokenText.includes('本地恢复记录不可读') && brokenText.includes('不要直接重试'), '')
 
-    // summary scope：普通用户安全摘要，不能因缺少 operations 崩溃，不得显示成功
-    mock.wpsRecoveryForbidden = false
-    mock.wpsRecovery = {
-      ok: true, contract_version: 1, source: 'local_journal', read_only: true,
-      queried_cloud: false, contains_cloud_checked_records: false, scope: 'summary',
-      counts: { planned: 0, writing: 0, ledger_pending: 0, uncertain: 1, verified: 0, failed: 0, not_started: 0 },
-      next_action: 'manual_reconcile', error_code: 'wps_recovery_uncertain',
-      summary: { operation_count: 1, pending_count: 1, uncertain_count: 1, failed_count: 0, not_started_count: 0, has_pending: true, needs_review: true, guidance: '存在不确定结果：请先只读核对云端与日志，不要直接重传' },
-    }
-    assert.ok(await cdp.eval(clickByTextJs('button', '刷新状态（只读）')), '找不到刷新状态按钮')
-    await cdp.waitFor(`document.body.innerText.includes('安全摘要视图')`)
-    const summaryText = await cdp.eval(`document.body.innerText`)
-    record('summary scope 无 operations 也能显示数量与下一步', summaryText.includes('安全摘要视图') && summaryText.includes('待核对') && summaryText.includes('只读核对云端与日志'), '')
-    record('summary scope 缺明细不显示成功/重传', !summaryText.includes('本地恢复记录：无待核对批次') && mock.wpsUploadCalls === 0, `uploads=${mock.wpsUploadCalls}`)
-
-    // 权限失败：准确权限提示，不误报网络故障；不得反复请求
-    enterScenario('5 恢复查询：无权限 403（预期）')
+    // 服务端强制拒绝（403）：准确提示，不误报网络故障；不得反复请求
+    enterScenario('5 恢复查询：服务端 403 拒绝（预期）')
     mock.wpsRecoveryForbidden = true
     await new Promise((r) => setTimeout(r, 500))
     const callsBeforeForbidden = mock.wpsRecoveryCalls
     assert.ok(await cdp.eval(clickByTextJs('button', '刷新状态（只读）')), '找不到刷新状态按钮')
-    await cdp.waitFor(`document.body.innerText.includes('当前账号没有该权限')`)
+    await cdp.waitFor(`document.body.innerText.includes('服务端拒绝了本次请求')`)
     await new Promise((r) => setTimeout(r, 800))
     const forbiddenText = await cdp.eval(`document.body.innerText`)
     const forbiddenDelta = mock.wpsRecoveryCalls - callsBeforeForbidden
-    record('恢复查询无权限显示准确权限提示，不误报网络故障', forbiddenText.includes('当前账号没有该权限') && !forbiddenText.includes('网络已断开'), '')
-    record('恢复查询无权限不反复请求', forbiddenDelta === 1, `delta=${forbiddenDelta}`)
+    record('恢复查询被 403 拒绝时给出准确提示，不误报网络故障', forbiddenText.includes('服务端拒绝了本次请求') && !forbiddenText.includes('网络已断开'), '')
+    record('恢复查询被 403 拒绝后不反复请求', forbiddenDelta === 1, `delta=${forbiddenDelta}`)
     mock.wpsRecoveryForbidden = false
 
-    // 管理员只读查询到其他账号 pending 时只显示安全提示，不打开输入、不自动提交
+    // 只读查询到没有明细的 pending 时只显示安全提示，不打开输入、不自动提交
     mock.pendingItems = [{
       interaction_id: 'x1', operation_id: 'op-x', kind: 'order_retry', status: 'pending',
       created_at: 1, expires_at: Date.now() / 1000 + 300, request: {}, request_redacted: true,
@@ -2159,10 +2143,10 @@ async function main() {
     mock.resolveDecisionCalls = 0
     await cdp.send('Page.reload', { ignoreCache: true })
     await cdp.waitFor(`document.body && document.body.innerText.includes('任务工作台')`)
-    await cdp.waitFor(`document.body.innerText.includes('属于其他账号')`)
+    await cdp.waitFor(`document.body.innerText.includes('未返回明细')`)
     const redactedState = await cdp.eval(`({ dialogs: document.querySelectorAll('[role="alertdialog"]').length, text: document.body.innerText })`)
-    record('pending 权限脱敏只显示元数据提示，不打开输入', redactedState.dialogs === 0 && redactedState.text.includes('属于其他账号') && redactedState.text.includes('不会自动提交'), JSON.stringify({ dialogs: redactedState.dialogs }))
-    record('pending 权限脱敏不自动提交', mock.resolveDecisionCalls === 0, `resolveCalls=${mock.resolveDecisionCalls}`)
+    record('pending 脱敏只显示元数据提示，不打开输入', redactedState.dialogs === 0 && redactedState.text.includes('未返回明细') && redactedState.text.includes('不会自动提交'), JSON.stringify({ dialogs: redactedState.dialogs }))
+    record('pending 脱敏不自动提交', mock.resolveDecisionCalls === 0, `resolveCalls=${mock.resolveDecisionCalls}`)
     mock.pendingItems = []
 
     // ---------- 5b. W6：计划口径 vs 已核实完成 ----------
@@ -2193,7 +2177,6 @@ async function main() {
       await new Promise((r) => setTimeout(r, 400))
     }
 
-    mock.isAdmin = true
     mock.operationStatus = null
     mock.wpsRecovery = {
       ok: true, contract_version: 1, source: 'local_journal', read_only: true,
@@ -2876,8 +2859,8 @@ async function main() {
     mock.wpsUploadDelay = 0
     await reloadApp(cdp)
 
-    // ---------- 5e. W3：管理员恢复流程 ----------
-    enterScenario('5e W3 管理员恢复')
+    // ---------- 5e. W3：旧任务恢复/退场流程 ----------
+    enterScenario('5e W3 恢复流程')
     const recoveryOp = {
       operation_id: 'wps-1234567890abcdef', operation_ref: 'wps-op:abcdef123456',
       status: 'uncertain', pending: true, cloud_checked: true,
@@ -2914,26 +2897,6 @@ async function main() {
     mock.wpsResolveNetwork = false
     mock.wpsResolveForbidden = false
 
-    // 非管理员：没有恢复处置入口，也无法提交
-    mock.isAdmin = false
-    await reloadApp(cdp)
-    assert.ok(await ensureCloudPanel(cdp, '待核对批次（只读可见）'), '云文档页签/恢复卡片未出现')
-    const nonAdminState = await cdp.eval(`({
-      text: document.body.innerText,
-      resolveButtons: [...document.querySelectorAll('button')].filter((b) => (b.textContent || '').includes('管理员恢复处置')).length,
-    })`)
-    record(
-      'W3 非管理员看不到恢复处置入口',
-      nonAdminState.resolveButtons === 0
-        && nonAdminState.text.includes('当前账号没有恢复处置权限')
-        && !nonAdminState.text.includes('删除账本'),
-      `resolveButtons=${nonAdminState.resolveButtons} :: ` + nearText(nonAdminState.text, '当前账号没有恢复处置权限')
-        + ' :: hasDeleteLedger=' + nonAdminState.text.includes('删除账本'),
-    )
-    record('W3 非管理员刷新不会调用恢复写入', mock.wpsResolveCalls === 0, `resolveCalls=${mock.wpsResolveCalls}`)
-
-    // 管理员：完整流程
-    mock.isAdmin = true
     await reloadApp(cdp)
     assert.ok(await ensureCloudPanel(cdp, '待核对批次（只读可见）'), '云文档页签/恢复卡片未出现')
     const callsAfterRefresh = mock.wpsResolveCalls
@@ -2946,8 +2909,8 @@ async function main() {
       ]),
       `len=${panelText.length} ` + nearText(panelText, '待核对批次（只读可见）', 320),
     )
-    assert.ok(await cdp.eval(clickButtonJs('管理员恢复处置')), '找不到管理员恢复处置按钮')
-    await cdp.waitFor(`document.body.innerText.includes('管理员恢复/退场处置')`)
+    assert.ok(await cdp.eval(clickButtonJs('恢复处置')), '找不到恢复处置按钮')
+    await cdp.waitFor(`document.body.innerText.includes('旧任务恢复/退场处置')`)
     const dialogProbe = await cdp.eval(`(() => {
       const dialog = document.querySelector('[role="dialog"]')
       const text = document.body.innerText
@@ -3056,13 +3019,13 @@ async function main() {
       })(),
       JSON.stringify(mock.wpsResolvePayloads[0] || null),
     )
-    // 权限不足（服务端 403）：保留阻断、不显示成功、不重试
-    enterScenario('5e 恢复处置：无权限 403（预期）')
+    // 服务端 403 拒绝：保留阻断、不显示成功、不重试
+    enterScenario('5e 恢复处置：服务端 403 拒绝（预期）')
     mock.wpsResolveForbidden = true
     mock.wpsResolveDelay = 0
     const callsBeforeResolveForbidden = mock.wpsResolveCalls
-    assert.ok(await cdp.eval(clickButtonJs('管理员恢复处置')), '找不到管理员恢复处置按钮')
-    await cdp.waitFor(`document.body.innerText.includes('管理员恢复/退场处置')`)
+    assert.ok(await cdp.eval(clickButtonJs('恢复处置')), '找不到恢复处置按钮')
+    await cdp.waitFor(`document.body.innerText.includes('旧任务恢复/退场处置')`)
     assert.ok(await cdp.eval(clickDialogRadioJs('keep')), '找不到 keep 决策单选项')
     assert.ok(await cdp.eval(setDialogInputJs('#wps-resolve-note', '已人工只读核对云端排单表')), '无法写入备注')
     assert.ok(await cdp.eval(setDialogInputJs('#wps-resolve-confirm', 'keep')), '无法写入确认串')
@@ -3071,8 +3034,8 @@ async function main() {
     await new Promise((r) => setTimeout(r, 900))
     const resolveForbiddenText = await cdp.eval('document.body.innerText')
     record(
-      'W3 权限不足无法提交恢复：准确权限提示 + 阻断保持 + 不显示成功',
-      resolveForbiddenText.includes('当前账号没有该权限')
+      'W3 被 403 拒绝时无法提交恢复：准确提示 + 阻断保持 + 不显示成功',
+      resolveForbiddenText.includes('恢复请求被服务端拒绝')
         && resolveForbiddenText.includes('阻断仍然保留')
         && !resolveForbiddenText.includes('恢复处置：已带审计退场')
         && mock.wpsResolveCalls - callsBeforeResolveForbidden === 1,
@@ -3084,8 +3047,8 @@ async function main() {
     enterScenario('5e 恢复处置：网络失败（故意断网）')
     mock.wpsResolveNetwork = true
     const callsBeforeNetwork = mock.wpsResolveCalls
-    assert.ok(await cdp.eval(clickButtonJs('管理员恢复处置')), '找不到管理员恢复处置按钮')
-    await cdp.waitFor(`document.body.innerText.includes('管理员恢复/退场处置')`)
+    assert.ok(await cdp.eval(clickButtonJs('恢复处置')), '找不到恢复处置按钮')
+    await cdp.waitFor(`document.body.innerText.includes('旧任务恢复/退场处置')`)
     assert.ok(await cdp.eval(clickDialogRadioJs('keep')), '找不到 keep 决策单选项')
     assert.ok(await cdp.eval(setDialogInputJs('#wps-resolve-note', '已人工只读核对云端排单表')), '无法写入备注')
     assert.ok(await cdp.eval(setDialogInputJs('#wps-resolve-confirm', 'keep')), '无法写入确认串')
@@ -3113,8 +3076,8 @@ async function main() {
       scope: { operation_ref: 'wps-op:abcdef123456', target_dates: ['2026-09-20'], target_refs: [], sheet_count: 1, guard_retained: true, blocking: 'retired_guarded' },
       audit: { actor: 'admin@example.com', at: '2026-09-20T10:05:00', decision: 'retire_guarded', note_recorded: true, duplicate: true, effects: { cloud_written: false, guard_retained: true, blocking: 'retired_guarded', auto_retry_allowed: false } },
     }
-    assert.ok(await cdp.eval(clickButtonJs('管理员恢复处置')), '找不到管理员恢复处置按钮')
-    await cdp.waitFor(`document.body.innerText.includes('管理员恢复/退场处置')`)
+    assert.ok(await cdp.eval(clickButtonJs('恢复处置')), '找不到恢复处置按钮')
+    await cdp.waitFor(`document.body.innerText.includes('旧任务恢复/退场处置')`)
     assert.ok(await cdp.eval(clickDialogRadioJs('keep')), '找不到 keep 决策单选项')
     assert.ok(await cdp.eval(setDialogInputJs('#wps-resolve-note', '已人工只读核对云端排单表')), '无法写入备注')
     assert.ok(await cdp.eval(setDialogInputJs('#wps-resolve-confirm', 'keep')), '无法写入确认串')
@@ -3187,13 +3150,12 @@ async function main() {
     // ---------- 5f. 弹窗窄屏/横屏/长错误提示/可达性 ----------
     enterScenario('5f 弹窗窄屏横屏可达性')
     mock.wpsRecovery = adminRecoveryStatus
-    mock.isAdmin = true
     await reloadApp(cdp)
     for (const [label, width, height] of [['360x800', 360, 800], ['800x450 landscape', 800, 450]]) {
       await cdp.viewport(width, height)
       assert.ok(await ensureCloudPanel(cdp, '待核对批次（只读可见）'), `云文档页签/恢复卡片未出现 ${label}`)
-      if (await cdp.eval(clickButtonJs('管理员恢复处置'))) {
-        await cdp.waitFor(`document.body.innerText.includes('管理员恢复/退场处置')`)
+      if (await cdp.eval(clickButtonJs('恢复处置'))) {
+        await cdp.waitFor(`document.body.innerText.includes('旧任务恢复/退场处置')`)
         await new Promise((r) => setTimeout(r, 250))
         const dialogLayout = await cdp.eval(`(() => {
           const dialog = document.querySelector('[role="dialog"]')
@@ -3233,11 +3195,11 @@ async function main() {
         await new Promise((r) => setTimeout(r, 300))
         record(
           `W3 恢复弹窗 ${label} 可用 Escape 关闭`,
-          (await cdp.eval(`!document.body.innerText.includes('管理员恢复/退场处置')`)) === true,
+          (await cdp.eval(`!document.body.innerText.includes('旧任务恢复/退场处置')`)) === true,
           '',
         )
       } else {
-        record(`W3 恢复弹窗 ${label} 无横向溢出且操作区可达`, false, '找不到管理员恢复处置按钮')
+        record(`W3 恢复弹窗 ${label} 无横向溢出且操作区可达`, false, '找不到恢复处置按钮')
       }
     }
 
@@ -3325,7 +3287,6 @@ async function main() {
     // 本节用真实渲染 + 真实点击锁住修复后的行为；纯圆心计算测试挡不住这类回归。
     enterScenario('7 手机日志悬浮按钮')
     mock.operationStatus = idleOperation()
-    mock.isAdmin = true
     mock.clearResult = 'success'
     await cdp.viewport(390, 844)
     await reloadApp(cdp)
@@ -3896,7 +3857,6 @@ async function main() {
     // 本节用 CDP 真实鼠标事件走浏览器命中测试：被盖住就点不到，能开合才算过。
     enterScenario('8 手机端提示条与日志按钮')
     mock.operationStatus = idleOperation()
-    mock.isAdmin = true
     mock.stopTaskCalls = 0
     await cdp.viewport(390, 844)
     await reloadApp(cdp)
@@ -4235,7 +4195,6 @@ async function main() {
     // 因此不可能盖住任何关键内容；桌面/平板仍是 sonner 默认的右下角浮层。
     enterScenario('9 手机端提示区域占布局')
     mock.operationStatus = idleOperation()
-    mock.isAdmin = true
     mock.pendingItems = []
     await cdp.viewport(390, 844)
     await reloadApp(cdp)
@@ -4294,7 +4253,7 @@ async function main() {
       JSON.stringify(chromeShown?.status),
     )
 
-    // 9.3 失败原因横幅（真实渲染：属于其他账号的待处理交互）不被遮挡
+    // 9.3 失败原因横幅（真实渲染：未返回明细的待处理交互）不被遮挡
     enterScenario('9b 提示不遮失败原因横幅')
     mock.pendingItems = [{
       interaction_id: 'notice-r1', operation_id: 'op-notice', kind: 'captcha', status: 'pending',
@@ -4303,7 +4262,7 @@ async function main() {
     await cdp.viewport(390, 844)
     await reloadApp(cdp)
     assert.ok(
-      await cdp.waitFor(`document.body.innerText.includes('属于其他账号')`, 6000),
+      await cdp.waitFor(`document.body.innerText.includes('未返回明细')`, 6000),
       '失败原因横幅（脱敏待处理）未出现',
     )
     await toastThenCloseLog()
@@ -4311,7 +4270,7 @@ async function main() {
     const bannerChrome = await cdp.eval(phoneChromeProbeJs)
     record(
       '提示不遮失败原因横幅（不相交 + 横幅文案仍在 + 中心命中横幅自身）',
-      bannerChrome?.banner?.found === true && bannerChrome.banner.text.includes('属于其他账号')
+      bannerChrome?.banner?.found === true && bannerChrome.banner.text.includes('未返回明细')
         && overlaps(bannerNotice?.rect, bannerChrome.banner.rect) === false
         && bannerChrome.banner.hitSelf === true,
       JSON.stringify({ banner: bannerChrome?.banner, region: bannerNotice?.rect }),
@@ -4911,7 +4870,7 @@ async function main() {
       })()`, 6000)
       await reloadApp(cdp)
     }
-    /** 管理员凭据在高级设置里：展开后写入密码草稿（不提交、不触网）。 */
+    /** 平台凭据在高级设置里：展开后写入密码草稿（不提交、不触网）。 */
     async function setSssPasswordDraft(value) {
       const visible = await cdp.eval(`(() => { const el = document.querySelector('#sss-password'); return Boolean(el) && el.getBoundingClientRect().width > 0 })()`)
       if (!visible) {
@@ -4988,7 +4947,7 @@ async function main() {
 
     // A2) 确认页：按当前账号/当前名单先对账再补缺失项，可能费用与列表延迟都写明；
     //     未勾选确认句不可提交；取消不启动；双击只发一次 start_sss。
-    // 表单校验是补单的前置（保持既有语义）：先补上管理员凭据草稿，否则确认页不会打开。
+    // 表单校验是补单的前置（保持既有语义）：先补上平台凭据草稿，否则确认页不会打开。
     await setSssPasswordDraft('draft-b3-sss')
     assert.ok(await cdp.eval(clickByTextJs('button', '核对并补单')), '点不到核对并补单主按钮')
     await new Promise((r) => setTimeout(r, 450))

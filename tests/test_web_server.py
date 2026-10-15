@@ -118,14 +118,10 @@ def test_healthz_needs_no_token(server):
 
 @pytest.mark.parametrize("token", [None, "", "wrong"])
 def test_bridge_calls_require_a_valid_token(server, token):
-    """无有效凭据的 API 调用必须 401。
-
-    code 从 ``unauthorized`` 改为 ``login_required``：现在凭据体系是「账号会话」
-    而不是单一静态令牌，提示语要引导用户去登录。
-    """
+    """无有效令牌的 API 调用必须 401。"""
     status, body = _request(server, "POST", "/api/bridge_ready", [], token=token)
     assert status == 401
-    assert body["code"] == "login_required"
+    assert body["code"] == "token_required"
 
 
 def test_token_is_also_accepted_from_query_string(server):
@@ -133,6 +129,38 @@ def test_token_is_also_accepted_from_query_string(server):
                             token=None)
     assert status == 200
     assert body["version"]
+
+
+def test_gateway_requests_are_refused_even_with_a_valid_token(server):
+    """经网关进来的请求一律 403：公网入口不再可用，令牌不得在那里生效。"""
+    port = server.server_address[1]
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/bridge_ready?token=secret",
+        data=b"[]", method="POST")
+    request.add_header("Content-Type", "application/json")
+    request.add_header("CF-Connecting-IP", "203.0.113.7")
+    request.add_header("X-Forwarded-For", "203.0.113.7")
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(request, timeout=10)
+    assert excinfo.value.code == 403
+    assert json.loads(excinfo.value.read().decode("utf-8"))["code"] == "remote_denied"
+
+    # 页面请求给可读的 HTML，而不是 JSON。
+    page = urllib.request.Request(f"http://127.0.0.1:{port}/?token=secret")
+    page.add_header("CF-Ray", "abc123")
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(page, timeout=10)
+    assert excinfo.value.code == 403
+    assert "网关" in excinfo.value.read().decode("utf-8")
+
+
+def test_gateway_request_to_healthz_is_still_allowed(server):
+    """探活是所有路径里唯一的例外：网关后面也可能有人做连通性探测。"""
+    port = server.server_address[1]
+    request = urllib.request.Request(f"http://127.0.0.1:{port}/healthz")
+    request.add_header("CF-Connecting-IP", "203.0.113.7")
+    with urllib.request.urlopen(request, timeout=10) as response:
+        assert response.status == 200
 
 
 # ----------------------------------------------------------------------
@@ -218,15 +246,11 @@ def test_state_change_survives_round_trip(server):
 # ----------------------------------------------------------------------
 # 静态资源
 # ----------------------------------------------------------------------
-def test_index_html_requires_login(server):
-    """行为变更：首页不再对公网匿名开放，未登录一律跳到登录页。
-
-    旧实现把界面连同全部静态资源匿名开放，只给 /api/* 上锁；公网暴露后任何人
-    都能看到完整界面。现在整站都要先通过账号鉴权。
-    """
-    status, headers = _request_status(server, "GET", "/", token=None)
-    assert status == 302
-    assert headers["Location"].startswith("/login")
+def test_index_html_requires_the_token(server):
+    """整站都要令牌：没有它连界面都不给看（不再重定向到任何登录页）。"""
+    status, body = _request(server, "GET", "/", token=None, raw=True)
+    assert status == 401
+    assert "访问令牌" in body
 
 
 def test_index_html_is_served_with_token(server):
@@ -246,10 +270,11 @@ def test_path_traversal_is_rejected(server, path):
     assert status in (403, 404)
 
 
-def test_query_string_token_still_works_for_local_recovery(server):
-    """本地直连仍可用 ?token= 自救（忘记管理员密码时进审批页）。"""
-    status, body = _request(server, "GET", "/healthz", token=None)
+def test_query_string_token_opens_the_app(server):
+    """本机/局域网直连用 ?token= 直接进界面（APK 的 WebView 就是这么加载的）。"""
+    status, body = _request(server, "GET", "/?token=secret", token=None, raw=True)
     assert status == 200
+    assert "<!doctype html" in body.lower()
 
 
 # ----------------------------------------------------------------------
@@ -280,7 +305,7 @@ def test_fs_list_reports_missing_directory(server, tmp_path):
 def test_fs_list_is_authenticated(server, tmp_path):
     status, body = _request(server, "GET", f"/api/fs/list?path={tmp_path}", token=None)
     assert status == 401
-    assert body["code"] == "login_required"
+    assert body["code"] == "token_required"
 
 
 def test_fs_list_result_is_json_serialisable(server, tmp_path):
@@ -365,9 +390,8 @@ def test_lan_addresses_rank_ethernet_before_vpn(monkeypatch):
 def test_client_disconnect_does_not_raise(server, monkeypatch, error):
     """客户端中途断开时不能抛异常。
 
-    真实故障：访客输错密码，服务正要回「密码不正确」的重定向，此时回源连接被掐断，
-    写 socket 抛 BrokenPipeError。未捕获 → 请求异常结束 → Cloudflare 判定源站无响应
-    → 访客看到 **502 Bad Gateway**，而不是那句本该出现的提示。
+    真实故障：服务正要回响应，此时连接被掐断，写 socket 抛 BrokenPipeError。
+    未捕获 → 请求异常结束，本该出现的提示变成了一个错误响应。
 
     这里直接让 wfile.write 抛错，断言请求处理不再向外冒异常，并关掉 keep-alive。
     """

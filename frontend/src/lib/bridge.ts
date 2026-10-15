@@ -652,8 +652,6 @@ export interface SssDiagnosticsReadResult {
 export interface AppState {
   version: string
   status: StatusState
-  /** 当前登录账号是否管理员。后端按会话判定，前端据此只做显示裁剪。 */
-  is_admin?: boolean
   /** Python 进程标识：用于识别重启后 sequence 归零，避免复用旧 cursor。 */
   event_producer_id?: string
   /** 运行平台：android = APK 自带 WebView；web = 纯浏览器访问。 */
@@ -904,8 +902,8 @@ interface BackendApi {
   wps_status(): Promise<WpsStatus>
   wps_recovery_status(): Promise<WpsRecoveryStatus>
   /**
-   * 管理员专用（普通用户 HTTP 403 `admin_only`）。
-   * 只改本地 journal 审计，**永不写云端**；不提供“删除账本/直接重传”。
+   * 旧任务恢复/退场处置。只改本地 journal 审计，**永不写云端**；
+   * 不提供“删除账本/直接重传”。
    */
   wps_recovery_resolve(payload: WpsRecoveryResolvePayload): Promise<WpsRecoveryResolveResult>
   wps_preview(): Promise<WpsPreviewResult>

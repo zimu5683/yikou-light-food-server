@@ -30,22 +30,19 @@ python run.py --web --port 9000      # 换端口；--host 127.0.0.1 只允许本
 `app/api/bridge.py`；事件是「Python 追加 + 前端按 cursor 轮询」，不需要 WebSocket。
 「选择 Excel 文件」用的是**主机上**的文件浏览器（任务与 Excel 都在主机上）。
 
-### 账号与访问审批
+### 访问令牌
 
-网页版等于把这台机器的完整操作权限交给「能进得来的人」，因此除了令牌还有一套账号体系：
-整站（含首页与静态资源）都要求登录，未登录一律跳 `/login`。
+网页版等于把这台机器的完整操作权限交给「能连上端口的人」，所以有一道**访问令牌**：
+除 `/healthz` 外，所有路径（含首页与静态资源）都要带令牌，否则 401。
 
-- **注册申请**：访客在登录页填账号密码提交申请，进入待审批队列；
-- **管理员审批**：`approved` 之前**密码正确也登不进来**；管理员在 `/admin` 点同意/拒绝，
-  也可生成邀请码让凭码注册直接通过，省一轮人工审批；
-- **会话**：登录成功发 `HttpOnly` 会话 Cookie（30 天）；失效/被拒/改密后旧会话立即失效。
-
-```bash
-python run.py --web --create-admin          # 交互式创建第一个管理员（--username 指定账号名）
-python run.py --web --reset-admin-password  # 忘记密码时重置；--list-users 列出账号与审批状态
-```
-
-账号数据落在用户配置目录的 `users.json`（手机上是 `~/.config/yikou-light-food/`）。
+- 令牌由服务首次启动时生成，落在用户配置目录的 `web_token`（手机上是
+  `~/.config/yikou-light-food/`）；启动时终端会打印可直接点开的带 `?token=` 网址。
+- 客户端可以带 `?token=<令牌>`（APK 的 WebView 就是这么加载的，前端会把它存下来并
+  在后续 API 调用上换成 `X-Yikou-Token` 请求头），也可以直接发 `X-Yikou-Token`。
+- 轮换：`python run.py --web --new-token`；轮换后所有旧网址立即失效。
+- **账号体系（注册 / 登录 / 管理员审批 / 会话 Cookie）已于 2026-10-15 整体删除**：
+  项目是自用工具，没有第二个人需要区分权限。`/login`、`/logout`、`/admin` 与
+  `--create-admin` / `--list-users` / `--reset-admin-password` 都不再存在。
 
 ### Android APK（arm64 独立安装）
 
@@ -151,25 +148,24 @@ cd frontend && pnpm install && pnpm build
 .venv/bin/python run.py
 ```
 
-## 部署与公网访问
+## 部署与访问范围
 
-手机在 CGNAT 后面没有公网 IP，用 Cloudflare Tunnel 由手机主动向 Cloudflare 建出站连接，
-公网请求沿该连接回源，因此不需要公网 IP、端口映射或 DDNS（**不要做端口映射**）。
-服务用 runit 托管（崩溃自动拉起、开机自动启动），开机自启依赖 **Termux:Boot**；`/admin`
-建议再叠一层 Cloudflare Access：设好 `YIKOU_ACCESS_TEAM_DOMAIN` 与 `YIKOU_ACCESS_AUD`
-后该页会校验 `Cf-Access-Jwt-Assertion` 的签名。
+**本服务只接受本机与局域网直连**：手机/主机与访问设备在同一网络里，浏览器直接打开
+`http://<主机IP>:8756/?token=<令牌>` 即可。服务用 runit 托管（崩溃自动拉起、开机自动启动），
+开机自启依赖 **Termux:Boot**。
 
-- 手机开着 VPN/代理时 `cloudflared` 必须加 `--protocol http2`（默认 QUIC 会被 fake-ip
-  代理破坏，症状是隧道 inactive、公网 1033）；它是隐藏参数，清理参数时不要删。`pkg upgrade`
-  可能覆盖包自带的 run 脚本、冲掉该参数，用 `~/fix-http2.sh` 一键重放。
-
-> ⚠️ **域名阻断（2026-09-16 实测）**：`zimu5683.kdns.fr` 在中国大陆被 SNI 阻断，服务端与隧道正常，**换一个未被阻断的域名即可**；证据链与换域名步骤见 [design/公网访问现状与域名阻断.md](design/公网访问现状与域名阻断.md)。
+- **公网入口已关闭（2026-10-15）**：服务端一旦看到 `CF-Connecting-IP` / `CF-Ray` /
+  `X-Forwarded-For` / `X-Forwarded-Proto` 任一请求头，就直接 403 `remote_denied`
+  （`/healthz` 除外，探活仍可用），令牌在那里也不生效。原先给公网准备的
+  Cloudflare Tunnel 与 Cloudflare Access 因此都成了死路，**隧道可以停掉**
+  （`sv down cloudflared` 之类），历史方案见
+  [design/公网访问现状与域名阻断.md](design/公网访问现状与域名阻断.md)。
+- 纯局域网 HTTP 理论上可被同网段嗅探，令牌可能被旁路；只剩你自己用的场景下这是可接受的。
 
 ## 已知限制
 
 - **令牌只对本地/局域网直连有效**：请求经网关（带 `CF-Connecting-IP` / `X-Forwarded-*`）
-  进来时 `?token=` 一律失效，不能绕过审批；服务自身只提供 HTTP，公网 HTTPS 由 Cloudflare
-  边缘终结，纯局域网 HTTP 理论上可被嗅探；
+  进来时一律 403，`?token=` 在那里不会生效；服务自身只提供 HTTP，
 - Termux 上云文档同步/闪时送云端名单**硬依赖 `pkg install proot`**：静态链接的 kdocs-cli
   读不到 `/etc/resolv.conf` 与 CA，Android seccomp 还会拦 `faccessat2`；
 - `ruff==0.15.22` 在 Android 上没有可安装的包，可用 `pkg install ruff` 代替，

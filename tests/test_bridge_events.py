@@ -14,7 +14,7 @@ class _AliveWorker:
 
 def test_event_replay_window_keeps_critical_events(tmp_path, monkeypatch):
     monkeypatch.setattr("app.api.bridge.EVENT_HISTORY_LIMIT", 10)
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     for index in range(50):
         bridge.log(f"log {index}")
     bridge._emit_event("task:done", {"message": "done", "stopped": False,
@@ -45,7 +45,7 @@ def test_event_replay_window_keeps_critical_events(tmp_path, monkeypatch):
 
 
 def test_decision_timeout_unblocks_worker(tmp_path):
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     bridge._interaction_timeout_s = 0.05
     result: list[str] = []
 
@@ -63,7 +63,7 @@ def test_decision_timeout_unblocks_worker(tmp_path):
 
 
 def test_address_input_event_and_resolve(tmp_path):
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     bridge._interaction_timeout_s = 2.0
     result: list[dict[str, str]] = []
     items = [{"raw_address": "教学楼-南门", "order_numbers": ["W16", "W15"],
@@ -94,7 +94,7 @@ def test_address_input_event_and_resolve(tmp_path):
 
 
 def test_address_input_timeout_returns_empty_mapping(tmp_path):
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     bridge._interaction_timeout_s = 0.05
     result: list[dict[str, str]] = []
 
@@ -113,7 +113,7 @@ def test_address_input_timeout_returns_empty_mapping(tmp_path):
 
 
 def test_stop_task_wakes_captcha_waiter(tmp_path):
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     bridge._worker = _AliveWorker()  # type: ignore[assignment]
     bridge._interaction_timeout_s = 5.0
     errors: list[BaseException] = []
@@ -138,7 +138,7 @@ def test_stop_task_wakes_captcha_waiter(tmp_path):
 
 
 def test_request_close_timeout_leaves_no_pending_interaction(tmp_path):
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     bridge._worker = _AliveWorker()  # type: ignore[assignment]
     bridge._interaction_timeout_s = 0.05
 
@@ -150,7 +150,7 @@ def test_request_close_timeout_leaves_no_pending_interaction(tmp_path):
 
 def test_ack_sequence_prunes_acknowledged_events(tmp_path, monkeypatch):
     monkeypatch.setattr("app.api.bridge.EVENT_ACK_RETAIN", 1)
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     for index in range(5):
         bridge.log(f"log {index}")
 
@@ -164,7 +164,7 @@ def test_ack_sequence_prunes_acknowledged_events(tmp_path, monkeypatch):
 
 def test_middle_sequence_gap_emits_dropped_notice(tmp_path, monkeypatch):
     monkeypatch.setattr("app.api.bridge.EVENT_HISTORY_LIMIT", 10)
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     bridge._emit_event("task:done", {"message": "done", "stopped": False,
                                      "partial": False, "result": {}})
     for index in range(20):
@@ -183,7 +183,7 @@ def test_middle_sequence_gap_emits_dropped_notice(tmp_path, monkeypatch):
 
 def test_critical_events_have_explicit_cap_notice(tmp_path, monkeypatch):
     monkeypatch.setattr("app.api.bridge.CRITICAL_EVENT_LIMIT", 2)
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     for index in range(4):
         bridge._emit_event("task:error", {"message": str(index)})
 
@@ -197,7 +197,7 @@ def test_critical_events_have_explicit_cap_notice(tmp_path, monkeypatch):
 
 def test_ack_from_other_producer_is_ignored(tmp_path, monkeypatch):
     monkeypatch.setattr("app.api.bridge.EVENT_ACK_RETAIN", 1)
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     for index in range(3):
         bridge.log(f"log {index}")
 
@@ -212,7 +212,7 @@ def test_ack_from_other_producer_is_ignored(tmp_path, monkeypatch):
 def test_dropped_ranges_merge_even_when_critical_pruned_after_logs(tmp_path, monkeypatch):
     monkeypatch.setattr("app.api.bridge.EVENT_HISTORY_LIMIT", 3)
     monkeypatch.setattr("app.api.bridge.CRITICAL_EVENT_LIMIT", 1)
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     bridge._emit_event("task:done", {"message": "1", "stopped": False,
                                      "partial": False, "result": {}})
     for index in range(3):
@@ -232,7 +232,7 @@ def test_dropped_ranges_merge_even_when_critical_pruned_after_logs(tmp_path, mon
 
 
 def test_sss_day_orders_rejects_while_worker_running(tmp_path):
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     bridge._worker = _AliveWorker()
     result = bridge.sss_day_orders()
     assert result["ok"] is False
@@ -246,7 +246,7 @@ def test_sss_day_orders_reports_import_refusal(tmp_path, monkeypatch):
         raise ImportRefused("读取云端表「东湖中餐」失败：未授权")
 
     monkeypatch.setattr("app.api.bridge.prepare_day_orders", refuse)
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     result = bridge.sss_day_orders()
     assert result["ok"] is False
     assert "未授权" in result["reason"]
@@ -273,7 +273,7 @@ def test_sss_day_orders_returns_counts_and_logs(tmp_path, monkeypatch):
 
     monkeypatch.setattr("app.api.bridge.prepare_day_orders",
                         lambda config, **kwargs: day)
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     result = bridge.sss_day_orders()
     assert result["ok"] is True
     assert result["target_date"] == "2026-09-16"

@@ -23,8 +23,7 @@ import pytest
 
 from app.api import bridge as bridge_module
 from app.api.bridge import Bridge
-from app.web.auth import AuthStore
-from app.web.server import SESSION_COOKIE, create_server
+from app.web.server import create_server
 from app.ordering import submission as sss_submission
 from app.ordering import uncertain as sss_uncertain
 from app.wps.executor import _refresh_journal_after_lock
@@ -383,7 +382,7 @@ class _DeleteBackend:
 )
 def test_clear_password_false_or_raise_never_reports_ok(
         tmp_path, monkeypatch, backend, expected_state):
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     bridge._config.phone_number = "13800000000"
     bridge._config.sss_account = "sss-user"
     monkeypatch.setattr(bridge_module, "delete_password", backend.delete)
@@ -398,7 +397,7 @@ def test_clear_password_false_or_raise_never_reports_ok(
 
 
 def _apply_result_via_bridge(tmp_path, executor_result: dict) -> dict:
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     bridge._wps_cli = lambda: SimpleNamespace(path="/fake/kdocs-cli")
     reservation = bridge._operations.try_reserve("wps_upload")
     assert reservation.granted
@@ -522,36 +521,12 @@ def _seed_recovery_journal(data_dir: Path) -> Path:
     return journal_path
 
 
-def test_non_admin_recovery_query_is_safe_summary(tmp_path, monkeypatch):
-    """普通用户可查询，但只得到安全摘要，不含客户/餐次/文件/路径原文。"""
-    data_dir = tmp_path / "data"
-    journal_path = _seed_recovery_journal(data_dir)
-    monkeypatch.setenv("YIKOU_DATA_DIR", str(data_dir))
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=False)
-    bridge.set_request_identity("bob")
-    before = journal_path.read_bytes()
-
-    got = bridge.wps_recovery_status()
-    after = journal_path.read_bytes()
-
-    assert got["ok"] is True, got
-    assert got["scope"] == "summary"
-    assert got["read_only"] is True and got["queried_cloud"] is False
-    assert before == after
-    assert "operations" not in got and "pending_operations" not in got
-    text = json.dumps(got, ensure_ascii=False)
-    for marker in ("张三", "13800000001", "总餐次应为", "SECRET_FILE_ID",
-                   "东湖中餐", str(data_dir), "学3-101"):
-        assert marker not in text, f"普通用户响应泄露了 {marker!r}: {text}"
-
-
-def test_admin_recovery_query_is_authorized_and_sanitized(tmp_path, monkeypatch):
-    """正向：管理员授权查询必须可用，但白名单 DTO 仍不得含客户/文件原文。"""
+def test_recovery_query_is_read_only_and_sanitized(tmp_path, monkeypatch):
+    """恢复查询必须可用，且白名单 DTO 仍不得含客户/文件/路径原文。"""
     data_dir = tmp_path / "data-admin"
     journal_path = _seed_recovery_journal(data_dir)
     monkeypatch.setenv("YIKOU_DATA_DIR", str(data_dir))
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
-    bridge.set_request_identity("admin")
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     before = journal_path.read_bytes()
 
     got = bridge.wps_recovery_status()
@@ -563,8 +538,8 @@ def test_admin_recovery_query_is_authorized_and_sanitized(tmp_path, monkeypatch)
     assert journal_path.read_bytes() == before
     text = json.dumps(got, ensure_ascii=False)
     for marker in ("张三", "13800000001", "总餐次应为", "SECRET_FILE_ID",
-                   "学3-101", str(data_dir)):
-        assert marker not in text, f"管理员响应异常泄露了 {marker!r}: {text}"
+                   "东湖中餐", "学3-101", str(data_dir)):
+        assert marker not in text, f"恢复响应异常泄露了 {marker!r}: {text}"
 
 
 def test_recovery_query_corrupt_journal_error_is_sanitized(tmp_path, monkeypatch):
@@ -576,8 +551,7 @@ def test_recovery_query_corrupt_journal_error_is_sanitized(tmp_path, monkeypatch
     (data_dir / "wps_sync_state.json.journal").write_text(
         "{not-json 张三 13800000001 总餐次应为9", encoding="utf-8")
     monkeypatch.setenv("YIKOU_DATA_DIR", str(data_dir))
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=False)
-    bridge.set_request_identity("bob")
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
 
     got = bridge.wps_recovery_status()
 
@@ -588,15 +562,15 @@ def test_recovery_query_corrupt_journal_error_is_sanitized(tmp_path, monkeypatch
 
 
 def _http_call(server, method: str, path: str, *, body=None,
-               cookie: str | None = None) -> tuple[int, str]:
+               token: str | None = None) -> tuple[int, str]:
     port = server.server_address[1]
     headers: dict[str, str] = {}
     data = None
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    if cookie:
-        headers["Cookie"] = f"{SESSION_COOKIE}={cookie}"
+    if token:
+        headers["X-Yikou-Token"] = token
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}", data=data, method=method,
         headers=headers)
@@ -607,51 +581,20 @@ def _http_call(server, method: str, path: str, *, body=None,
         return exc.code, exc.read().decode("utf-8")
 
 
-def _http_token(server, username: str, password: str) -> str:
-    port = server.server_address[1]
-    data = urllib.parse.urlencode(
-        {"action": "login", "username": username,
-         "password": password}).encode("utf-8")
-    request = urllib.request.Request(
-        f"http://127.0.0.1:{port}/login", data=data, method="POST")
-    request.add_header("Content-Type", "application/x-www-form-urlencoded")
-
-    class _NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, *args, **kwargs):  # noqa: ANN002
-            return None
-
-    response = None
-    try:
-        response = urllib.request.build_opener(_NoRedirect).open(
-            request, timeout=15)
-    except urllib.error.HTTPError as exc:
-        response = exc
-    raw = response.headers.get("Set-Cookie", "")
-    assert f"{SESSION_COOKIE}=" in raw, raw
-    return raw.split(f"{SESSION_COOKIE}=", 1)[1].split(";", 1)[0]
-
-
-def test_recovery_http_permissions_redaction_and_read_only(tmp_path, monkeypatch):
-    """真实本地 HTTP：权限、脱敏、异常返回与查询只读性。"""
-    admin = "admin@example.com"
-    user = "worker@example.com"
-    admin_pw = "adminpw123"
-    user_pw = "workerpw123"
+def test_recovery_http_token_gate_redaction_and_read_only(tmp_path, monkeypatch):
+    """真实本地 HTTP：令牌闸门、脱敏、异常返回与查询只读性。"""
+    access_token = "synthetic-token-for-test"
 
     data_dir = tmp_path / "data"
     journal_path = _seed_recovery_journal(data_dir)
     monkeypatch.setenv("YIKOU_DATA_DIR", str(data_dir))
 
-    auth = AuthStore(tmp_path / "auth")
-    auth.create_admin(admin, admin_pw)
-    auth.register(user, user_pw)
-    auth.approve(user, by=admin)
     dist = tmp_path / "dist"
     dist.mkdir()
     (dist / "index.html").write_text("<!doctype html><title>t</title>",
                                      encoding="utf-8")
-    server = create_server("127.0.0.1", 0, dist_dir=dist,
-                           config_path=tmp_path / "config.json", auth=auth)
+    server = create_server("127.0.0.1", 0, dist_dir=dist, token=access_token,
+                           config_path=tmp_path / "config.json")
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
@@ -687,35 +630,24 @@ def test_recovery_http_permissions_redaction_and_read_only(tmp_path, monkeypatch
         status, _body = _http_call(server, "POST", "/api/wps_recovery_status",
                                    body=[])
         assert status == 401
+        wrong, _body = _http_call(server, "POST", "/api/wps_recovery_status",
+                                  body=[], token="not-the-token")
+        assert wrong == 401
 
-        user_cookie = _http_token(server, user, user_pw)
-        admin_cookie = _http_token(server, admin, admin_pw)
         before = journal_path.read_bytes()
 
-        user_status, user_text = _http_call(
+        ok_status, ok_text = _http_call(
             server, "POST", "/api/wps_recovery_status",
-            body=[], cookie=user_cookie)
-        assert user_status == 200, user_text
-        user_body = json.loads(user_text)
-        assert user_body["scope"] == "summary"
-        assert user_body["read_only"] is True
-        assert user_body["queried_cloud"] is False
-        assert "operations" not in user_body
-        assert "pending_operations" not in user_body
-        assert "future_unknown_count" not in user_body["counts"]
+            body=[], token=access_token)
+        assert ok_status == 200, ok_text
+        ok_body = json.loads(ok_text)
+        assert ok_body["read_only"] is True
+        assert ok_body["queried_cloud"] is False
+        assert isinstance(ok_body.get("operations"), list) and ok_body["operations"]
+        assert "future_unknown_count" not in ok_body["counts"]
 
-        admin_status, admin_text = _http_call(
-            server, "POST", "/api/wps_recovery_status",
-            body=[], cookie=admin_cookie)
-        assert admin_status == 200, admin_text
-        admin_body = json.loads(admin_text)
-        assert admin_body["scope"] == "admin"
-        assert isinstance(admin_body.get("operations"), list) and admin_body["operations"]
-        assert admin_body["read_only"] is True
-
-        for text in (user_text, admin_text):
-            for marker in markers:
-                assert marker not in text, f"HTTP 响应泄露 {marker!r}: {text}"
+        for marker in markers:
+            assert marker not in ok_text, f"HTTP 响应泄露 {marker!r}: {ok_text}"
         assert journal_path.read_bytes() == before, "恢复查询不得写 journal"
 
         # 异常路径：损坏 journal 原文夹带客户标记，响应必须只回安全 error_code。
@@ -725,7 +657,7 @@ def test_recovery_http_permissions_redaction_and_read_only(tmp_path, monkeypatch
         journal_path.write_text(corrupt, encoding="utf-8")
         err_status, err_text = _http_call(
             server, "POST", "/api/wps_recovery_status",
-            body=[], cookie=user_cookie)
+            body=[], token=access_token)
         assert err_status == 200, err_text
         err_body = json.loads(err_text)
         assert err_body["ok"] is False
@@ -737,26 +669,16 @@ def test_recovery_http_permissions_redaction_and_read_only(tmp_path, monkeypatch
         thread.join(timeout=5)
 
 
-def test_pending_interactions_owner_expiry_duplicate_and_cancel(tmp_path):
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=False)
-    bridge._task_owner = "alice"
-    bridge._task_owner_is_admin = False
+def test_pending_interactions_expiry_duplicate_and_cancel(tmp_path):
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     bridge._task_operation_id = "op-owner"
-    bridge.set_request_identity("alice")
 
     entry_id, entry = bridge._register_interaction("sss_retry", request={
         "title": "确认", "message": "m", "choices": [
             {"value": "retry", "label": "重试", "style": "primary"}]})
     assert bridge.pending_interactions()["count"] == 1
 
-    # 跨用户：bob 不可见也不可 resolve。
-    bridge.set_request_identity("bob")
-    assert bridge.pending_interactions()["count"] == 0
-    denied = bridge.resolve_decision(entry_id, "retry")
-    assert denied["ok"] is False and denied["status"] == "forbidden"
-
-    # 归属人：首次 resolve 成功，重复 resolve 必须 not_pending。
-    bridge.set_request_identity("alice")
+    # 首次 resolve 成功，重复 resolve 必须 not_pending。
     first = bridge.resolve_decision(entry_id, "retry")
     assert first["ok"] is True
     second = bridge.resolve_decision(entry_id, "retry")
@@ -764,7 +686,6 @@ def test_pending_interactions_owner_expiry_duplicate_and_cancel(tmp_path):
     assert entry.holder[-1] == "retry"
 
     # 过期：pending 查询隐藏，resolve 返回 expired。
-    bridge._task_owner = "alice"
     bridge._interaction_timeout_s = 0.01
     expired_id, _entry = bridge._register_interaction("captcha", request={"image": "x"})
     time.sleep(0.05)
@@ -776,7 +697,7 @@ def test_pending_interactions_owner_expiry_duplicate_and_cancel(tmp_path):
 def test_cancel_wakes_decision_worker_with_safe_default(tmp_path):
     import threading
 
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     bridge._interaction_timeout_s = 5.0
     result: list[str] = []
 
@@ -831,7 +752,7 @@ def test_probe_still_detects_dangerous_recovery_leak(monkeypatch):
                         dangerous_full)
     monkeypatch.setattr(
         Bridge, "_sanitize_wps_recovery",
-        staticmethod(lambda raw, *, viewer_admin: raw))
+        staticmethod(lambda raw: raw))
     probe = _load_probe_module()
     assert probe.probe_recovery_status_name_leak() is True
 

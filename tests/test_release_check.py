@@ -94,7 +94,7 @@ def test_remote_newer_version_is_an_update(monkeypatch):
 
 
 def _bridge(tmp_path) -> Bridge:
-    return Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    return Bridge(config_path=str(tmp_path / "config.json"))
 
 
 def test_worker_checks_the_release_exactly_once(tmp_path, monkeypatch):

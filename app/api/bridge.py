@@ -27,7 +27,6 @@ sequence 中间缺口和关键事件超限都会返回 ``events:dropped`` 告警
 """
 from __future__ import annotations
 
-import contextvars
 import copy
 import datetime as _dt
 import json
@@ -83,13 +82,6 @@ from app.wps.sync import (KdocsCli, SyncLedger, WpsCloudError, apply_plan,
 from app.wps import android_runtime
 
 logger = logging.getLogger(__name__)
-
-#: HTTP 请求线程的当前角色；None 表示回退到 Bridge 实例默认角色。
-_REQUEST_IS_ADMIN: contextvars.ContextVar[bool | None] = contextvars.ContextVar(
-    "yikou_bridge_request_is_admin", default=None)
-#: HTTP 请求线程的当前用户名；用于 pending interaction 的归属过滤。
-_REQUEST_IDENTITY: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "yikou_bridge_request_identity", default=None)
 
 EXCEL_EXTS = {".xlsx", ".xlsm"}
 # 文件对话框过滤器沿用 "描述 (*.a;*.b)" 写法（历史格式，保持配置兼容）。
@@ -153,22 +145,13 @@ class _PendingInteraction:
     created_at: float = 0.0
     expires_at: float = 0.0
     operation_id: str = ""
-    owner: str = ""
-    owner_is_admin: bool = False
     request: dict[str, Any] = field(default_factory=dict)
 
 
 class Bridge:
     """js_api 对象。公开方法（无下划线）均可被前端 Promise 调用。"""
 
-    def __init__(self, config_path: os.PathLike[str] | str | None = None, *,
-                 is_admin: bool = False) -> None:
-        """``is_admin`` 决定这个实例的权限级别。
-
-        **默认 False（非管理员）是刻意的**：任何忘记显式指定的地方都退化为「受限」，
-        而不是「全权」。网页版在每次请求时按会话账号重设（见 web_server），
-        桌面版与测试则以管理员身份构造。
-        """
+    def __init__(self, config_path: os.PathLike[str] | str | None = None) -> None:
         self._window: Any = None
         # config_path 供测试注入临时配置文件；生产环境沿用默认用户配置目录。
         self._config = AppConfig.load(config_path) if config_path else AppConfig.load()
@@ -197,14 +180,9 @@ class Bridge:
         self._decision_seq = 0
         self._decisions: dict[str, _PendingInteraction] = {}
         self._interaction_timeout_s = DEFAULT_INTERACTION_TIMEOUT_S
-        #: 当前任务归属：HTTP 会话身份 + 是否管理员；只用于交互只读过滤。
-        self._task_owner = ""
-        self._task_owner_is_admin = False
         #: 成功清除过的凭据，用于同一 Bridge 进程内重复 clear 的幂等判定。
         self._password_clear_lock = threading.Lock()
         self._cleared_password_accounts: set[tuple[str, str]] = set()
-        #: 实例默认角色；每个 HTTP 请求的会话角色由 ContextVar 临时覆盖。
-        self._is_admin = bool(is_admin)
         #: 统一互斥：订单 / 闪时送 / 云上传 / WPS 授权退出 / 更新。
         self._operations = OperationCoordinator()
         #: 一次性 WPS 上传预览令牌（只读哈希与指纹）。
@@ -217,42 +195,6 @@ class Bridge:
         self._authorize_operation_id = ""
         self._update_check_operation_id = ""
         self._update_install_operation_id = ""
-
-    # -- 请求局部权限上下文 --------------------------------------------
-    @property
-    def is_admin(self) -> bool:
-        """当前请求的角色。
-
-        网页版是共享 Bridge：请求线程调用 ``set_request_is_admin`` 写入
-        ContextVar，读到这里优先取请求局部值；没有请求上下文（单元测试、
-        桌面直调、后台 worker）时回退实例构造时的 ``_is_admin``。
-        这避免了“A 请求把共享实例改成管理员、B 请求又改回普通用户”的
-        串权限窗口，同时保留 ``Bridge(is_admin=True)`` 的直接可用性。
-        """
-        request_value = _REQUEST_IS_ADMIN.get()
-        if request_value is None:
-            return self._is_admin
-        return bool(request_value)
-
-    @is_admin.setter
-    def is_admin(self, value: bool) -> None:
-        self._is_admin = bool(value)
-
-    def set_request_is_admin(self, value: bool | None) -> None:
-        """网页版每个请求调用一次；``None`` 表示清回实例默认角色。"""
-        _REQUEST_IS_ADMIN.set(None if value is None else bool(value))
-
-    def set_request_identity(self, username: str | None) -> None:
-        """网页版每个请求写入当前登录用户名；``None`` 表示清空。"""
-        _REQUEST_IDENTITY.set((str(username).strip() or None)
-                              if username is not None else None)
-
-    def _request_identity(self) -> str:
-        return str(_REQUEST_IDENTITY.get() or "").strip()
-
-    def _clear_request_is_admin(self) -> None:
-        _REQUEST_IS_ADMIN.set(None)
-        _REQUEST_IDENTITY.set(None)
 
     # ------------------------------------------------------------------
     # 事件通道：保留窗口 + 前端 cursor 拉取
@@ -434,70 +376,6 @@ class Bridge:
         """当前任务状态（``ready``/``running``/``stopping``/``success``/``partial``/``stopped``/``error``/``updating``）。"""
         return self._status
 
-    #: 非管理员不可见（但任务仍按这些值运行）的配置字段。
-    #: 判据是「泄漏后能被用来做什么」：管理网址 + 手机号可用来接管下单目标、
-    #: Excel 路径暴露服务器目录结构、WPS 表格 ID 可直接改云端文档。
-    _ADMIN_ONLY_CONFIG = (
-        "target_url", "phone_number", "excel_path",
-        "sss_url", "sss_account", "sss_excel_path",
-        "wps_cli_path", "wps_drive_id", "wps_tables", "wps_test_tables",
-        "wps_test_file_id", "wps_test_drive_id",
-    )
-
-    def _visible_config(self, fields: dict[str, Any]) -> dict[str, Any]:
-        """按角色过滤配置字段。
-
-        非管理员这些字段**整体清空**（而不是保留真值）：界面隐藏挡不住任何人 ——
-        接口是公开可调的，真值一旦发出去就等于公开。
-        """
-        if self.is_admin:
-            return fields
-        for key in self._ADMIN_ONLY_CONFIG:
-            if key in fields:
-                current = fields[key]
-                fields[key] = type(current)() if isinstance(current, (dict, list)) else ""
-        return fields
-
-    def _forced_order_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """非管理员：下单目标一律取服务端预设，客户端传什么都不作数。
-
-        为什么必须在后端做：否则普通用户只要把 url/phone 指向自己的管理后台，
-        再点「开始处理」，就能让这台手机登录**别人的**平台并按其数据下单 ——
-        参数被隐藏毫无意义。
-
-        口令同样取自**服务端已保存的那份**（非管理员看不到密码输入框，
-        让他填既没意义也拦不住）——否则会卡在校验「请输入登录密码」而无法下单。
-        密钥环里没存过口令时仍会如实回报该错误，由管理员去「订单处理」里补一次，
-        这与原本的行为一致。``remember`` 强制 False：非管理员不该借下单
-        往密钥环写入或替换平台口令。
-        """
-        forced = dict(payload)
-        config = self._config
-        forced["url"] = config.target_url
-        forced["phone"] = config.phone_number
-        forced["excel"] = str(config.excel_path) if config.excel_path else ""
-        forced["password"] = (get_password(config.phone_number) or "") if config.phone_number else ""
-        forced["remember"] = False
-        return forced
-
-    def _forced_sss_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """非管理员：闪时送的账号/地址/Excel 同样强制取预设。
-
-        ``dry_run`` / ``preflight`` / ``product_name`` 保留 —— 它们是「怎么跑」，
-        不是「拿谁的账号、跑到哪个地址去」，属于受权范围内的操作选择。
-        """
-        forced = dict(payload)
-        config = self._config
-        forced["url"] = config.sss_url
-        forced["account"] = config.sss_account
-        forced["excel"] = str(config.sss_excel_path) if config.sss_excel_path else ""
-        forced["password"] = (get_sss_password(config.sss_account) or "") if config.sss_account else ""
-        forced["remember"] = False
-        for key in ("use_fixed_address", "fixed_lnt", "fixed_lat",
-                    "fixed_area_code", "fixed_address_detail", "common_address"):
-            forced.pop(key, None)
-        return forced
-
     # ------------------------------------------------------------------
     # 操作互斥与断线可查状态
     # ------------------------------------------------------------------
@@ -580,9 +458,6 @@ class Bridge:
             "platform": "android" if android_mode else "web",
             #: 是否支持应用内下载安装（当前只有 APK 模式支持）。
             "can_self_update": android_mode,
-            #: 前端据此决定显示哪些表单字段。真正的拦截在后端（见 _ADMIN_ONLY_CONFIG
-            #: 与 web_server 的方法白名单），前端只是不显示。
-            "is_admin": bool(self.is_admin),
             "config": {
                 "target_url": config.target_url,
                 "phone_number": config.phone_number,
@@ -616,14 +491,11 @@ class Bridge:
                 "wps_target_hour_end": config.wps_target_hour_end,
                 "wps_marker_enabled": config.wps_marker_enabled,
             },
-            # 密码只回给管理员：这是平台登录口令，拿到即可冒充管理员操作。
-            # 非管理员仍能下单 —— 服务端在 start_order/start_sss 里自己从密钥环取，
-            # 所以清空它不影响授权范围内的功能。
+            # 平台登录口令：整个服务只有一个使用者（本机/局域网令牌持有者），
+            # 前端需要用它回填「订单处理 / 闪时送下单」的密码框。
             "passwords": {
-                "order": (get_password(config.phone_number) if config.phone_number else "")
-                if self.is_admin else "",
-                "sss": (get_sss_password(config.sss_account) if config.sss_account else "")
-                if self.is_admin else "",
+                "order": get_password(config.phone_number) if config.phone_number else "",
+                "sss": get_sss_password(config.sss_account) if config.sss_account else "",
             },
         }
         try:
@@ -639,7 +511,6 @@ class Bridge:
             }
         state["operation"] = dict(operation)
         state["operations"] = list(operation.get("operations") or [])
-        state["config"] = self._visible_config(state["config"])
         return state
 
     # ------------------------------------------------------------------
@@ -663,8 +534,6 @@ class Bridge:
         operation = reservation.operation
         assert operation is not None
         try:
-            if not self.is_admin:
-                payload = self._forced_order_payload(payload)
             fields: dict[str, dict[str, str]] = {}
             url = str(payload.get("url", "")).strip()
             phone = str(payload.get("phone", "")).strip()
@@ -722,14 +591,10 @@ class Bridge:
                     self._cleared_password_accounts.discard(("order", phone))
             snapshot = copy.deepcopy(self._config)
             self._task_operation_id = operation.operation_id
-            self._task_owner = self._request_identity()
-            self._task_owner_is_admin = bool(self.is_admin)
             launched = self._launch("order", snapshot, count, password)
             if launched is False:
                 if self._task_operation_id == operation.operation_id:
                     self._task_operation_id = ""
-                    self._task_owner = ""
-                    self._task_owner_is_admin = False
                 self._operations.finish(
                     operation, status="rejected", reason="operation_conflict",
                     summary={"message": "启动时发现已有任务正在运行"},
@@ -744,8 +609,6 @@ class Bridge:
                     next_action="")
                 if self._task_operation_id == operation.operation_id:
                     self._task_operation_id = ""
-                    self._task_owner = ""
-                    self._task_owner_is_admin = False
             active = self._operations.is_active(operation)
             return {
                 "ok": True,
@@ -759,8 +622,6 @@ class Bridge:
         except Exception:
             if self._task_operation_id == operation.operation_id:
                 self._task_operation_id = ""
-                self._task_owner = ""
-                self._task_owner_is_admin = False
             self._operations.finish_if_active(
                 operation, status="error", reason="start_failed",
                 next_action="查看日志后重试")
@@ -782,8 +643,6 @@ class Bridge:
         operation = reservation.operation
         assert operation is not None
         try:
-            if not self.is_admin:
-                payload = self._forced_sss_payload(payload)
             fields = {}
             url = str(payload.get("url", "")).strip()
             account = str(payload.get("account", "")).strip()
@@ -865,14 +724,10 @@ class Bridge:
                     self._cleared_password_accounts.discard(("sss", account))
             snapshot = copy.deepcopy(self._config)
             self._task_operation_id = operation.operation_id
-            self._task_owner = self._request_identity()
-            self._task_owner_is_admin = bool(self.is_admin)
             launched = self._launch("sss", snapshot, None, password)
             if launched is False:
                 if self._task_operation_id == operation.operation_id:
                     self._task_operation_id = ""
-                    self._task_owner = ""
-                    self._task_owner_is_admin = False
                 self._operations.finish(
                     operation, status="rejected", reason="operation_conflict",
                     summary={"message": "启动时发现已有任务正在运行"},
@@ -886,8 +741,6 @@ class Bridge:
                     next_action="")
                 if self._task_operation_id == operation.operation_id:
                     self._task_operation_id = ""
-                    self._task_owner = ""
-                    self._task_owner_is_admin = False
             active = self._operations.is_active(operation)
             return {
                 "ok": True,
@@ -901,8 +754,6 @@ class Bridge:
         except Exception:
             if self._task_operation_id == operation.operation_id:
                 self._task_operation_id = ""
-                self._task_owner = ""
-                self._task_owner_is_admin = False
             self._operations.finish_if_active(
                 operation, status="error", reason="start_failed",
                 next_action="查看日志后重试")
@@ -1472,8 +1323,6 @@ class Bridge:
         operation_id = self._task_operation_id
         self._task_operation_id = ""
         self._cancel_pending_interactions("任务结束")
-        self._task_owner = ""
-        self._task_owner_is_admin = False
         self.log(outcome["message"], outcome["log_level"])
         self._worker = None
         status = outcome["status"]
@@ -1530,8 +1379,6 @@ class Bridge:
         operation_id = self._task_operation_id
         self._task_operation_id = ""
         self._cancel_pending_interactions("任务异常")
-        self._task_owner = ""
-        self._task_owner_is_admin = False
         self.log("错误: " + message, "ERROR")
         self._worker = None
         self._set_status("error")
@@ -1606,10 +1453,8 @@ class Bridge:
     def _register_interaction(self, kind: str,
                               request: dict[str, Any] | None = None
                               ) -> tuple[str, _PendingInteraction]:
-        """登记交互；记录稳定 operation_id 与所有者，供只读恢复过滤。"""
+        """登记交互；记录稳定 operation_id，供只读恢复配对。"""
         now = time.time()
-        owner = self._task_owner or self._request_identity()
-        owner_is_admin = bool(self._task_owner_is_admin or self.is_admin)
         with self._push_lock:
             self._decision_seq += 1
             prefix = "c" if kind == "captcha" else "d"
@@ -1621,8 +1466,6 @@ class Bridge:
                 expires_at=now + max(0.0, float(self._interaction_timeout_s)),
                 operation_id=(self._task_operation_id
                               or self._operations.active_operation_id()),
-                owner=owner,
-                owner_is_admin=owner_is_admin,
                 request=copy.deepcopy(dict(request or {})),
             )
             self._decisions[interaction_id] = entry
@@ -1753,16 +1596,13 @@ class Bridge:
         return {"title": title, "message": message, "choices": choices}
 
     def pending_interactions(self, operation_id: str = "") -> dict[str, Any]:
-        """只读列出当前有效且调用者有权处理的交互。
+        """只读列出当前有效的交互。
 
-        - 管理员可见全部；普通用户只可见自己发起的任务的交互。
         - ``operation_id`` 非空时只返回该操作名下的交互。
         - 只返回未过期的 pending 项；不会 resolve/消费/取消任何交互。
-        - 不返回密码、令牌、holder 中已提交的值或任务上下文之外的数据。
+        - 字段白名单过滤：不返回密码、令牌、holder 中已提交的值或任务上下文之外的数据。
         """
         wanted_operation = str(operation_id or "").strip()
-        viewer_admin = bool(self.is_admin)
-        viewer_identity = self._request_identity()
         now = time.time()
         with self._push_lock:
             entries = list(self._decisions.items())
@@ -1772,17 +1612,9 @@ class Bridge:
                 continue
             if wanted_operation and str(entry.operation_id or "") != wanted_operation:
                 continue
-            is_owner = bool(viewer_identity) and entry.owner == viewer_identity
-            if not viewer_admin and not is_owner:
-                # 普通用户必须是有名有姓的发起者本人；空 owner 的遗留/后台交互
-                # 不向普通用户公开，避免借旧 pending 列表越权。
-                continue
-            # 管理员如果不是该交互 owner，只给元数据；request 属于任务业务数据，
-            # 不把“管理员身份”默认等价于可见全部客户敏感明细。
-            request = (self._safe_pending_request(
+            request = self._safe_pending_request(
                 str(entry.kind or ""),
                 self._sanitize_interaction_request(dict(entry.request or {})))
-                if is_owner else {})
             item = {
                 "interaction_id": interaction_id,
                 "operation_id": str(entry.operation_id or ""),
@@ -1792,8 +1624,6 @@ class Bridge:
                 "status": "pending",
                 "request": request,
             }
-            if not is_owner:
-                item["request_redacted"] = True
             interactions.append(item)
         interactions.sort(key=lambda item: item["created_at"])
         return {
@@ -1815,14 +1645,6 @@ class Bridge:
                         "reason": "interaction_not_found_or_resolved",
                         "interaction_id": key, "operation_id": "",
                         "next_action": "pending_interactions"}
-            if not self.is_admin:
-                caller = self._request_identity()
-                if not caller or entry.owner != caller:
-                    return {"ok": False, "status": "forbidden",
-                            "reason": "interaction_not_owned_by_caller",
-                            "interaction_id": key,
-                            "operation_id": str(entry.operation_id or ""),
-                            "next_action": "pending_interactions"}
             if entry.kind not in kinds:
                 return {"ok": False, "status": "wrong_kind",
                         "reason": "interaction_kind_mismatch",
@@ -2400,8 +2222,7 @@ class Bridge:
         }
 
     @classmethod
-    def _wps_recovery_failure(cls, error_code: str, next_action: str,
-                              *, viewer_admin: bool) -> dict[str, Any]:
+    def _wps_recovery_failure(cls, error_code: str, next_action: str) -> dict[str, Any]:
         counts = cls._wps_recovery_counts({})
         code = cls._wps_recovery_error_code(error_code, ok=False)
         next_action = cls._wps_recovery_next_action(
@@ -2418,33 +2239,28 @@ class Bridge:
             "counts": counts,
             "next_action": next_action,
             "error_code": code,
-            "scope": "admin" if viewer_admin else "summary",
+            "scope": "admin",
         }
         base["summary"] = cls._wps_recovery_summary(
             [], counts, next_action, code)
-        if not viewer_admin:
-            base.pop("operations", None)
-            base.pop("pending_operations", None)
         return base
 
     @classmethod
-    def _sanitize_wps_recovery(cls, raw: Any, *, viewer_admin: bool) -> dict[str, Any]:
+    def _sanitize_wps_recovery(cls, raw: Any) -> dict[str, Any]:
         """把 B 的安全 DTO/任意底层返回重新做 Bridge 字段白名单。
 
         未知字段直接丢弃；异常/损坏/未知状态只返回稳定 error_code 与固定指引。
         """
         if not isinstance(raw, dict):
             return cls._wps_recovery_failure(
-                "wps_recovery_contract_invalid", "fix_journal",
-                viewer_admin=viewer_admin)
+                "wps_recovery_contract_invalid", "fix_journal")
         if not raw.get("ok"):
             code = cls._wps_recovery_error_code(
                 raw.get("error_code") or raw.get("reason"), ok=False)
             counts = cls._wps_recovery_counts(raw.get("counts"))
             next_action = cls._wps_recovery_next_action(
                 raw.get("next_action"), ok=False, counts=counts)
-            return cls._wps_recovery_failure(code, next_action,
-                                             viewer_admin=viewer_admin)
+            return cls._wps_recovery_failure(code, next_action)
         raw_operations = raw.get("operations")
         raw_operations = raw_operations if isinstance(raw_operations, list) else []
         operations = [item for item in (
@@ -2472,13 +2288,12 @@ class Bridge:
             "counts": counts,
             "next_action": next_action,
             "error_code": error_code,
-            "scope": "admin" if viewer_admin else "summary",
+            "scope": "admin",
         }
         result["summary"] = cls._wps_recovery_summary(
             operations, counts, next_action, error_code)
-        if viewer_admin:
-            result["operations"] = operations
-            result["pending_operations"] = pending_operations
+        result["operations"] = operations
+        result["pending_operations"] = pending_operations
         return result
 
     def _wps_recovery_snapshot(self) -> tuple[Any, dict[str, Any] | None, str]:
@@ -2504,18 +2319,16 @@ class Bridge:
         return ledger, raw, ""
 
     def wps_recovery_status(self) -> dict[str, Any]:
-        """只读 WPS 恢复查询：普通用户仅安全摘要，管理员仅最小白名单 DTO。
+        """只读 WPS 恢复查询：只返回最小白名单 DTO。
 
         不返回原始 journal、problems/risk_reason、客户姓名/电话/地址/餐次、
         sheet/file_id、异常原文或未来新增字段；不写云端/日志/账本。
         """
-        viewer_admin = bool(self.is_admin)
         _ledger, raw, error_code = self._wps_recovery_snapshot()
         if error_code:
-            return self._wps_recovery_failure(
-                error_code, "fix_journal", viewer_admin=viewer_admin)
+            return self._wps_recovery_failure(error_code, "fix_journal")
         assert raw is not None
-        return self._sanitize_wps_recovery(raw, viewer_admin=viewer_admin)
+        return self._sanitize_wps_recovery(raw)
 
     # ------------------------------------------------------------------
     # W3：管理员专用恢复/退场入口
@@ -2565,7 +2378,7 @@ class Bridge:
 
     def wps_recovery_resolve(self, payload: dict[str, Any] | None = None,
                              **options: Any) -> dict[str, Any]:
-        """管理员专用恢复入口：带确认、范围与审计地处理 pending 旧任务。
+        """恢复入口：带确认、范围与审计地处理 pending 旧任务。
 
         请求（HTTP ``POST /api/wps_recovery_resolve``，JSON 数组单对象或对象键值均可）::
 
@@ -2576,9 +2389,8 @@ class Bridge:
              "note": "人工核对说明（至少 4 个字符，写进审计）",
              "confirm_structure_checked": true}   # 仅 retire_guarded 需要
 
-        权限：仅管理员。普通用户 HTTP 403 ``admin_only``；即使绕过 HTTP 直接调用
-        也会得到 ``ok=false, status=forbidden``。重复请求幂等：同一 operation 已经
-        ``retired_guarded`` 时返回 ``already_retired`` 且不写任何东西。
+        重复请求幂等：同一 operation 已经 ``retired_guarded`` 时返回
+        ``already_retired`` 且不写任何东西。
         """
         data: dict[str, Any] = dict(payload) if isinstance(payload, dict) else {}
         if isinstance(payload, str) and payload.strip():
@@ -2586,7 +2398,7 @@ class Bridge:
         for key, value in options.items():
             if value is not None:
                 data[key] = value
-        actor = self._request_identity() or "local-admin"
+        actor = "local-admin"
         operation_id = str(data.get("operation_id") or "").strip()
         raw_decision = str(data.get("decision") or "").strip().lower()
         confirm = str(data.get("confirm") or "").strip()
@@ -2595,11 +2407,6 @@ class Bridge:
         decision = ("retire_guarded" if raw_decision in self._WPS_RETIRE_ALIASES
                     else raw_decision)
 
-        if not self.is_admin:
-            # 双保险：HTTP 白名单已经 403；直接调用（脚本/旧客户端）也必须拒绝。
-            return self._wps_resolve_failure(
-                "forbidden", "恢复/退场仅管理员可用", "联系管理员处理",
-                status="forbidden")
         if not re.fullmatch(r"wps-[0-9a-f]{16}", operation_id):
             return self._wps_resolve_failure(
                 "invalid_operation_id",
@@ -2674,7 +2481,7 @@ class Bridge:
                 "本地账本/意图日志不可用，拒绝任何恢复动作",
                 "先修复本地日志/账本", status="blocked",
                 extra={"operation_id": operation_id})
-        snapshot = self._sanitize_wps_recovery(raw, viewer_admin=True)
+        snapshot = self._sanitize_wps_recovery(raw)
         current = next((op for op in (snapshot.get("operations") or [])
                         if op.get("operation_id") == operation_id), None)
         if current is None:
@@ -2784,7 +2591,7 @@ class Bridge:
         # 重新读一遍本地状态，证明效果真的落盘（而不是只看 B 的返回值）。
         _ledger2, raw2, _err2 = self._wps_recovery_snapshot()
         sanitized2: dict[str, Any] | None = (
-            self._sanitize_wps_recovery(raw2, viewer_admin=True)
+            self._sanitize_wps_recovery(raw2)
             if isinstance(raw2, dict) else None)
         found2 = next((op for op in ((sanitized2 or {}).get("operations") or [])
                        if op.get("operation_id") == operation_id), None)

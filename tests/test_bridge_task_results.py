@@ -16,7 +16,7 @@ from app.api.bridge import Bridge
 
 
 def _bridge_with_operation(tmp_path):
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     reservation = bridge._operations.try_reserve("order")
     assert reservation.granted
     operation_id = reservation.operation.operation_id

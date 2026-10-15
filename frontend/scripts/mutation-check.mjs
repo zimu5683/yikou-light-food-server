@@ -418,8 +418,8 @@ const SCENARIOS = [
       {
         file: CLOUD_FORM,
         name: '云文档页重新加回 operationView 依赖',
-        find: `    config, isAdmin, hasValidToken, authError, operationActive, reconnect,\n  } = useApp()`,
-        replace: `    config, isAdmin, hasValidToken, authError, operationActive, operationView, reconnect,\n  } = useApp()`,
+        find: `    config, hasValidToken, authError, operationActive, reconnect,\n  } = useApp()`,
+        replace: `    config, hasValidToken, authError, operationActive, operationView, reconnect,\n  } = useApp()`,
       },
       {
         file: CLOUD_FORM,

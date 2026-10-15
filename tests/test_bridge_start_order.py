@@ -28,10 +28,9 @@ def _assert_started(got):
 
 
 def _bridge(tmp_path) -> Bridge:
-    # 这些用例验证的是**管理员**的完整能力（start_order 的校验/副作用）。
-    # Bridge 的默认角色是「非管理员」（安全默认），故此处显式以管理员构造；
-    # 角色相关的拦截由 tests/test_web_roles.py 专门覆盖。
-    return Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    # Bridge 不再区分角色，这里直接构造即可；HTTP 层的令牌闸门由
+    # tests/test_web_server.py 覆盖。
+    return Bridge(config_path=str(tmp_path / "config.json"))
 
 
 def _excel(tmp_path, name: str = "排单.xlsx"):

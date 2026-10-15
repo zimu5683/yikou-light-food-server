@@ -24,10 +24,9 @@ from app.api import bridge as bridge_module
 
 
 def _bridge(tmp_path) -> Bridge:
-    # 这些用例验证的是**管理员**的完整能力（js_api 表面）。
-    # Bridge 的默认角色是「非管理员」（安全默认），故此处显式以管理员构造；
-    # 角色相关的拦截由 tests/test_web_roles.py 专门覆盖。
-    return Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    # 这些用例验证 js_api 的完整表面。Bridge 不再区分角色；HTTP 层的
+    # 令牌闸门由 tests/test_web_server.py 覆盖。
+    return Bridge(config_path=str(tmp_path / "config.json"))
 
 
 def test_removed_channels_are_not_on_the_bridge(tmp_path):

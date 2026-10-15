@@ -9,7 +9,7 @@
 浏览器 (frontend/)
    │  POST /api/<method> + 轮询 /api/drain_events
    ▼
-app/web/        HTTP 交付层：路由、鉴权、静态资源、服务器端文件浏览器
+app/web/        HTTP 交付层：路由、令牌鉴权、静态资源、服务器端文件浏览器
    ▼
 app/api/       应用 API/编排层：Bridge、事件队列、任务线程、交互等待
    ▼
@@ -33,7 +33,7 @@ app/integrations/  外部 HTTP 客户端（requests）
 | `app/core/models.py` | `MealInfo` / `OrderInfo` 纯数据模型 |
 | `app/core/update.py` | 版本检查与更新：只查网页版 Release，发现新版本提示更新 |
 | `app/integrations/api_client.py` | 管理后台与闪时送 HTTP 会话、登录、错误映射 |
-| `app/order/parsing.py` | 订单文本解析、Excel 列写入、备份等纯函数 |
+| `app/order/parsing.py` | 订单文本解析、Excel 列写入等纯函数 |
 | `app/order/runner.py` | 管理后台订单抓取、合并、退款过滤、写排单表 |
 | `app/order/templates.py` | 排单表 / 闪时送表模板生成 |
 | `app/order/aliases.py` | 地址别名与待确认地址落盘 |
@@ -42,9 +42,7 @@ app/integrations/  外部 HTTP 客户端（requests）
 | `app/ordering/cloud_import.py` | 从 WPS 云端读当天名单、地址过滤、日期闸门、留档 |
 | `app/wps/sync.py` | kdocs-cli 封装、增量计划、原地排序、格式复制、执行校验与账本 |
 | `app/api/bridge.py` | 前端唯一 API 表面：事件、任务、交互、WPS、配置、更新检查 |
-| `app/web/server.py` | ThreadingHTTPServer、统一鉴权、路由、静态资源、文件浏览器 |
-| `app/web/auth.py` | 账号/PBKDF2/会话/邀请码/Cloudflare Access JWT |
-| `app/web/pages.py` | 登录、拒绝、管理员审批页的 HTML 模板 |
+| `app/web/server.py` | ThreadingHTTPServer、令牌鉴权、网关拒绝、路由、静态资源、文件浏览器 |
 
 ## Android APK 运行形态
 
@@ -71,8 +69,8 @@ WpsRuntime（Kotlin）→ proot → kdocs-cli     SecureStore（Keystore）
 ## 一次前端请求怎么走
 
 1. `frontend/src/lib/bridge.ts` 以 `POST /api/<method>` 调用；
-2. `app/web/server.py` 在 `parse_request` 统一做会话/令牌鉴权，再按方法白名单
-   分发到 `Bridge.<method>`；
+2. `app/web/server.py` 在 `parse_request` 统一做令牌鉴权（经网关的请求直接 403），
+   再把 `/api/<method>` 分发到同名 `Bridge` 方法；
 3. `Bridge` 更新配置或起后台线程，把日志/状态/交互事件写入事件队列；
 4. 前端轮询 `drain_events(last_sequence, ack_sequence)`，按 `event_id` 去重、
    应用成功后推进 cursor；队列溢出会收到 `events:dropped` 告警。
@@ -81,8 +79,8 @@ WpsRuntime（Kotlin）→ proot → kdocs-cli     SecureStore（Keystore）
 
 - 新的平台 HTTP 调用 → `app/integrations/`
 - 新的订单/闪时送业务规则 → 对应领域包（`app/order/` / `app/ordering/` / `app/wps/`）
-- 新的前端可调接口 → `app/api/bridge.py` 加方法，并在 `app/web/server.py`
-  的 `_NON_ADMIN_METHODS` 里明确普通用户权限（默认仅管理员）
+- 新的前端可调接口 → `app/api/bridge.py` 加方法即可（HTTP 面不区分角色，
+  只受统一令牌闸门保护；下划线开头与 `attach` 之类不会被暴露）
 - 新的 HTTP 页面/路由 → `app/web/`
 - 纯配置/凭据/通用模型 → `app/core/`
 
@@ -109,8 +107,8 @@ WpsRuntime（Kotlin）→ proot → kdocs-cli     SecureStore（Keystore）
 
 1. `app/api/bridge.py`（约 1560 行）→ `events.py` / `interactions.py` /
    `services/wps.py` / `tasks.py`，`Bridge` 用组合拼起来。
-2. `app/web/server.py`（约 990 行）→ 继续抽 `routing.py` / `session_auth.py`
-   （静态资源与文件浏览已拆出）。
+2. `app/web/server.py`（约 570 行）→ 继续抽 `routing.py`（把路由表与令牌闸门
+   从请求处理器里分出来）。
 
 拆分前先用 rope 的 `move-module`/`rename-module` 做机械化移动（见
 `.zcode/skills/python-rope-refactor`），再改行为；`tests/test_architecture_boundaries.py`

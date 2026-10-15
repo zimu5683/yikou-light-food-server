@@ -650,7 +650,7 @@ def test_concurrent_starts_never_double_post(tmp_path, monkeypatch):
 def test_bridge_entry_points_reject_non_canonical_url(tmp_path):
     from app.api.bridge import Bridge
 
-    bridge = Bridge(config_path=str(tmp_path / "config.json"), is_admin=True)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
     bridge._config.sss_url = "https://sss.example.invalid/takeout"
 
     saved = bridge.save_sss_config({"url": "http://sss.example.invalid."})

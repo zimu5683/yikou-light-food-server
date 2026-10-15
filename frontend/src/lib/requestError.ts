@@ -101,9 +101,9 @@ const VIEWS: Record<RequestErrorKind, Omit<RequestErrorView, 'kind'>> = {
     retryable: false,
   },
   permission: {
-    title: '当前账号没有该权限',
-    detail: '服务端拒绝了这个操作。',
-    nextStep: '请联系管理员授权，或改用管理员账号操作。',
+    title: '服务端拒绝了本次请求',
+    detail: '服务端以 403 拒绝了这个操作。',
+    nextStep: '确认打开的是本机/局域网地址且令牌正确；经网关（反向代理）进来的请求一律被拒。',
     retryable: false,
   },
   offline: {
