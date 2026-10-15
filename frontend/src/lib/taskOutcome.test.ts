@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { parseSssSubmission, sssSubmissionNotes } from './sssSubmission.ts'
 import { taskOutcomeView } from './taskOutcome.ts'
 
 test('uncertain / partial / failed / blocked 都不显示成功', () => {
@@ -117,12 +118,16 @@ test('闪时送本轮统计：成功响应是聚合次数；技术异常不叫�
   } as never)
   assert.equal(view.isSuccess, false)
   assert.equal(view.needsReview, true)
-  assert.match(view.message, /共收到 25 次成功响应/)
-  assert.match(view.message, /无法判断其中多少只是/)
-  assert.match(view.message, /不要因为看不到就自动重发/)
-  assert.match(view.message, /技术异常/)
+  // 提示条只说结果与下一步：站内计数的口径不在提示条里抄第二遍（同一句话只说一次）。
+  assert.equal(view.message, '闪时送任务未确认：确认 51/99')
   assert.ok(!view.message.includes('已完成'))
   assert.ok(!view.message.includes('可能暂未显示'))
+  // 但「不要因为看不到就自动重发」这条保护必须仍然存在 —— 移到文案现在所在的结果卡片脚注。
+  const parsed = parseSssSubmission(summary.submission)
+  assert.ok(parsed)
+  const notes = sssSubmissionNotes(parsed)
+  assert.match(notes.join('\n'), /不要因为看不到就自动重发/)
+  assert.match(notes.join('\n'), /平台列表有延迟/)
 
   // ok=true/success=true 但站内仍有未确认：不能弹绿色成功。
   const dirtySuccess = taskOutcomeView({

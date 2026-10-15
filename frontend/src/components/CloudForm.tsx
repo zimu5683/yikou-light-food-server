@@ -943,8 +943,8 @@ function RecoveryResolveDialog({
           旧任务恢复/退场处置
         </h2>
         <p className="mt-1 text-[11px] text-muted-foreground">
-          本入口永不写云端（只改本地 journal 审计）；退场不会解除同一目标日期 + 云表的防重复闸门。
-          失败时阻断保持，且没有「删除账本」或「直接重传」的捷径。
+          本入口不写云端，只改本地 journal 审计；退场不会解除同一目标日期 + 云表的防重复闸门，
+          也没有「删除账本」或「直接重传」的捷径。
         </p>
 
         <dl className="mt-2 space-y-1 rounded-md border bg-secondary/30 px-2.5 py-2 text-[11px]">
@@ -1059,7 +1059,7 @@ function RecoveryResolveDialog({
         )}
 
         <p className="mt-2 text-[11px] text-muted-foreground">
-          提交只会修改本地审计；不会自动重传、不会删除账本、不会强制清除不确定结果。网络失败时结果未知，请只读核对后再决定。
+          网络失败时结果未知：请只读核对后再决定是否重来。
         </p>
 
         <div className="mt-3 flex flex-wrap gap-2">
@@ -1152,7 +1152,7 @@ function WpsRecoveryCard({ status, error, busy, onResolve }: {
   return (
     <Callout tone={needsAttention ? 'warning' : 'success'} title={needsAttention ? '待核对批次（只读可见）' : '本地恢复记录：无待核对批次'}>
       <p className="text-muted-foreground">
-        本次刷新为只读查询：不会上传、不会解除阻断、不会自动重试，也不会自动恢复写入。
+        本次刷新为只读查询：不会上传、不会解除阻断、不会自动重试。
         {status.queried_cloud === false ? ' 当前展示的是本地 journal 记录，本查询未调用云端。' : ' 数据来自只读恢复查询。'}
       </p>
       {status.contains_cloud_checked_records && (

@@ -10,7 +10,6 @@ import {
   sssSendGuard,
   sssSubmissionAllConfirmed,
   sssSubmissionHeadline,
-  sssSubmissionNote,
   sssSubmissionNotes,
   sssSubmissionPending,
   sssSubmissionRows,
@@ -236,23 +235,23 @@ test('行文案：提交/尝试/成功/异常/拒绝/未发送/新增确认/未�
   assert.match(sssSubmissionHeadline(view).title, /仍有 48 项未确认/)
 })
 
-test('提示：成功响应是聚合次数，不能判断其中多少尚未可见；补单不是只读操作', () => {
+test('提示：未确认只说一句（不自动重发），不抄计数行与补单弹窗的口径', () => {
   const view = parsed()
-  const notes = sssSubmissionNotes(view).join('\n')
-  assert.match(notes, /共收到 25 次成功响应/)
-  assert.match(notes, /无法从这个次数判断\s*其中多少只是尚未显示在站内列表/)
-  assert.match(notes, /优先等待并只读复查/)
-  assert.match(notes, /技术异常（48 次）/)
-  assert.match(notes, /不代表订单确定创建失败/)
-  assert.match(notes, /「核对并补单」不是只读操作：先做站内对账，仍缺失的订单会真实提交/)
-  assert.match(notes, /不表示本轮新建了这么多单/)
-  assert.match(notes, /平台列表有延迟时仍可能出现重复/)
-  assert.ok(!notes.includes('可再运行一次补单）；'), notes)
+  const notes = sssSubmissionNotes(view)
+  assert.equal(notes.length, 1)
+  assert.match(notes[0], /仍有未确认项/)
+  assert.match(notes[0], /平台列表有延迟/)
+  assert.match(notes[0], /不要因为看不到就自动重发/)
+  assert.ok(!notes[0].includes('已完成'))
+  // 「未知不按 0 计」由计数行承担、「补单不是只读」由补单确认弹窗承担，脚注不再重复。
+  assert.ok(!notes[0].includes('不按 0 计'))
+  assert.ok(!notes[0].includes('核对并补单'))
 
-  const note = sssSubmissionNote(view)
-  assert.match(note, /共收到 25 次成功响应/)
-  assert.match(note, /优先等待并只读复查，不要因为看不到就自动重发/)
-  assert.ok(!note.includes('已完成'))
+  // 全部确认但本轮有技术异常：异常仍是「结果未知」，补一句，绝不写成确定失败。
+  const settled = parsed({ ...SUBMISSION, confirmed: 99, newly_confirmed: 73, unconfirmed: 0 })
+  const settledNotes = sssSubmissionNotes(settled)
+  assert.equal(settledNotes.length, 1)
+  assert.match(settledNotes[0], /技术异常 48 次＝结果未知，不代表未创建/)
 })
 
 test('模拟/预检/余额闸门：只说明未提交，不提示补单，缺确认仍未知', () => {

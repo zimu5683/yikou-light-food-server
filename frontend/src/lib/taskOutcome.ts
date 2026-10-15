@@ -11,7 +11,6 @@ import {
   sssRunKindFromSummary,
   sssSubmissionAllConfirmed,
   sssSubmissionHeadline,
-  sssSubmissionNote,
 } from './sssSubmission.ts'
 
 export type TaskOutcomeLevel = 'success' | 'info' | 'warning' | 'error'
@@ -78,20 +77,18 @@ export function taskOutcomeView(payload: TaskOutcomeLike): TaskOutcomeView {
   const status = String(payload.result_status || payload.status || '').toLowerCase()
   const message = (payload.message || payload.next_action || payload.reason || '').trim()
   const submission = parseSssSubmission(payload.summary?.submission)
-  // 闪时送：把本轮计数里「成功但站内暂不可见」与「内部异常未确认」分开讲清楚，
-  // 并明确不会自动重发（不改变任何状态判定，只补一句提示）。
-  const submissionNote = submission ? sssSubmissionNote(submission) : ''
+  // 提示条只说「哪里结束 + 下一步」：站内计数的口径与「不要自动重发」由结果卡片
+  // 的脚注（`sssSubmissionNotes`）承担，不在提示条里抄一遍。
   const withNext = (text: string): string => {
-    const withNote = submissionNote && !text.includes(submissionNote) ? `${text} ${submissionNote}` : text
-    if (!payload.next_action || withNote.includes(payload.next_action)) return withNote
-    return `${withNote} ${payload.next_action}`
+    if (!payload.next_action || text.includes(payload.next_action)) return text
+    return `${text} ${payload.next_action}`
   }
 
   if (payload.uncertain || status === 'uncertain') {
     return {
       level: 'warning', toast: 'warning',
       title: '结果不确定 · 待核对',
-      message: withNext(message || '任务结果不确定；可再运行一次补单（重跑前会先做站内对账，已存在的不会重复提交）。'),
+      message: withNext(message || '任务结果不确定；可再运行一次补单（先对账，列表延迟仍可能重复）。'),
       needsReview: true, isSuccess: false, statusKey: 'uncertain',
     }
   }

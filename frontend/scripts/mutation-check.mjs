@@ -182,7 +182,7 @@ const UNCERTAIN_OPERATION_MUTATIONS = [
     file: OPERATION_STATUS,
     name: '权威 uncertain 渲染成“已完成 / success”',
     find: `    case 'uncertain':
-      return resultView(modeLabel, 'uncertain', \`\${modeLabel}结果不确定 · 待核对\`, '未能确认全部结果；可再运行一次补单（重跑前会先做站内对账，已存在的订单不会重复提交）。', 'warning', true, nextAction, reason, common)`,
+      return resultView(modeLabel, 'uncertain', \`\${modeLabel}结果不确定 · 待核对\`, '未能确认全部结果；可再运行一次补单（先对账，列表延迟仍可能重复）。', 'warning', true, nextAction, reason, common)`,
     replace: `    case 'uncertain':
       return resultView(modeLabel, 'success', \`\${modeLabel}已完成\`, '任务已正常结束，可查看结果与日志。', 'success', false, nextAction, reason, common)`,
   },
@@ -457,12 +457,11 @@ const SCENARIOS = [
     // 前提是文本比容器宽。error · order 的失败原因是长句（账号锁定那段），必然被截；
     // 待核对 @360x800 在窄屏取样，同样必然被截。
     //
-    // uncertain 的两格（order/cloud）曾是控制组（3.6.14 时说明文案很短，390px 一行放得下）。
-    // 3.6.21 起说明统一为「未能确认全部结果；可再运行一次补单（重跑前会先做站内对账，
-    // 已存在的订单不会重复提交）。」（43 字 ≈ 460px @11px），在 390px 视口下 **本来就
-    // 会超过一行** —— 注入 truncate 必然产生可见裁切，这两格对该变异是真敏感的，
-    // 因此移到 mustFail（本机注入复现：detailClipped=true）。控制组只保留对该变异
-    // 天然不敏感的格子。
+    // uncertain 的两格（order/cloud）曾经是控制组（3.6.14 时说明文案很短，390px 一行放得下）。
+    // 3.6.21 起说明变成 43 字的长句；2026-10-15 精简到 33 字
+    // （「未能确认全部结果；可再运行一次补单（先对账，列表延迟仍可能重复）。」），
+    // **仍然超过一行** —— 实测注入 truncate 后这两格 detailClipped=true，对该变异真敏感，
+    // 因此留在 mustFail。控制组只保留对该变异天然不敏感的格子。
     mustFail: [
       '批2 error · order：状态说明完整可见（无横向省略号/纵向裁切）且无横向溢出',
       '批2 待核对 · 订单 @360x800：状态只在头部一处、说明完整、无横向溢出',
@@ -504,7 +503,7 @@ const SCENARIOS = [
     mutations: SSS_SUBMISSION_CARD_MUTATIONS,
     mustFail: [
       '批3 结果卡片：99/26/73/25/48 主样例逐项对应具体数值（目标 99 · 已有 26 · 提交 73 · 成功 25 · 异常 48 · 新增 25 → 确认 51 · 未确认 48）',
-      '批3 结果卡片：未确认 48 项 → headline=unconfirmed，且与“成功响应暂不可见/技术异常”分开说明',
+      '批3 结果卡片：未确认 48 项 → headline=unconfirmed，且明示“不要因为看不到就自动重发”',
       '批3 结果卡片手机窄屏不溢出（390x844，卡片宽度不超过视口）',
       '批3 success + 进度 20：权威状态点明仍有未确认，不冒充最终完成',
       '批3 运行中：进度 20 只算暂定（headline=running），主动作禁用且不是补单',

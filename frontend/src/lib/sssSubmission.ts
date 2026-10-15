@@ -330,75 +330,28 @@ export function sssSubmissionPending(summary: SssSubmissionSummary): boolean {
 }
 
 /**
- * 卡片脚注：说明口径，并把「成功但暂不可见」与「内部异常」分开讲清楚。
+ * 卡片脚注：只在真有风险时说一句。
  *
- * 非正式运行（模拟/预检/余额闸门/无单）只说明“没有提交任何请求”，不提示补单。
+ * 「未知不按 0 计」由计数行的 `UNKNOWN_TEXT` 承担，「补单不是只读」由补单确认弹窗承担，
+ * 这里不重复；非正式运行（模拟/预检/余额闸门/无单）只说“没有提交任何请求”。
  */
 export function sssSubmissionNotes(
   summary: SssSubmissionSummary,
   options: { kind?: SssRunKind } = {},
 ): string[] {
-  const kind = options.kind || 'live'
-  if (kind !== 'live') {
-    return [
-      '这次运行没有提交任何下单请求（模拟 / 预检 / 余额闸门 / 无单），站内不会因此新增订单。',
-      '确认为未知时不按 0 计；下面的计数只描述本次组装或只读核对的规模。',
-    ]
+  if ((options.kind || 'live') !== 'live') {
+    return ['本次没有提交任何下单请求，站内不会因此新增订单。']
   }
   const notes: string[] = []
-  if ((summary.successResponses ?? 0) > 0 && sssSubmissionPending(summary)) {
-    notes.push(
-      `共收到 ${summary.successResponses} 次成功响应；仍有未确认项时，无法从这个次数判断`
-      + '其中多少只是尚未显示在站内列表（平台列表有延迟）：优先等待并只读复查，'
-      + '不要因为看不到就自动重发。',
-    )
-  }
-  if ((summary.technicalErrors ?? 0) > 0) {
-    notes.push(
-      `技术异常（${summary.technicalErrors} 次）是内部错误导致的“结果未知”：`
-      + '同一单内已按提交节流自动重试，用尽后不再跨轮重发，'
-      + '不代表订单确定创建失败；以站内列表为准。',
-    )
-  }
-  const auth = summary.authRejections
-  const balance = summary.balanceRejections
-  if (auth !== null || balance !== null) {
-    notes.push(
-      `明确拒绝明细：登录失效 ${auth === null ? UNKNOWN_TEXT : `${auth} 次`}`
-      + ` · 余额不足 ${balance === null ? UNKNOWN_TEXT : `${balance} 次`}。`,
-    )
-  }
-  if (summary.newlyConfirmed !== null) {
-    notes.push('「本轮新增站内确认」= 最终确认集合 − 初始已确认集合，是对账差异，不表示本轮新建了这么多单。')
-  }
-  if (sssSubmissionPending(summary)) {
-    notes.push('「核对并补单」不是只读操作：先做站内对账，仍缺失的订单会真实提交（可能产生费用）。')
-  }
-  notes.push('计数以站内订单列表对账为准：响应失败不代表未创建；平台列表有延迟时仍可能出现重复。')
   if (!summary.consistent) {
     notes.push(`服务端计数不自洽（${summary.issues.join('；')}），请按未知处理并只读核对。`)
   }
+  if (sssSubmissionPending(summary)) {
+    notes.push('仍有未确认项：平台列表有延迟，先等待并只读复查，不要因为看不到就自动重发。')
+  } else if ((summary.technicalErrors ?? 0) > 0) {
+    notes.push(`技术异常 ${summary.technicalErrors} 次＝结果未知，不代表未创建；以站内列表为准。`)
+  }
   return notes
-}
-
-/** 收尾提示里的一句话：区分「成功但暂不可见」与「内部异常」（不自动重发）。 */
-export function sssSubmissionNote(summary: SssSubmissionSummary): string {
-  const parts: string[] = []
-  if ((summary.successResponses ?? 0) > 0 && sssSubmissionPending(summary)) {
-    parts.push(
-      `共收到 ${summary.successResponses} 次成功响应；仍有未确认项时，无法判断其中多少只是`
-      + '尚未显示在站内列表（平台列表有延迟）：优先等待并只读复查，不要因为看不到就自动重发。',
-    )
-  }
-  if ((summary.technicalErrors ?? 0) > 0) {
-    const head = parts.length > 0 ? `另有 ${summary.technicalErrors} 次` : `${summary.technicalErrors} 次`
-    parts.push(`${head}技术异常属内部错误、结果未知（同一单内已自动重试、用尽后不再重发），不代表确定创建失败；以站内对账为准。`)
-  }
-  if (parts.length > 0) return parts.join(' ')
-  if (summary.unconfirmed === null) {
-    return '本站未返回未确认数量：按待核对处理，不按 0 计。'
-  }
-  return ''
 }
 
 /**

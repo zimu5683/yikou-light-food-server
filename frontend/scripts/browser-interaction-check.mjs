@@ -4915,12 +4915,12 @@ async function main() {
       JSON.stringify({ rows: cardA?.rows }),
     )
     record(
-      '批3 结果卡片：未确认 48 项 → headline=unconfirmed，且与“成功响应暂不可见/技术异常”分开说明',
+      '批3 结果卡片：未确认 48 项 → headline=unconfirmed，且明示“不要因为看不到就自动重发”',
       cardA?.headline === 'unconfirmed' && cardA.running === 'false'
         && cardA.title.includes('仍有 48 项未确认')
-        && cardA.text.includes('尚未显示在站内列表')
-        && cardA.text.includes('不代表订单确定创建失败')
-        && cardA.text.includes('「核对并补单」不是只读操作'),
+        && cardA.text.includes('仍有未确认项')
+        && cardA.text.includes('平台列表有延迟')
+        && cardA.text.includes('不要因为看不到就自动重发'),
       JSON.stringify({ headline: cardA?.headline, title: cardA?.title, running: cardA?.running }),
     )
     record(
@@ -4954,10 +4954,11 @@ async function main() {
     const dlgA = await cdp.eval(openDialogProbeJs)
     const confirmBtn = (dlgA?.buttons || []).find((item) => item.label === '确认对账并补单') || null
     record(
-      '批3 确认页：说明按当前账号/当前名单先对账再补缺失项，可能产生费用',
+      '批3 确认页：说明按当前账号/当前名单先对账再补缺失项，且明确不是只读操作、可能产生费用',
       dlgA?.text?.includes('当前账号') === true && dlgA.text.includes('当前名单')
         && dlgA.text.includes('先做一次站内对账') && dlgA.text.includes('只补仍然缺失的订单')
-        && dlgA.text.includes('可能产生费用') && dlgA.text.includes('不是上一批的冻结快照'),
+        && dlgA.text.includes('不是只读') && dlgA.text.includes('可能产生费用')
+        && dlgA.text.includes('不是上一批的冻结快照'),
       JSON.stringify({ text: dlgA?.text?.slice(0, 260) }),
     )
     record(
