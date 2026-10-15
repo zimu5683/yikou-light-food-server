@@ -118,7 +118,7 @@ tests/test_wps_cloud.py      单元测试（mock subprocess，不联网）
 
 ```python
 wps_enabled: bool = False              # 是否启用云文档同步
-wps_test_mode: bool = True             # 默认开测试模式（安全）
+wps_test_mode: bool = False            # v4 起出厂关闭（出厂无副本可指＝拒绝写入）
 wps_test_file_id: str = "bFc8181nB1MmRwMHWZ9uxxVcg7R7dF9LX"
 wps_test_drive_id: str = "757726039"
 wps_drive_id: str = "757726038"

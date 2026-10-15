@@ -26,7 +26,8 @@ DEFAULTS_REVISION = 4
 #: v0 → v1：下单并发 4 → 8、读取超时 20 → 30 秒。
 #: v1 → v2：下单并发 8 → 4（读取超时 30 秒不变）。
 #: v2 → v3：下单并发 4 → 1（默认串行；读取超时 30 秒不变）。
-#: v3 → v4：下单并发 1 → 4，提交节流 2.5 秒 → 0（关闭节流），回到提速取向。
+#: v3 → v4：下单并发 1 → 4，提交节流 2.5 秒 → 0（关闭节流），回到提速取向；
+#: 同时把 `wps_test_mode` 的出厂值 True → False（见下方 `_V3_DEFAULT_WPS_TEST_MODE`）。
 #: 并发依据：平台的建单路径存在偶发内部异常（`IndexOutOfBoundsException` 等），
 #: 且失败比例与提交节奏无关——放慢提交并不能减少失败。因此出厂按并发 4 路、不限速；
 #: 需要串行或另行节流时把 `sss_max_workers` 配成 1、`sss_submit_min_interval_s`
@@ -47,6 +48,13 @@ _SSS_MAX_WORKERS_CEILING = 20
 _DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S = 0.0
 _V3_DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S = 2.5
 _SSS_SUBMIT_MIN_INTERVAL_CEILING_S = 60.0
+#: WPS 测试模式出厂值。v3 及以前是 True（必须显式配置本轮新建副本）；v4 起 False。
+#: 理由：`wps_test_tables` 出厂为空，而测试模式下一张副本都指不出来时
+#: （``app/wps/cli.py``）上传会直接抛「未配置新的测试副本，拒绝写入」——也就是
+#: 出厂状态下云同步根本走不通。翻成 False 后出厂即写正式表；需要测试副本时在界面上
+#: 打开测试模式并填上副本 ID 即可，测试模式本身的分支保留不变。
+_V3_DEFAULT_WPS_TEST_MODE = True
+_DEFAULT_WPS_TEST_MODE = False
 
 # 本地排单子表 -> 云端排单表（WPS 云文档 file_id）。
 # 表名映射来自用户确认：本地「衣锦」= 云端「校门口」（云端表标题写的是「衣锦汇总」）。
@@ -268,7 +276,8 @@ class AppConfig:
     # 把本地排单表的内容增量写入云端排单表；单元格级写入，不整表覆盖。
     wps_enabled: bool = False
     # 测试模式必须显式配置本轮新建副本；不会自动使用正式表或历史副本。
-    wps_test_mode: bool = True
+    # v4 起出厂关闭（默认写正式表），因为出厂状态下没有副本可指。
+    wps_test_mode: bool = _DEFAULT_WPS_TEST_MODE
     wps_test_file_id: str = "anUpCyxwE1MZcZc7KKpS1x625UG5Qwtg3"
     wps_test_drive_id: str = "757726038"
     wps_test_tables: Dict[str, Any] = field(default_factory=default_wps_test_tables)
@@ -318,7 +327,7 @@ class AppConfig:
                  sss_unit_price: float = 1.9,
                  sss_idempotency_field: str = "",
                  wps_enabled: bool = False,
-                 wps_test_mode: bool = True,
+                 wps_test_mode: bool = _DEFAULT_WPS_TEST_MODE,
                  wps_test_file_id: str = "anUpCyxwE1MZcZc7KKpS1x625UG5Qwtg3",
                  wps_test_drive_id: str = "757726038",
                  wps_test_tables: Optional[Dict[str, Any]] = None,
@@ -416,6 +425,11 @@ class AppConfig:
         self.wps_test_file_id = str(wps_test_file_id or "").strip()
         self.wps_test_drive_id = str(wps_test_drive_id or "").strip()
         self.wps_test_tables = normalize_wps_test_tables(wps_test_tables)
+        if (revision < 4 and self.wps_test_mode is _V3_DEFAULT_WPS_TEST_MODE
+                and not self.wps_test_tables):
+            # 只搬「开着测试模式、却一张副本都没配」这一种：那正是出厂状态，上传必然
+            # 被 `wps/cli.py` 拒绝。真配了副本的安装保留测试模式，不会被误翻成写正式表。
+            self.wps_test_mode = _DEFAULT_WPS_TEST_MODE
         self.wps_production_tables = normalize_wps_production_tables(wps_production_tables)
         self.wps_drive_id = str(wps_drive_id or "").strip()
         self.wps_cli_path = str(wps_cli_path or "").strip()

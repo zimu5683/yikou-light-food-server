@@ -244,6 +244,54 @@ def test_split_ratio_is_clamped_on_construction():
 
 
 # ----------------------------------------------------------------------
+# v3 → v4：WPS 测试模式出厂值 True → False
+# ----------------------------------------------------------------------
+def test_wps_test_mode_defaults_to_off():
+    """出厂关闭测试模式 —— 开着但一张副本都没有时，上传会被必然拒绝。"""
+    assert AppConfig().wps_test_mode is False
+
+
+def test_legacy_test_mode_without_copies_is_migrated_off():
+    """v3 出厂状态（测试模式开、副本为空）加载即翻成关闭。"""
+    migrated = AppConfig(defaults_revision=3, wps_test_mode=True)
+    assert migrated.wps_test_mode is False
+    assert migrated.defaults_revision == DEFAULTS_REVISION
+
+
+def test_legacy_test_mode_with_copies_is_kept():
+    """真配了测试副本的旧配置**不能**被翻成写正式表。"""
+    kept = AppConfig(defaults_revision=3, wps_test_mode=True,
+                     wps_test_tables={"东湖中餐": "FID"})
+    assert kept.wps_test_mode is True
+    # 空白 / 空串会被规整掉，等同于「没配副本」——这种要翻。
+    blank = AppConfig(defaults_revision=3, wps_test_mode=True,
+                      wps_test_tables={"东湖中餐": "   "})
+    assert blank.wps_test_tables == {}
+    assert blank.wps_test_mode is False
+
+
+def test_current_revision_keeps_an_explicitly_enabled_test_mode():
+    """迁移是一次性的：当前修订版里测试模式开着就是用户的真实选择。"""
+    current = AppConfig(defaults_revision=DEFAULTS_REVISION, wps_test_mode=True)
+    assert current.wps_test_mode is True
+
+
+def test_load_migrates_test_mode_in_an_old_file(tmp_path):
+    """旧 config.json（revision 3、测试模式开、无副本）：加载即翻关并写回。"""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"defaults_revision": 3, "wps_test_mode": True,
+                                "wps_test_tables": {},
+                                "sss_max_workers": 6,
+                                "sss_submit_min_interval_s": 7.0},
+                               ensure_ascii=False), encoding="utf-8")
+
+    loaded = AppConfig.load(path)
+    assert loaded.wps_test_mode is False
+    loaded.save()
+    assert AppConfig.load(path).wps_test_mode is False
+
+
+# ----------------------------------------------------------------------
 # save → load 往返：**合法**取值必须逐字段保真
 # ----------------------------------------------------------------------
 ROUNDTRIP_FIELDS = {
