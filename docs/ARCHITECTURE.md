@@ -89,6 +89,9 @@ WpsRuntime（Kotlin）→ proot → kdocs-cli     SecureStore（Keystore）
 - 文件职责单一，领域逻辑不要放进 `web/` 或 `api/`；`Bridge` 只做协议与编排。
 - 配置集中在 `AppConfig`，密码只进 keyring，不写入源码或仓库。
 - 写云端/下单等外部副作用必须可预览、可回读校验，并让领域层返回明确结果。
+- 本地幂等锚点（账本）必须**有备份、有留档、有可执行的重建入口**：任何一处失败都
+  要能说清"下一步做什么"，不能只提示"先修复"却没有入口（见
+  [design/WPS-账本丢失与损坏的兜底.md](../design/WPS-账本丢失与损坏的兜底.md)）。
 - 新增依赖先加进 `requirements.txt`，前端依赖进 `frontend/package.json`。
 - 修改后必须跑：`python -m pytest -q`、`cd frontend && pnpm build && pnpm test`。
 
@@ -105,7 +108,7 @@ WpsRuntime（Kotlin）→ proot → kdocs-cli     SecureStore（Keystore）
 
 以下文件仍偏大，建议继续按“每次移动一个模块、保持 public API 与测试绿”拆分：
 
-1. `app/api/bridge.py`（约 1560 行）→ `events.py` / `interactions.py` /
+1. `app/api/bridge.py`（约 2000 行）→ `events.py` / `interactions.py` /
    `services/wps.py` / `tasks.py`，`Bridge` 用组合拼起来。
 2. `app/web/server.py`（约 570 行）→ 继续抽 `routing.py`（把路由表与令牌闸门
    从请求处理器里分出来）。

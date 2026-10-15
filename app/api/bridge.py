@@ -74,9 +74,14 @@ from app.core.update import (
     select_android_apk,
     select_sha256_asset,
 )
-from app.wps.sync import (KdocsCli, SyncLedger, WpsCloudError, apply_plan,
-                        build_plan, effective_tables, format_plan,
-                        read_local_orders, summarize_plan, target_date_for,
+from app.wps.sync import (REBUILD_CONFIRM_WORD, REBUILD_MIN_NOTE, AtomicWriteError,
+                        FileLock, KdocsCli, LockTimeout, SyncJournal, SyncLedger,
+                        WpsCloudError, apply_plan, operation_lock_path_for,
+                        salvage_ledger,
+                        build_plan, build_rebuild, effective_tables,
+                        format_plan, format_rebuild, journal_path_for,
+                        ledger_loss_evidence, read_local_orders, summarize_plan,
+                        target_date_for, verify_rebuild, write_rebuild,
                         recovery_status as _wps_recovery_status_contract,
                         resolve_pending_operation as _wps_resolve_pending_operation)
 from app.wps import android_runtime
@@ -130,6 +135,7 @@ _MODE_LABELS = {
     "wps_check_copies": "云文档副本核对",
     "sss_day_orders": "云端当天名单读取",
     "wps_recovery_resolve": "旧任务恢复/退场",
+    "wps_ledger_rebuild": "账本锚点重建",
 }
 
 
@@ -1955,13 +1961,14 @@ class Bridge:
         # 通讯记号写的是**运行日**的周几（实测目标表：周四晚跑记 5、周五晚跑记 6）
         status["weekday_number"] = weekday_number(_dt.date.today())
 
-        ledger = None
-        try:
-            ledger = SyncLedger()
-        except WpsCloudError as exc:
+        view = self._wps_ledger_view()
+        ledger = view["ledger"]
+        status["ledger_state"] = str(view["state"])
+        status["ledger_lost"] = bool((view.get("loss") or {}).get("lost"))
+        if ledger is None:
             # 损坏/不可读账本必须失败关闭；状态入口也不能 500。
             status["ok"] = False
-            status["reason"] = str(exc)
+            status["reason"] = str(view.get("error") or "本地账本不可用")
         try:
             effective = self._wps_effective_tables()
         except WpsCloudError as exc:
@@ -1999,7 +2006,7 @@ class Bridge:
         status["effective_targets"] = sorted(fid for fid in effective_ids if fid)
         status["production_tables"] = {k: v.get("file_id", "")
                                        for k, v in (cfg.wps_production_tables or {}).items()}
-        status["state_path"] = str(ledger.path) if ledger is not None else ""
+        status["state_path"] = str(view.get("path") or "")
         return status
 
     # ------------------------------------------------------------------
@@ -2222,7 +2229,8 @@ class Bridge:
         }
 
     @classmethod
-    def _wps_recovery_failure(cls, error_code: str, next_action: str) -> dict[str, Any]:
+    def _wps_recovery_failure(cls, error_code: str, next_action: str,
+                              ledger_state: str = "") -> dict[str, Any]:
         counts = cls._wps_recovery_counts({})
         code = cls._wps_recovery_error_code(error_code, ok=False)
         next_action = cls._wps_recovery_next_action(
@@ -2239,6 +2247,8 @@ class Bridge:
             "counts": counts,
             "next_action": next_action,
             "error_code": code,
+            "ledger_state": cls._wps_ledger_state_value(ledger_state),
+            "ledger_lost": False,
             "scope": "admin",
         }
         base["summary"] = cls._wps_recovery_summary(
@@ -2260,7 +2270,8 @@ class Bridge:
             counts = cls._wps_recovery_counts(raw.get("counts"))
             next_action = cls._wps_recovery_next_action(
                 raw.get("next_action"), ok=False, counts=counts)
-            return cls._wps_recovery_failure(code, next_action)
+            return cls._wps_recovery_failure(
+                code, next_action, ledger_state=raw.get("ledger_state"))
         raw_operations = raw.get("operations")
         raw_operations = raw_operations if isinstance(raw_operations, list) else []
         operations = [item for item in (
@@ -2288,6 +2299,8 @@ class Bridge:
             "counts": counts,
             "next_action": next_action,
             "error_code": error_code,
+            "ledger_state": cls._wps_ledger_state_value(raw.get("ledger_state")),
+            "ledger_lost": bool(raw.get("ledger_loss")),
             "scope": "admin",
         }
         result["summary"] = cls._wps_recovery_summary(
@@ -2297,16 +2310,31 @@ class Bridge:
         return result
 
     def _wps_recovery_snapshot(self) -> tuple[Any, dict[str, Any] | None, str]:
-        """只读取出 (ledger, 原始恢复 DTO, error_code)；失败时 ledger 可能为 None。"""
-        try:
-            ledger = SyncLedger()
-        except WpsCloudError as exc:
-            code = ("wps_recovery_ledger_unreadable"
-                    if type(exc).__name__ == "LedgerCorruptError"
+        """只读取出 (ledger, 原始恢复 DTO, error_code)；失败时 ledger 可能为 None。
+
+        账本损坏/不可读时**不再直接放弃恢复视图**：意图日志的路径只由账本路径决定
+        （``journal_path_for``），不需要能构造 ``SyncLedger``。否则界面会指向一个
+        此刻打不开的入口（design/WPS-账本丢失与损坏的兜底.md §4.1）。
+        """
+        view = self._wps_ledger_view()
+        ledger = view["ledger"]
+        state = str(view["state"])
+        if ledger is None:
+            journal = self._wps_journal_for_path(str(view.get("path") or ""))
+            if journal is None:
+                return None, None, (
+                    "wps_recovery_ledger_unreadable" if state == "corrupt"
                     else "wps_recovery_journal_unreadable")
-            return None, None, code
-        except Exception:  # noqa: BLE001 - 只读入口错误也必须脱敏
-            return None, None, "wps_recovery_internal_error"
+            try:
+                raw = _wps_recovery_status_contract(None, journal=journal)
+            except WpsCloudError as exc:
+                code = ("wps_recovery_journal_unreadable"
+                        if type(exc).__name__ in ("JournalError", "JournalCorruptError")
+                        else "wps_recovery_ledger_unreadable")
+                return None, None, code
+            except Exception:  # noqa: BLE001 - 只读入口错误也必须脱敏
+                return None, None, "wps_recovery_internal_error"
+            return None, self._wps_recovery_raw_state(raw, view), ""
         try:
             raw = _wps_recovery_status_contract(ledger)
         except WpsCloudError as exc:
@@ -2316,7 +2344,15 @@ class Bridge:
             return ledger, None, code
         except Exception:  # noqa: BLE001
             return ledger, None, "wps_recovery_internal_error"
-        return ledger, raw, ""
+        return ledger, self._wps_recovery_raw_state(raw, view), ""
+
+    @staticmethod
+    def _wps_recovery_raw_state(raw: Any, view: dict[str, Any]) -> Any:
+        """把账本可用性附在原始恢复 DTO 上（脱敏白名单在 _sanitize 里做）。"""
+        if isinstance(raw, dict):
+            raw["ledger_state"] = str(view.get("state") or "")
+            raw["ledger_loss"] = bool((view.get("loss") or {}).get("lost"))
+        return raw
 
     def wps_recovery_status(self) -> dict[str, Any]:
         """只读 WPS 恢复查询：只返回最小白名单 DTO。
@@ -2353,6 +2389,11 @@ class Bridge:
     })
     #: 审计备注最短长度：强制管理员写下“为什么可以退出”。
     _WPS_RESOLVE_MIN_NOTE = 4
+    #: 不需要可写账本的决策：只写意图日志，所以账本损坏时也必须可用。
+    _WPS_LEDGER_FREE_DECISIONS = ("retire_guarded", "keep")
+    #: 抢救的确认词与说明长度（与重建同一口径，类属性便于用例引用）。
+    SALVAGE_CONFIRM_WORD = "salvage"
+    SALVAGE_MIN_NOTE = 4
 
     def _wps_resolve_failure(self, code: str, reason: str, next_action: str, *,
                              status: str = "rejected",
@@ -2475,12 +2516,25 @@ class Bridge:
                                    actor: str) -> dict[str, Any]:
         """实际执行一次恢复/退场：只读快照 → B 的入口 → 复核落盘 → 脱敏返回。"""
         ledger, raw, error_code = self._wps_recovery_snapshot()
-        if error_code or ledger is None or raw is None:
+        if error_code or raw is None:
             return self._wps_resolve_failure(
                 error_code or "wps_recovery_internal_error",
                 "本地账本/意图日志不可用，拒绝任何恢复动作",
                 "先修复本地日志/账本", status="blocked",
                 extra={"operation_id": operation_id})
+        ledger_state = str(raw.get("ledger_state") or "")
+        if ledger is None and decision not in self._WPS_LEDGER_FREE_DECISIONS:
+            # 账本读不出来时，「带审计退场」与「只留核对备注」仍然可用（它们只写
+            # 意图日志）；但「确认云端已完成/未执行」的结论必须并进账本，无处可落
+            # 就只能拒绝，并指向真正的出路。
+            return self._wps_resolve_failure(
+                "ledger_unavailable_requires_repair",
+                "本地账本不可用：「退场」与「只记录备注」仍然可用，"
+                "但「确认云端已完成/未执行」需要先把账本修好",
+                "先跑一次「账本锚点重建」，再重新查询恢复状态",
+                status="blocked",
+                extra={"operation_id": operation_id,
+                       "ledger_state": self._wps_ledger_state_value(ledger_state)})
         snapshot = self._sanitize_wps_recovery(raw)
         current = next((op for op in (snapshot.get("operations") or [])
                         if op.get("operation_id") == operation_id), None)
@@ -2538,8 +2592,22 @@ class Bridge:
                         "先在「云文档同步」里完成授权后重试", status="blocked",
                         operation_ref=operation_ref,
                         extra={"operation_id": operation_id, "scope": scope_base})
+            journal = None
+            if ledger is None:
+                # 账本读不出来：意图日志只按路径读（「退场」「只记录备注」只需要它，
+                # 它们从不碰账本，这正是"账本损坏时恢复入口还能用"的落点）。
+                journal = self._wps_journal_for_path(self._wps_ledger_path_probe())
+                if journal is None:
+                    return self._wps_resolve_failure(
+                        "wps_recovery_journal_unreadable",
+                        "本地账本与意图日志都不可用，拒绝任何恢复动作",
+                        "先修复本地日志/账本", status="blocked",
+                        operation_ref=operation_ref,
+                        extra={"operation_id": operation_id,
+                               "scope": scope_base})
             resolved = _wps_resolve_pending_operation(
                 ledger, operation_id, decision, note=note, cli=cli,
+                journal=journal,
                 confirm_structure_checked=confirm_structure_checked)
         except WpsCloudError as exc:
             return self._wps_resolve_failure(
@@ -2939,7 +3007,121 @@ class Bridge:
         payload.update(extra)
         return payload
 
-    def _wps_context_bundle(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    # ------------------------------------------------------------------
+    # 账本可用性（第 14 项）：把「缺失 / 丢过 / 损坏 / 不可读」分开
+    #
+    # 账本是**唯一**的幂等锚点，云端只存总餐次与日期格，锚点一丢增量从任何地方
+    # 都推算不出来。所以这里既不能把损坏当空账本（会重复加餐），也不能因为账本
+    # 读不出来就把用户锁死（连恢复/重建入口都打不开）。
+    # ------------------------------------------------------------------
+    #: 账本可用性取值（对外白名单）。
+    _LEDGER_STATES = ("ok", "missing", "missing_with_history", "corrupt",
+                      "unreadable")
+
+    @classmethod
+    def _wps_ledger_state_value(cls, value: Any) -> str:
+        text = str(value or "").strip()
+        return text if text in cls._LEDGER_STATES else ""
+
+    @staticmethod
+    def _wps_ledger_state(ledger: Any, loss: Any = None) -> str:
+        """账本可用性：ok / missing / missing_with_history。
+
+        ``missing`` 与 ``missing_with_history`` 的区别是**这台机器以前同步过**：
+        前者多半是全新安装，后者必须提示人工核对 —— 两种情况都不能静默当成
+        "没事"（见 design/WPS-账本丢失与损坏的兜底.md §4.2）。
+        """
+        # ``ledger.path`` 是 ``pathlib.Path``；被替身换成别的对象时按"不存在"处理，
+        # 不在这里 import Path（这个模块只需要鸭子类型）。
+        path = getattr(ledger, "path", None)
+        exists = False
+        if path is not None:
+            try:
+                exists = bool(path.is_file())
+            except (OSError, AttributeError):
+                exists = False
+        if exists:
+            return "ok"
+        return "missing_with_history" if (loss or {}).get("traces") else "missing"
+
+    @staticmethod
+    def _wps_ledger_path_probe() -> str:
+        """账本读不出来时仍然拿到它的路径（意图日志路径只由它决定）。
+
+        只问类、不读盘：``SyncLedger.empty()`` 不碰文件。类被替换成没有 ``empty``
+        的替身时返回空串 —— 那种情况下宁可不给恢复视图，也绝不去读真实用户目录
+        里的日志。
+        """
+        factory = getattr(SyncLedger, "empty", None)
+        if not callable(factory):
+            return ""
+        try:
+            return str(getattr(factory(), "path", "") or "")
+        except Exception:  # noqa: BLE001 - 拿不到路径就不给恢复视图
+            return ""
+
+    @staticmethod
+    def _wps_journal_for_path(path: str) -> Any:
+        """只按路径读意图日志（不需要能构造 ``SyncLedger``）；读不出来返回 None。"""
+        if not path:
+            return None
+        try:
+            return SyncJournal(journal_path_for(path))
+        except Exception:  # noqa: BLE001 - 日志损坏只说明恢复视图不可用
+            return None
+
+    def _wps_ledger_view(self) -> dict[str, Any]:
+        """只读取得账本视图 ``{ledger, state, loss, path, error}``；绝不抛异常。"""
+        try:
+            ledger = SyncLedger()
+        except WpsCloudError as exc:
+            state = ("corrupt" if type(exc).__name__ == "LedgerCorruptError"
+                     else "unreadable")
+            return {"ledger": None, "state": state, "loss": None,
+                    "path": self._wps_ledger_path_probe(), "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001 - 只读入口错误也必须脱敏
+            return {"ledger": None, "state": "unreadable", "loss": None,
+                    "path": self._wps_ledger_path_probe(),
+                    "error": f"{type(exc).__name__}"}
+        try:
+            loss = ledger_loss_evidence(ledger)
+        except Exception:  # noqa: BLE001 - 证明不了就只提示，不阻断
+            loss = {"lost": False, "records": 0, "traces": [], "reason": ""}
+        return {"ledger": ledger, "state": self._wps_ledger_state(ledger, loss),
+                "loss": loss, "path": str(getattr(ledger, "path", "") or ""),
+                "error": ""}
+
+    @staticmethod
+    def _wps_annotate_missing_anchors(plans: list[Any], bundle: dict[str, Any]) -> None:
+        """账本不是 ok 时，给"没有锚点"的行加一条明确警告。
+
+        「本批首次同步 +N」在全新安装和账本丢失时长得一模一样 —— 这正是危险点：
+        丢失时预览看起来完全正常，只有人工比云端总餐次才发现。所以必须在这里
+        明说"可能是第一次用，也可能账本丢过"。
+        """
+        state = str(bundle.get("ledger_state") or "ok")
+        if state == "ok":
+            return
+        state_text = {
+            "missing": "账本文件不存在",
+            "missing_with_history": "账本文件不存在，但本机留着以前同步过的痕迹",
+            "corrupt": "账本文件损坏",
+            "unreadable": "账本文件读不出来",
+        }.get(state, f"账本状态异常（{state}）")
+        for plan in plans:
+            missing = [change for change in (getattr(plan, "changes", None) or [])
+                       if getattr(change, "ledger_prev", None) is None]
+            if not missing:
+                continue
+            plan.warnings.append(
+                f"{state_text}：本批有 {len(missing)} 行没有账本锚点，下面这些行会按"
+                f"「本批首次同步」算。第一次用就是对的；以前同步过（卸载重装、清过"
+                f"应用数据）就得先核对云端这些人的总餐次与日期格，核对不了先跑"
+                f"「账本锚点重建」")
+
+    def _wps_context_bundle(self, *, allow_ledger_failure: bool = False
+                             ) -> tuple[dict[str, Any] | None,
+                                      dict[str, Any] | None]:
         """只读准备当前上下文；失败返回统一的拒绝结果，绝不触发写入。
 
         这里会**建立一次账本快照**（``bundle["ledger"]``），并让后续的
@@ -2979,19 +3161,31 @@ class Bridge:
                 "确认排单表可读后重试", proven_no_write=True)
         # 账本快照必须早于任何云端读取建立，才能覆盖“计划构建期间另一个进程提交”
         # 的窗口；损坏/不可读账本在这里就失败关闭（零云端写入）。
-        try:
-            ledger = SyncLedger()
-        except WpsCloudError as exc:
+        # 账本快照必须早于任何云端读取建立，才能覆盖“计划构建期间另一个进程提交”
+        # 的窗口；损坏/不可读账本在这里就失败关闭（零云端写入）。
+        view = self._wps_ledger_view()
+        ledger = view["ledger"]
+        loss = view.get("loss") or {}
+        if ledger is None and not allow_ledger_failure:
             return None, self._wps_reject(
-                "local_state_blocked", f"本地账本/意图日志不可用：{exc}",
+                "local_state_blocked",
+                f"本地账本/意图日志不可用：{view.get('error') or '账本不可用'}",
                 "只读核对；先修复本地日志/账本后重新预览",
                 status="blocked", summary={"code": "local_state_blocked"},
                 proven_no_write=True)
-        except Exception as exc:  # noqa: BLE001 - 账本异常一律失败关闭
+        if (ledger is not None and loss.get("lost") and not allow_ledger_failure):
+            # **可证明**的丢失：意图日志里记着"这批已经落盘"的锚点，账本里却查不到。
+            # 锚点只增不减，所以现在按空账本算增量就是把整批餐再加一遍 —— 必须
+            # 失败关闭，并把用户引到唯一能继续的出路（账本锚点重建）。
             return None, self._wps_reject(
-                "local_state_blocked", f"本地账本不可用：{type(exc).__name__}",
-                "只读核对；先修复本地日志/账本后重新预览",
-                status="blocked", summary={"code": "local_state_blocked"},
+                "local_ledger_lost",
+                "本地账本丢过锚点（意图日志里记着已同步的批次，账本里查不到），"
+                "按现在这样上传会把整批餐再加一遍，已拒绝",
+                "先跑「账本锚点重建」核对本批是否已入账，再重新预览",
+                status="blocked",
+                summary={"code": "local_ledger_lost",
+                         "records": int(loss.get("records") or 0),
+                         "traces": list(loss.get("traces") or [])},
                 proven_no_write=True)
         context = self._wps_context_snapshot(
             local_sha256=local_sha, tables=tables, target=target)
@@ -3003,6 +3197,11 @@ class Bridge:
             "context": context,
             "context_fingerprint": fingerprint_payload(context),
             "ledger": ledger,
+            # 账本可用性随 bundle 走：预览要据此警告，账本重建要据此决定写哪条路径。
+            "ledger_state": str(view["state"]),
+            "ledger_loss": dict(loss),
+            "ledger_path": str(view.get("path") or ""),
+            "ledger_unavailable": ledger is None,
         }, None
 
     def _wps_read_plans(self, bundle: dict[str, Any]
@@ -3031,10 +3230,12 @@ class Bridge:
                     "local_file_changed", "本地排单表在读取过程中发生变化，请重新预览",
                     "文件稳定后重新预览", proven_no_write=True)
             ledger = bundle.get("ledger")
-            if ledger is None:
+            if ledger is None and not bundle.get("ledger_unavailable"):
                 # 兼容直接构造 bundle 的调用方（测试/未来重构）：没有随 bundle
                 # 传递快照时绝不静默新建第二个账本，而是就地建立并写回 bundle，
                 # 保证同一次预览/上传里 build_plan 与 apply_plan 用的是同一份。
+                # 账本锚点重建那条路是例外（ledger_unavailable）：它**必须**用
+                # ledger=None 建计划 —— "按空账本算出来的增量"正是要推断的东西。
                 try:
                     ledger = SyncLedger()
                 except WpsCloudError as exc:
@@ -3052,6 +3253,7 @@ class Bridge:
                 address_order=cfg.wps_address_order,
                 sort_enabled=cfg.wps_sort_enabled,
                 log=self.log)
+            self._wps_annotate_missing_anchors(plans, bundle)
             if sha256_file(cfg.excel_path) != bundle["local_sha256"]:
                 return None, self._wps_reject(
                     "local_file_changed", "本地排单表在计划构建期间发生变化，请重新预览",
@@ -3223,6 +3425,406 @@ class Bridge:
             conflicting_operation=(conflict.get("summary") or {}
                                    ).get("conflicting_operation"))
 
+    # ------------------------------------------------------------------
+    # 账本锚点重建（第 14 项）：账本丢失/损坏之后**唯一**能继续上传的出路
+    #
+    # 两段式，和预览/上传同一套纪律：先只读提案（逐行推断"这一批是不是已经入账"），
+    # 再带**指纹**确认写入。整条路只写本地账本，永不写云端（cloud_write=false），
+    # 也不解除任何防重复闸门 —— 闸门（意图日志）与锚点（账本）是两条独立防线。
+    #
+    # 判定方向永远**宁漏勿重**：漏加可以人工补，重复加要按云端日期格往回减。
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 账本抢救（第 14 项续）：结构受损但还能解析时，逐条丢坏的、留好的
+    #
+    # 纯本地修复：不读云端、不写云端，也**不看** wps_enabled（云同步关着也该能修
+    # 本地账本）。两段式：不带 confirm 只给清单，带 confirm="salvage" 才写。
+    # ------------------------------------------------------------------
+    #: 确认写入时用户必须逐字输入的值。
+    SALVAGE_CONFIRM_WORD = "salvage"
+    #: 人工核对说明的最短长度（与重建/恢复同一口径）。
+    SALVAGE_MIN_NOTE = 4
+
+    def wps_ledger_salvage(self, payload: dict[str, Any] | None = None,
+                           **options: Any) -> dict[str, Any]:
+        """账本抢救：逐条丢掉坏掉的人/表/日期，好的原样留下。
+
+        请求（HTTP ``POST /api/wps_ledger_salvage``）::
+
+            {}                          # 只读清单：留下多少、丢了哪几条、为什么丢
+            {"confirm": "salvage",      # 逐字确认
+             "note": "账本损坏，按清单抢救"}   # ≥4 字符，写进账本审计
+
+        写在**本地账本**里，一个云端格子都不动。救不了的情况会明说并指向
+        「账本锚点重建」：文件不存在、读不出来、连 JSON 都解析不了。
+        """
+        data: dict[str, Any] = dict(payload) if isinstance(payload, dict) else {}
+        for key, value in options.items():
+            if value is not None:
+                data[key] = value
+        confirm = str(data.get("confirm") or "").strip()
+        if not confirm:
+            return self._wps_ledger_salvage_impl(dry_run=True, note="")
+        if confirm != self.SALVAGE_CONFIRM_WORD:
+            return self._wps_reject(
+                "confirmation_required",
+                f"必须逐字确认：confirm 必须等于 {self.SALVAGE_CONFIRM_WORD}",
+                f"重新提交并令 confirm={self.SALVAGE_CONFIRM_WORD}",
+                proven_no_write=True, changed=False)
+        note = str(data.get("note") or "").strip()
+        if len(note) < self.SALVAGE_MIN_NOTE:
+            return self._wps_reject(
+                "note_required",
+                "必须填写至少 4 个字符的人工核对说明（写进本地账本审计）",
+                "补充 note 后重试", proven_no_write=True, changed=False)
+        return self._wps_ledger_salvage_impl(dry_run=False, note=note)
+
+    @staticmethod
+    def _wps_salvage_dropped_item(item: Any) -> dict[str, Any]:
+        """抢救清单里的一条：丢掉的是谁、在哪一批、为什么丢。
+
+        姓名/电话与「账本锚点重建」的提案同一口径：用户必须知道丢的是**谁**的
+        锚点，才能去核对那些人这一批到底加没加过。
+        """
+        if not isinstance(item, dict):
+            return {"scope": "", "day": "", "file": "", "name": "", "phone": "",
+                    "reason": ""}
+        return {
+            "scope": str(item.get("scope") or "")[:16],
+            "day": str(item.get("day") or "")[:32],
+            "file": str(item.get("file") or "")[:64],
+            "name": str(item.get("name") or "")[:64],
+            "phone": str(item.get("phone") or "")[:32],
+            "reason": str(item.get("reason") or "")[:64],
+        }
+
+    def _wps_ledger_salvage_impl(self, *, dry_run: bool, note: str) -> dict[str, Any]:
+        view = self._wps_ledger_view()
+        path = str(view.get("path") or "")
+        if not path:
+            return self._wps_reject(
+                "ledger_path_unavailable",
+                "拿不到本地账本路径，拒绝任何动作（一个字节都没写）",
+                "检查数据目录权限后重试", status="blocked",
+                proven_no_write=True, changed=False)
+        lock = None
+        if not dry_run:
+            # 与 apply_plan / 恢复入口共用同一把操作锁：上传正在写账本时抢着抢救，
+            # 会把那一批刚写下的锚点覆盖掉。宁可明确拒绝，也不制造这种窗口。
+            lock = FileLock(operation_lock_path_for(path), timeout=5.0)
+            try:
+                lock.acquire()
+            except LockTimeout:
+                return self._wps_reject(
+                    "operation_conflict",
+                    "另一个云同步/恢复操作正在进行，本次没有抢救任何内容",
+                    "等它结束后重新生成清单；不要重复提交", status="rejected",
+                    proven_no_write=True, changed=False)
+            except (AtomicWriteError, OSError, RuntimeError) as exc:
+                return self._wps_reject(
+                    "lock_unavailable",
+                    f"本地存储不可用，无法取得操作锁：{type(exc).__name__}",
+                    "检查磁盘/权限后重试", status="blocked",
+                    proven_no_write=True, changed=False)
+        try:
+            try:
+                result = salvage_ledger(path, note=note, actor="local-admin",
+                                        dry_run=dry_run)
+            except Exception as exc:  # noqa: BLE001 - 抢救失败绝不能 500
+                self.log(f"[云同步账本抢救] 失败：{type(exc).__name__}: {exc}",
+                         "ERROR")
+                return self._wps_reject(
+                    "salvage_failed", f"抢救未完成：{type(exc).__name__}",
+                    "查看日志后重试；确认前不要上传", status="error",
+                    proven_no_write=True, changed=False)
+            verified = False
+            if not dry_run:
+                # 回读证明：抢救完的账本必须真的能被读回来（否则等于没救）。
+                verified = self._wps_ledger_view()["ledger"] is not None
+        finally:
+            if lock is not None:
+                lock.release()
+        report = dict(result.get("report") or {})
+        counts = {
+            "kept_people": int(report.get("kept_people") or 0),
+            "kept_batches": int(report.get("kept_batches") or 0),
+            "dropped_people": int(report.get("dropped_people") or 0),
+            "dropped_batches": int(report.get("dropped_batches") or 0),
+            "dropped_total": int(report.get("dropped_total") or 0),
+        }
+        warnings = [str(report["version_note"])] if report.get("version_note") else []
+        out: dict[str, Any] = {
+            "ok": bool(result.get("ok")),
+            "status": str(result.get("status") or ""),
+            "code": str(result.get("status") or ""),
+            "reason": str(result.get("reason") or ""),
+            "contract_version": 1,
+            "read_only": bool(dry_run),
+            "cloud_write": False,
+            "ledger_write": bool(not dry_run and result.get("changed")),
+            "changed": bool(result.get("changed")),
+            "ledger_path": str(result.get("path") or path),
+            "backup": str(result.get("backup") or ""),
+            "counts": counts,
+            "dropped": [self._wps_salvage_dropped_item(item)
+                        for item in (report.get("dropped") or [])],
+            "warnings": warnings,
+            "next_action": ("wps_ledger_salvage(confirm='salvage')" if dry_run
+                            else "repreview"),
+        }
+        if not dry_run:
+            out["verified_on_disk"] = verified
+            after = self._wps_ledger_view()
+            out["ledger_state"] = str(after.get("state") or "")
+            out["ledger_lost"] = bool((after.get("loss") or {}).get("lost"))
+            out["audit"] = {
+                "actor": "local-admin",
+                "at": _dt.datetime.now().isoformat(timespec="seconds"),
+                "note_recorded": bool(note),
+                "dropped_people": counts["dropped_people"],
+                "dropped_batches": counts["dropped_batches"],
+                "effects": {"cloud_written": False,
+                            "ledger_written": bool(result.get("changed"))},
+            }
+            if result.get("changed"):
+                self.log(
+                    f"[云同步账本抢救] 丢 {counts['dropped_people']} 人 / "
+                    f"{counts['dropped_batches']} 个批次层；"
+                    f"原件留档 {out['backup'] or '（无）'}；"
+                    f"回读{'通过' if verified else '未通过'}", "WARN")
+        return out
+
+    def wps_ledger_rebuild(self, payload: dict[str, Any] | None = None,
+                           **options: Any) -> dict[str, Any]:
+        """账本锚点重建；不带 ``confirm`` 时只返回**只读**提案。
+
+        请求（HTTP ``POST /api/wps_ledger_rebuild``，JSON 数组单对象或对象键值均可）::
+
+            {}                                   # 只读提案（读云端，不写任何东西）
+            {"confirm": "rebuild",               # 逐字确认
+             "note": "账本丢失，按云端日期格核对后重建",   # ≥4 字符，写进账本审计
+             "expected_fingerprint": "<提案里的 fingerprint>"}
+
+        为什么要有这个入口：账本是唯一的幂等锚点，云端只存总餐次与日期格，锚点一丢
+        增量就推算不出来。没有这个入口时，用户只会看到「先修复本地日志/账本」，
+        而没有任何可执行的动作。
+        """
+        data: dict[str, Any] = dict(payload) if isinstance(payload, dict) else {}
+        for key, value in options.items():
+            if value is not None:
+                data[key] = value
+        confirm = str(data.get("confirm") or "").strip()
+        if not confirm:
+            return self._wps_ledger_rebuild_proposal()
+        return self._wps_ledger_rebuild_commit(
+            confirm=confirm,
+            note=str(data.get("note") or "").strip(),
+            expected=str(data.get("expected_fingerprint") or "").strip())
+
+    def _wps_ledger_rebuild_proposal(self) -> dict[str, Any]:
+        if not self._config.wps_enabled:
+            return self._wps_reject(
+                "wps_disabled",
+                "云文档同步已关闭（wps_enabled=False），服务端已拒绝重建提案；"
+                "未读云端、未写任何内容",
+                "在「云文档同步」中开启后再试", status="rejected",
+                proven_no_write=True)
+        operation, conflict = self._begin_cloud_read(
+            "wps_ledger_rebuild", "账本锚点重建", "重建账本锚点")
+        if conflict is not None:
+            return self._cloud_read_conflict(conflict)
+        try:
+            result = self._wps_ledger_rebuild_proposal_impl()
+        except BaseException:
+            # 意外异常也必须先释放占位（与预览同一条纪律）。
+            self._finish_cloud_read(operation, {"ok": False, "status": "error",
+                                                "code": "unexpected"},
+                                    title="账本锚点重建")
+            raise
+        self._finish_cloud_read(operation, result, title="账本锚点重建")
+        return result
+
+    def _wps_ledger_rebuild_proposal_impl(self) -> dict[str, Any]:
+        """按**空账本**建计划，逐行推断本批是否已入账；只读，不写任何东西。"""
+        bundle, error = self._wps_context_bundle(allow_ledger_failure=True)
+        if error is not None:
+            return error
+        assert bundle is not None
+        plans, error = self._wps_read_plans(bundle)
+        if error is not None:
+            return error
+        assert plans is not None
+        try:
+            proposal = build_rebuild(plans)
+            text = format_rebuild(proposal)
+        except Exception as exc:  # noqa: BLE001
+            return self._wps_reject(
+                "rebuild_format_failed", f"{type(exc).__name__}: {exc}",
+                "查看日志后重试", status="failed", proven_no_write=True)
+        return {
+            "ok": True,
+            "status": "rebuild_ready",
+            "reason": "",
+            "code": "",
+            "contract_version": 1,
+            "read_only": True,
+            "cloud_write": False,
+            "ledger_write": False,
+            "next_action": "wps_ledger_rebuild(confirm='rebuild')",
+            "target_date": proposal.target_date,
+            "test_mode": bool(bundle["config"].wps_test_mode),
+            "ledger_state": str(bundle.get("ledger_state") or ""),
+            "ledger_lost": bool((bundle.get("ledger_loss") or {}).get("lost")),
+            "ledger_path": str(bundle.get("ledger_path") or ""),
+            "fingerprint": proposal.fingerprint,
+            "counts": proposal.counts,
+            "tables": [sheet.as_dict() for sheet in proposal.sheets],
+            "warnings": list(proposal.warnings),
+            "text": text,
+        }
+
+    def _wps_ledger_rebuild_commit(self, *, confirm: str, note: str,
+                                   expected: str) -> dict[str, Any]:
+        if confirm != REBUILD_CONFIRM_WORD:
+            return self._wps_reject(
+                "confirmation_required",
+                f"必须逐字确认：confirm 必须等于 {REBUILD_CONFIRM_WORD}",
+                f"重新提交并令 confirm={REBUILD_CONFIRM_WORD}",
+                proven_no_write=True, changed=False)
+        if len(note) < REBUILD_MIN_NOTE:
+            return self._wps_reject(
+                "note_required",
+                "必须填写至少 4 个字符的人工核对说明（写进账本审计）",
+                "补充 note 后重试", proven_no_write=True, changed=False)
+        if not self._config.wps_enabled:
+            return self._wps_reject(
+                "wps_disabled",
+                "云文档同步已关闭（wps_enabled=False），服务端已拒绝重建；未写任何内容",
+                "在「云文档同步」中开启后再试", status="rejected",
+                proven_no_write=True, changed=False)
+        operation, conflict = self._begin_cloud_read(
+            "wps_ledger_rebuild", "账本锚点重建", "重建账本锚点")
+        if conflict is not None:
+            return self._cloud_read_conflict(conflict)
+        try:
+            result = self._wps_ledger_rebuild_commit_impl(
+                note=note, expected=expected)
+        except BaseException:
+            self._finish_cloud_read(operation, {"ok": False, "status": "error",
+                                                "code": "unexpected"},
+                                    title="账本锚点重建")
+            raise
+        self._finish_cloud_read(operation, result, title="账本锚点重建")
+        return result
+
+    def _wps_ledger_rebuild_commit_impl(self, *, note: str,
+                                        expected: str) -> dict[str, Any]:
+        """重新只读推断一遍；指纹一致才写账本（先留档原件）。永不写云端。"""
+        bundle, error = self._wps_context_bundle(allow_ledger_failure=True)
+        if error is not None:
+            return error
+        assert bundle is not None
+        plans, error = self._wps_read_plans(bundle)
+        if error is not None:
+            return error
+        assert plans is not None
+        try:
+            proposal = build_rebuild(plans)
+        except Exception as exc:  # noqa: BLE001
+            return self._wps_reject(
+                "rebuild_format_failed", f"{type(exc).__name__}: {exc}",
+                "查看日志后重试", status="failed", proven_no_write=True,
+                changed=False)
+        counts = proposal.counts
+        ledger_path = str(bundle.get("ledger_path") or "")
+        if not ledger_path:
+            return self._wps_reject(
+                "ledger_path_unavailable",
+                "拿不到本地账本路径，拒绝写入（一个字节都没写）",
+                "检查数据目录权限后重试", status="blocked",
+                proven_no_write=True, changed=False)
+        if expected and expected != proposal.fingerprint:
+            # 云端或本地排单表在"看提案"与"确认"之间变了：锚点会不一样，宁可不写。
+            return self._wps_reject(
+                "rebuild_changed",
+                "云端或本地排单表在提案之后已经变化，重建出来的锚点会不一样，"
+                "已拒绝写入（一个字节都没写）",
+                "重新调用 wps_ledger_rebuild() 生成新提案后再确认",
+                proven_no_write=True, changed=False, counts=counts,
+                fingerprint=proposal.fingerprint,
+                ledger_path=ledger_path)
+        audit_base: dict[str, Any] = {
+            "actor": "local-admin",
+            "at": _dt.datetime.now().isoformat(timespec="seconds"),
+            "note_recorded": True,
+            "source": "cloud_scan",
+            "fingerprint": proposal.fingerprint,
+        }
+        if not int(counts.get("mark_synced") or 0):
+            return {
+                "ok": True, "status": "rebuild_noop", "code": "rebuild_noop",
+                "reason": "没有任何一行判定为「已入账」，本次不写账本",
+                "next_action": "repreview",
+                "contract_version": 1, "read_only": False, "cloud_write": False,
+                "ledger_write": False, "changed": False, "verified_on_disk": True,
+                "target_date": proposal.target_date,
+                "ledger_state": str(bundle.get("ledger_state") or ""),
+                "ledger_path": ledger_path,
+                "written_people": 0, "written_slots": 0,
+                "fingerprint": proposal.fingerprint, "counts": counts,
+                "tables": [sheet.as_dict() for sheet in proposal.sheets],
+                "warnings": list(proposal.warnings),
+                "audit": {**audit_base,
+                          "effects": {"cloud_written": False,
+                                      "ledger_written": False}},
+            }
+        try:
+            written = write_rebuild(proposal, ledger_path=ledger_path,
+                                    note=note, actor="local-admin")
+        except Exception as exc:  # noqa: BLE001 - 写失败绝不能声称成功
+            self.log(f"[云同步账本重建] 写账本失败：{type(exc).__name__}: {exc}",
+                     "ERROR")
+            return self._wps_reject(
+                "ledger_write_failed",
+                f"账本写入失败：{type(exc).__name__}（原件已尽力留档）",
+                "检查磁盘/权限后重试；确认前不要上传", status="error",
+                proven_no_write=True, changed=False, ledger_path=ledger_path,
+                fingerprint=proposal.fingerprint)
+        verified = verify_rebuild(proposal, ledger_path=ledger_path)
+        after = self._wps_ledger_view()
+        self.log(
+            f"[云同步账本重建] 写入 {written.get('people')} 人 / "
+            f"{written.get('slots')} 槽位；回读{'一致' if verified else '不一致'}；"
+            f"原件留档 {written.get('backup') or '（无）'}", "WARN")
+        return {
+            "ok": bool(verified),
+            "status": "rebuilt" if verified else "rebuild_unverified",
+            "code": "rebuilt" if verified else "rebuild_unverified",
+            "reason": ("已按云端现状重建本批锚点，未写云端" if verified
+                       else "账本已写入但回读对不上，请人工核对后再上传"),
+            "next_action": "repreview" if verified else "manual_reconcile",
+            "contract_version": 1, "read_only": False, "cloud_write": False,
+            "ledger_write": bool(written.get("changed")),
+            "changed": bool(written.get("changed")),
+            "verified_on_disk": bool(verified),
+            "target_date": proposal.target_date,
+            "ledger_state": str(after.get("state") or ""),
+            "ledger_lost": bool((after.get("loss") or {}).get("lost")),
+            "ledger_path": ledger_path,
+            "fingerprint": proposal.fingerprint, "counts": counts,
+            "written_people": int(written.get("people") or 0),
+            "written_slots": int(written.get("slots") or 0),
+            "replaced_corrupt": bool(written.get("replaced_corrupt")),
+            "backup": str(written.get("backup") or ""),
+            "tables": [sheet.as_dict() for sheet in proposal.sheets],
+            "warnings": list(proposal.warnings),
+            "audit": {**audit_base,
+                      "effects": {"cloud_written": False,
+                                  "ledger_written": bool(written.get("changed")),
+                                  "replaced_corrupt": bool(
+                                      written.get("replaced_corrupt"))}},
+        }
+
     def wps_preview(self) -> dict[str, Any]:
         """只读云端，生成结构化预览并发放 10 分钟一次性上传令牌。
 
@@ -3316,6 +3918,10 @@ class Bridge:
             "blocked": blocked,
             "warnings": warnings,
             "test_mode": bool(bundle["config"].wps_test_mode),
+            # 账本可用性随预览一起返回：界面据此提示"这些行可能是首次同步，
+            # 也可能账本丢过"，而不是只让人自己去比云端总餐次。
+            "ledger_state": str(bundle.get("ledger_state") or ""),
+            "ledger_lost": bool((bundle.get("ledger_loss") or {}).get("lost")),
         }
         result.update(self._previews.public(record))
         return result

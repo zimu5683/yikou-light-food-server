@@ -28,6 +28,8 @@ import {
   isApiReady,
   isWebTransport,
   type WpsCopyCheck,
+  type WpsLedgerRebuildResult,
+  type WpsLedgerSalvageResult,
   type WpsPreviewResult,
   type WpsRecoveryDecision,
   type WpsRecoveryOperation,
@@ -64,6 +66,26 @@ import {
   type ResolveOutcomeView,
 } from '@/lib/recoveryResolve'
 import {
+  REBUILD_CONFIRM_WORD,
+  REBUILD_MIN_NOTE,
+  REBUILD_RISK_TEXT,
+  SALVAGE_CONFIRM_WORD,
+  SALVAGE_MIN_NOTE,
+  SALVAGE_RISK_TEXT,
+  buildRebuildPayload,
+  buildSalvagePayload,
+  ledgerStateLabel,
+  rebuildCountsSummary,
+  rebuildOutcomeView,
+  rebuildRowText,
+  rebuildVisibility,
+  salvageCountsSummary,
+  salvageDroppedText,
+  salvageOutcomeView,
+  salvageVisibility,
+  type RebuildOutcomeView,
+} from '@/lib/ledgerRepair'
+import {
   journalIssueOf,
   previewFailureView,
   uploadFailureView,
@@ -96,6 +118,9 @@ const addressTextareaClass = cn(
 )
 
 type Tone = 'info' | 'success' | 'warning' | 'danger' | 'neutral'
+
+/** 这两个码是"用户还没填对"，弹窗留着让他改（不是业务失败）。 */
+const WAIT_FOR_INPUT_CODES = new Set(['confirmation_required', 'note_required'])
 
 interface Message {
   tone: Tone
@@ -145,6 +170,24 @@ export function CloudForm() {
   const [resolveBusy, setResolveBusy] = useState(false)
   const [resolveOutcome, setResolveOutcome] = useState<ResolveOutcomeView | null>(null)
   const resolveGate = useRef(new SingleFlightGate())
+  // 第 14 项：账本锚点重建（只读提案 → 逐字确认写入；只写本地账本，永不写云端）。
+  const [rebuildProposal, setRebuildProposal] = useState<WpsLedgerRebuildResult | null>(null)
+  const [rebuildError, setRebuildError] = useState('')
+  const [rebuildOpen, setRebuildOpen] = useState(false)
+  const [rebuildConfirm, setRebuildConfirm] = useState('')
+  const [rebuildNote, setRebuildNote] = useState('')
+  const [rebuildBusy, setRebuildBusy] = useState(false)
+  const [rebuildOutcome, setRebuildOutcome] = useState<RebuildOutcomeView | null>(null)
+  const rebuildGate = useRef(new SingleFlightGate())
+  // 第 14 项续：账本抢救（只读清单 → 逐字确认才写；只写本地账本）。
+  const [salvageProposal, setSalvageProposal] = useState<WpsLedgerSalvageResult | null>(null)
+  const [salvageError, setSalvageError] = useState('')
+  const [salvageOpen, setSalvageOpen] = useState(false)
+  const [salvageConfirm, setSalvageConfirm] = useState('')
+  const [salvageNote, setSalvageNote] = useState('')
+  const [salvageBusy, setSalvageBusy] = useState(false)
+  const [salvageOutcome, setSalvageOutcome] = useState<RebuildOutcomeView | null>(null)
+  const salvageGate = useRef(new SingleFlightGate())
   const uploadGateRef = useRef(new SingleFlightGate())
   const [enabled, setEnabled] = useState(config?.wps_enabled ?? false)
   const [testMode, setTestMode] = useState(config?.wps_test_mode ?? true)
@@ -420,6 +463,155 @@ export function CloudForm() {
       uploadGateRef.current.finish(token)
       setBusy('')
       setConfirmOpen(false)
+    }
+  }
+
+  // ---------- 第 14 项续：账本抢救（只读清单 → 逐字确认才写；只写本地账本） ----------
+
+  async function openSalvage() {
+    if (salvageBusy) return
+    setSalvageBusy(true)
+    setSalvageError('')
+    try {
+      const proposal = await api().wps_ledger_salvage()
+      if (proposal.ok !== true) {
+        setSalvageProposal(null)
+        setSalvageOutcome(salvageOutcomeView(proposal))
+        setSalvageError(String(proposal.reason || '抢救清单没有生成'))
+        return
+      }
+      setSalvageProposal(proposal)
+      setSalvageConfirm('')
+      setSalvageNote('')
+      setSalvageOutcome(null)
+      setRebuildOutcome(null)
+      setSalvageOpen(true)
+    } catch (error) {
+      setSalvageError(classifyRequestError(error).detail)
+    } finally {
+      setSalvageBusy(false)
+    }
+  }
+
+  function closeSalvage() {
+    setSalvageOpen(false)
+    setSalvageError('')
+  }
+
+  async function submitSalvage() {
+    if (!salvageProposal) return
+    const built = buildSalvagePayload({ confirm: salvageConfirm, note: salvageNote })
+    if (!built.ok || !built.payload) {
+      setSalvageError(built.message)
+      return
+    }
+    const token = salvageGate.current.begin()
+    if (token === null) return
+    setSalvageBusy(true)
+    setSalvageError('')
+    try {
+      const result = await api().wps_ledger_salvage(built.payload)
+      if (!salvageGate.current.isCurrent(token)) return
+      if (WAIT_FOR_INPUT_CODES.has(String(result.code || ''))) {
+        // 确认词/说明没填对：弹窗留着让用户改，别把他刚填的东西关掉。
+        setSalvageError(String(result.reason || '确认不完整，未写账本'))
+        return
+      }
+      setSalvageOutcome(salvageOutcomeView(result))
+      setSalvageOpen(false)
+      setSalvageProposal(null)
+      await refresh()
+    } catch (error) {
+      if (!salvageGate.current.isCurrent(token)) return
+      setSalvageOutcome({
+        ok: false,
+        tone: 'danger',
+        title: '抢救请求结果未知',
+        detail: `网络失败：${classifyRequestError(error).detail}。服务端可能没有收到，也可能已经写盘。`,
+        nextStep: '先用「刷新状态（只读）」确认账本状态，再决定要不要重来；不要重复提交。',
+        blockingRetained: true,
+        ledgerChanged: false,
+      })
+    } finally {
+      salvageGate.current.finish(token)
+      setSalvageBusy(false)
+    }
+  }
+
+  // ---------- 第 14 项：账本锚点重建（只写本地账本，永不写云端） ----------
+
+  async function openRebuild() {
+    if (rebuildBusy) return
+    setRebuildBusy(true)
+    setRebuildError('')
+    try {
+      const proposal = await api().wps_ledger_rebuild()
+      if (proposal.ok !== true) {
+        setRebuildProposal(null)
+        setRebuildOutcome(rebuildOutcomeView(proposal))
+        setRebuildError(String(proposal.reason || '重建提案没有生成'))
+        return
+      }
+      setRebuildProposal(proposal)
+      setRebuildConfirm('')
+      setRebuildNote('')
+      setRebuildOutcome(null)
+      setSalvageOutcome(null)
+      setRebuildOpen(true)
+    } catch (error) {
+      setRebuildError(classifyRequestError(error).detail)
+    } finally {
+      setRebuildBusy(false)
+    }
+  }
+
+  function closeRebuild() {
+    setRebuildOpen(false)
+    setRebuildError('')
+  }
+
+  async function submitRebuild() {
+    if (!rebuildProposal) return
+    const built = buildRebuildPayload({
+      confirm: rebuildConfirm,
+      note: rebuildNote,
+      fingerprint: String(rebuildProposal.fingerprint || ''),
+    })
+    if (!built.ok || !built.payload) {
+      setRebuildError(built.message)
+      return
+    }
+    // 双击/并发保护：同一时刻只允许一个重建请求在途。
+    const token = rebuildGate.current.begin()
+    if (token === null) return
+    setRebuildBusy(true)
+    setRebuildError('')
+    try {
+      const result = await api().wps_ledger_rebuild(built.payload)
+      if (!rebuildGate.current.isCurrent(token)) return
+      if (WAIT_FOR_INPUT_CODES.has(String(result.code || ''))) {
+        setRebuildError(String(result.reason || '确认不完整，未写账本'))
+        return
+      }
+      setRebuildOutcome(rebuildOutcomeView(result))
+      setRebuildOpen(false)
+      setRebuildProposal(null)
+      await refresh()
+    } catch (error) {
+      if (!rebuildGate.current.isCurrent(token)) return
+      // 网络未知：不当作成功也不当作失败；本地账本是否已改未知。
+      setRebuildOutcome({
+        ok: false,
+        tone: 'danger',
+        title: '重建请求结果未知',
+        detail: `网络失败：${classifyRequestError(error).detail}。服务端可能没有收到，也可能已经写盘。`,
+        nextStep: '先用「刷新状态（只读）」看账本状态与本地记录，确认后再决定；不要重复提交。',
+        blockingRetained: true,
+        ledgerChanged: false,
+      })
+    } finally {
+      rebuildGate.current.finish(token)
+      setRebuildBusy(false)
     }
   }
 
@@ -781,6 +973,19 @@ export function CloudForm() {
           onResolve={openResolve}
         />
 
+        <LedgerRebuildCard
+          status={recoveryStatus}
+          outcome={salvageOutcome ?? rebuildOutcome}
+          error={salvageError || rebuildError}
+          summary={ledgerCardSummary(rebuildProposal, salvageProposal,
+                                     Boolean(salvageOutcome ?? rebuildOutcome))}
+          busy={rebuildBusy || salvageBusy || busy !== '' || operationActive || resolveBusy}
+          rebuildLabel={rebuildButtonLabel(rebuildBusy, rebuildProposal)}
+          salvageLabel={salvageButtonLabel(salvageBusy, salvageProposal)}
+          onRebuild={() => void openRebuild()}
+          onSalvage={() => void openSalvage()}
+        />
+
         {preview && (
           <StructuredPreview
             preview={preview}
@@ -862,6 +1067,32 @@ export function CloudForm() {
         onStructureChecked={setResolveStructure}
         onClose={closeResolve}
         onSubmit={submitResolve}
+      />
+
+      <LedgerRebuildDialog
+        open={rebuildOpen}
+        proposal={rebuildProposal}
+        confirm={rebuildConfirm}
+        note={rebuildNote}
+        error={rebuildError}
+        busy={rebuildBusy}
+        onConfirmText={setRebuildConfirm}
+        onNote={setRebuildNote}
+        onClose={closeRebuild}
+        onSubmit={() => void submitRebuild()}
+      />
+
+      <LedgerSalvageDialog
+        open={salvageOpen}
+        proposal={salvageProposal}
+        confirm={salvageConfirm}
+        note={salvageNote}
+        error={salvageError}
+        busy={salvageBusy}
+        onConfirmText={setSalvageConfirm}
+        onNote={setSalvageNote}
+        onClose={closeSalvage}
+        onSubmit={() => void submitSalvage()}
       />
     </div>
   )
@@ -1484,5 +1715,262 @@ function CopyCheckCard({ check }: { check: WpsCopyCheck }) {
         </>
       )}
     </Callout>
+  )
+}
+
+/**
+ * 第 14 项：账本兜底卡片（重建 + 抢救）。
+ *
+ * 只在账本**确实有问题**时出现（blocking / advisory / 损坏）。普通 `missing`
+ * （没有任何历史痕迹）不占地方 —— 那多半就是第一次用，预览里那句"可能是首次
+ * 同步"已经说过一次了；这里再吓一次就成了噪音。
+ */
+function LedgerRebuildCard({ status, outcome, error, summary, busy, rebuildLabel, salvageLabel, onRebuild, onSalvage }: {
+  status: WpsRecoveryStatus | null
+  outcome: RebuildOutcomeView | null
+  error: string
+  summary: string
+  busy: boolean
+  rebuildLabel: string
+  salvageLabel: string
+  onRebuild: () => void
+  onSalvage: () => void
+}) {
+  const visibility = rebuildVisibility(status)
+  const salvageReady = salvageVisibility(status) === 'available'
+  if (visibility === 'hidden' && !salvageReady && !outcome && !error) return null
+  const stateText = ledgerStateLabel(status?.ledger_state, status?.ledger_lost === true)
+  return (
+    <Callout
+      tone={outcome?.tone ?? (visibility === 'blocking' ? 'danger' : 'warning')}
+      title={outcome?.title || '本地账本不可信：可以重建锚点'}
+    >
+      <p>
+        {outcome
+          ? outcome.detail
+          : `${stateText}。重建只按云端现状逐行推断「这一批是否已经入账」：判成已入账的行下一批不会再加，判错只会漏加。`}
+      </p>
+      {!outcome && summary && <p className="mt-0.5">{summary}</p>}
+      <p className="mt-1 font-medium text-foreground">
+        下一步：{outcome
+          ? outcome.nextStep
+          : '先「查看重建提案（只读）」，逐行核对判定后再确认写入。'}
+      </p>
+      <p className="mt-1 text-muted-foreground">
+        两个入口都只写本地账本，不写云端（cloud_write=false），也不解除防重复闸门。
+        {outcome?.blockingRetained ? ' 阻断仍然保留：未核清前不要上传。' : ''}
+      </p>
+      {error && <p className="mt-1 text-warning">{error}</p>}
+      <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1">
+        <button
+          type="button"
+          className="font-medium text-primary underline"
+          disabled={busy}
+          onClick={onRebuild}
+        >
+          {rebuildLabel}
+        </button>
+        {salvageReady && (
+          <button
+            type="button"
+            className="font-medium text-primary underline"
+            disabled={busy}
+            onClick={onSalvage}
+          >
+            {salvageLabel}
+          </button>
+        )}
+      </div>
+    </Callout>
+  )
+}
+
+/** 卡片上那一行统计：有结果时不重复显示清单统计。 */
+function ledgerCardSummary(rebuild: WpsLedgerRebuildResult | null,
+                           salvage: WpsLedgerSalvageResult | null,
+                           hasOutcome: boolean): string {
+  if (hasOutcome) return ''
+  if (salvage) return salvageCountsSummary(salvage.counts)
+  if (rebuild) return rebuildCountsSummary(rebuild.counts)
+  return ''
+}
+
+function rebuildButtonLabel(busy: boolean, proposal: WpsLedgerRebuildResult | null): string {
+  if (busy) return '处理中…'
+  return proposal ? '重新生成提案（只读）' : '查看重建提案（只读）'
+}
+
+function salvageButtonLabel(busy: boolean, proposal: WpsLedgerSalvageResult | null): string {
+  if (busy) return '处理中…'
+  return proposal ? '重新生成抢救清单（只读）' : '先试着抢救账本（只读清单）'
+}
+
+/**
+ * 重建确认弹窗：逐行列出判定，要求人工核对说明 + **逐字**输入确认词。
+ *
+ * 复用上传用的 `ConfirmActionDialog`（同一套"确认才动"的样式与开关门逻辑）。
+ */
+function LedgerRebuildDialog({ open, proposal, confirm, note, error, busy, onConfirmText, onNote, onClose, onSubmit }: {
+  open: boolean
+  proposal: WpsLedgerRebuildResult | null
+  confirm: string
+  note: string
+  error: string
+  busy: boolean
+  onConfirmText: (value: string) => void
+  onNote: (value: string) => void
+  onClose: () => void
+  onSubmit: () => void
+}) {
+  if (!proposal) return null
+  const tables = proposal.tables ?? []
+  const fieldClass = 'mt-1 w-full rounded-[6px] border border-transparent bg-secondary px-2.5 py-1.5 text-xs outline-none focus-visible:border-ring focus-visible:bg-card'
+  return (
+    <ConfirmActionDialog
+      open={open}
+      onOpenChange={(next) => { if (!next) onClose() }}
+      title="按云端现状重建本批账本锚点"
+      description={`${rebuildCountsSummary(proposal.counts)}。方向是宁漏勿重：判成「已入账」的行下一批不会再加，判错只会漏加。`}
+      details={
+        <div className="space-y-2">
+          <p className="text-muted-foreground">{REBUILD_RISK_TEXT}</p>
+          {(proposal.warnings ?? []).map((warning) => (
+            <p key={warning} className="text-warning">⚠ {warning}</p>
+          ))}
+          {tables.map((table) => (
+            <div key={table.sheet} className="rounded-[6px] border bg-card px-2 py-1.5">
+              <p className="font-medium text-foreground">
+                {table.sheet}{table.skipped_reason ? '（本次不重建）' : ''}
+              </p>
+              {table.skipped_reason && (
+                <p className="text-muted-foreground">{table.skipped_reason}</p>
+              )}
+              <ul className="mt-1 max-h-40 space-y-0.5 overflow-y-auto text-[11px]">
+                {table.rows.map((row) => (
+                  <li key={`${table.sheet}:${row.name}:${row.phone}:${row.slot}`}>
+                    {rebuildRowText(row)}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+          <label className="block">
+            <span className="text-muted-foreground">
+              人工核对说明（至少 {REBUILD_MIN_NOTE} 个字符，写进本地账本审计）
+            </span>
+            <textarea
+              id="wps-rebuild-note"
+              className={fieldClass}
+              rows={2}
+              value={note}
+              onChange={(event) => onNote(event.target.value)}
+            />
+          </label>
+          <label className="block">
+            <span className="text-muted-foreground">
+              逐字输入 {REBUILD_CONFIRM_WORD} 才能写入本地账本
+            </span>
+            <input
+              id="wps-rebuild-confirm"
+              className={fieldClass}
+              value={confirm}
+              autoComplete="off"
+              onChange={(event) => onConfirmText(event.target.value)}
+            />
+          </label>
+          {error && <p className="text-warning">{error}</p>}
+        </div>
+      }
+      acknowledge="我已逐行核对上面的判定（判成「已入账」的行本批不会再加，判错只会漏加），并确认按云端现状重建"
+      confirmLabel="确认重建"
+      busy={busy}
+      danger
+      onConfirm={onSubmit}
+    />
+  )
+}
+
+/**
+ * 抢救确认弹窗：逐条列出「会留下谁、会丢掉谁」，要求核对说明 + 逐字输入确认词。
+ *
+ * 复用上传用的 `ConfirmActionDialog`（同一套"确认才动"的样式与勾选门禁）。
+ */
+function LedgerSalvageDialog({ open, proposal, confirm, note, error, busy, onConfirmText, onNote, onClose, onSubmit }: {
+  open: boolean
+  proposal: WpsLedgerSalvageResult | null
+  confirm: string
+  note: string
+  error: string
+  busy: boolean
+  onConfirmText: (value: string) => void
+  onNote: (value: string) => void
+  onClose: () => void
+  onSubmit: () => void
+}) {
+  if (!proposal) return null
+  const dropped = proposal.dropped ?? []
+  const droppedTotal = Number(proposal.counts?.dropped_total || 0)
+  const fieldClass = 'mt-1 w-full rounded-[6px] border border-transparent bg-secondary px-2.5 py-1.5 text-xs outline-none focus-visible:border-ring focus-visible:bg-card'
+  return (
+    <ConfirmActionDialog
+      open={open}
+      onOpenChange={(next) => { if (!next) onClose() }}
+      title="抢救本地账本：只丢坏掉的那几条"
+      description={`${salvageCountsSummary(proposal.counts)}。写之前会先给原件留档，云端一个格子都不动。`}
+      details={
+        <div className="space-y-2">
+          <p className="text-muted-foreground">{SALVAGE_RISK_TEXT}</p>
+          {(proposal.warnings ?? []).map((warning) => (
+            <p key={warning} className="text-warning">⚠ {warning}</p>
+          ))}
+          {dropped.length === 0 ? (
+            <p className="text-muted-foreground">清单里没有被丢弃的条目。</p>
+          ) : (
+            <ul className="max-h-40 space-y-0.5 overflow-y-auto rounded-[6px] border bg-card px-2 py-1.5 text-[11px]">
+              {dropped.map((item, index) => (
+                <li key={`${item.scope}:${item.day}:${item.file}:${item.name}:${index}`}>
+                  {salvageDroppedText(item)}
+                </li>
+              ))}
+            </ul>
+          )}
+          {droppedTotal > dropped.length && (
+            <p className="text-muted-foreground">
+              另外还有 {droppedTotal - dropped.length} 条没有展开，总数以统计为准。
+            </p>
+          )}
+          <label className="block">
+            <span className="text-muted-foreground">
+              人工核对说明（至少 {SALVAGE_MIN_NOTE} 个字符，写进本地账本审计）
+            </span>
+            <textarea
+              id="wps-salvage-note"
+              className={fieldClass}
+              rows={2}
+              value={note}
+              onChange={(event) => onNote(event.target.value)}
+            />
+          </label>
+          <label className="block">
+            <span className="text-muted-foreground">
+              逐字输入 {SALVAGE_CONFIRM_WORD} 才能写回本地账本
+            </span>
+            <input
+              id="wps-salvage-confirm"
+              className={fieldClass}
+              value={confirm}
+              autoComplete="off"
+              onChange={(event) => onConfirmText(event.target.value)}
+            />
+          </label>
+          {error && <p className="text-warning">{error}</p>}
+        </div>
+      }
+      acknowledge="我已逐条核对要丢掉的条目，并确认按这份清单抢救（丢掉的那些人就没有锚点了）"
+      confirmLabel="确认抢救"
+      busy={busy}
+      danger
+      onConfirm={onSubmit}
+    />
   )
 }

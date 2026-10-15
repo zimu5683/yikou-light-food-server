@@ -311,6 +311,19 @@ const mock = {
   wpsResolveResult: null,
   wpsResolvePayloads: [],
   wpsResolveTimes: [],
+  /** 第 14 项：账本锚点重建（提案 / 落盘共用同一端点）。 */
+  wpsRebuildCalls: 0,
+  wpsRebuildPayloads: [],
+  wpsRebuildDelay: 0,
+  wpsRebuildResult: null,
+  /** 第 14 项续：账本抢救。 */
+  wpsSalvageCalls: 0,
+  wpsSalvageActive: 0,
+  wpsSalvageMaxActive: 0,
+  wpsSalvagePayloads: [],
+  wpsSalvageDelay: 0,
+  wpsSalvageForbidden: false,
+  wpsSalvageResult: null,
   /** 无人监听的本地端口：用于模拟网络失败而又不让请求被传输层重发。 */
   deadPort: 0,
   wpsStatusDelay: 0,
@@ -604,6 +617,43 @@ function createMockServer() {
         }
         if (mock.wpsResolveDelay > 0) setTimeout(respondResolve, mock.wpsResolveDelay)
         else respondResolve()
+        return
+      }
+      case 'wps_ledger_rebuild': {
+        mock.wpsRebuildCalls += 1
+        mock.wpsRebuildPayloads.push(firstArg ?? null)
+        const respondRebuild = () => json(res, mock.wpsRebuildResult || {
+          ok: true, status: 'rebuild_ready', code: '', reason: '',
+          contract_version: 1, read_only: true, cloud_write: false, ledger_write: false,
+          next_action: "wps_ledger_rebuild(confirm='rebuild')", target_date: '2026-09-20',
+          counts: { mark_synced: 0, leave_empty: 0, cloud_person_absent: 0, cloud_cell_marked: 0,
+                    cloud_cell_empty: 0, rows: 0, people: 0, sheets: 1, skipped_sheets: 0 },
+          tables: [], warnings: [], fingerprint: '0'.repeat(64), text: '',
+        })
+        if (mock.wpsRebuildDelay > 0) setTimeout(respondRebuild, mock.wpsRebuildDelay)
+        else respondRebuild()
+        return
+      }
+      case 'wps_ledger_salvage': {
+        mock.wpsSalvageCalls += 1
+        mock.wpsSalvageActive += 1
+        mock.wpsSalvageMaxActive = Math.max(mock.wpsSalvageMaxActive, mock.wpsSalvageActive)
+        mock.wpsSalvagePayloads.push(firstArg ?? null)
+        const respondSalvage = () => {
+          mock.wpsSalvageActive = Math.max(0, mock.wpsSalvageActive - 1)
+          if (mock.wpsSalvageForbidden) {
+            return json(res, { ok: false, status: 'refused', code: 'refused', reason: '服务端拒绝了本次请求', changed: false }, 403)
+          }
+          return json(res, mock.wpsSalvageResult || {
+            ok: true, status: 'nothing_to_salvage', code: 'nothing_to_salvage', reason: '',
+            contract_version: 1, read_only: true, cloud_write: false, ledger_write: false,
+            changed: false, ledger_path: '/tmp/synthetic-ledger.json', backup: '',
+            counts: { kept_people: 0, kept_batches: 0, dropped_people: 0, dropped_batches: 0, dropped_total: 0 },
+            dropped: [], warnings: [], next_action: "wps_ledger_salvage(confirm='salvage')",
+          })
+        }
+        if (mock.wpsSalvageDelay > 0) setTimeout(respondSalvage, mock.wpsSalvageDelay)
+        else respondSalvage()
         return
       }
       case 'start_order':
@@ -3232,6 +3282,315 @@ async function main() {
     )
 
     // ---------- 6. 缩小可视视口：底部主按钮仍可达、无横向溢出 ----------
+    // ---------- 5g. 第 14 项：账本兜底（重建 + 抢救） ----------
+    enterScenario('5g 账本兜底（重建与抢救）')
+    const ledgerQuietCounts = {
+      planned: 0, writing: 0, ledger_pending: 0, uncertain: 0,
+      verified: 0, failed: 0, not_started: 0, retired_guarded: 0,
+    }
+    const ledgerQuietSummary = {
+      operation_count: 0, pending_count: 0, uncertain_count: 0, failed_count: 0,
+      not_started_count: 0, retired_guarded_count: 0, has_pending: false,
+      needs_review: false, guidance: '没有待恢复的操作',
+    }
+    const ledgerSalvageProposalCounts = {
+      kept_people: 12, kept_batches: 3, dropped_people: 2, dropped_batches: 1, dropped_total: 3,
+    }
+    const ledgerSalvageDropped = [{
+      scope: 'person', day: '2026-09-20', file: 'F1',
+      name: '王五', phone: '333', reason: '账本 slots 值非法',
+    }]
+    // 页面里可能同时挂着多个 dialog 根（其它页签、已关闭的弹窗），而脚本自带的
+    // setDialogInputJs / clickDialogCheckboxJs 只认**第一个**根 —— 这里改成「在所有
+    // 根里找目标、优先可见的那个」，与本脚本 clickDialogButtonJs 的判据一致。
+    const ledgerDialogRootsJs = `[...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')]`
+    const ledgerPickVisibleJs = (hits) => `((${hits}).find((item) => {
+      const r = item.root.getBoundingClientRect()
+      return r.width > 0 && r.height > 0
+    }) || (${hits})[0])`
+    const ledgerConfirmDisabledProbe = (label) => `(() => {
+      const hits = []
+      for (const root of ${ledgerDialogRootsJs}) {
+        const button = [...root.querySelectorAll('button')]
+          .find((el) => (el.textContent || '').replace(/\\s+/g, '').includes(${JSON.stringify(label)}))
+        if (button) hits.push({ button, root })
+      }
+      if (!hits.length) return null
+      return ${ledgerPickVisibleJs('hits')}.button.disabled
+    })()`
+    const ledgerClickDialogCheckboxJs = `(() => {
+      const hits = []
+      for (const root of ${ledgerDialogRootsJs}) {
+        const box = root.querySelector('input[type="checkbox"]')
+        if (box) hits.push({ box, root })
+      }
+      if (!hits.length) return false
+      const box = ${ledgerPickVisibleJs('hits')}.box
+      if (!box.checked) box.click()
+      return box.checked === true
+    })()`
+    const ledgerSetDialogInput = (selector, value) => `(() => {
+      const hits = []
+      for (const root of ${ledgerDialogRootsJs}) {
+        const el = root.querySelector(${JSON.stringify(selector)})
+        if (el) hits.push({ el, root })
+      }
+      if (!hits.length) return { ok: false, reason: 'not_found' }
+      const el = ${ledgerPickVisibleJs('hits')}.el
+      const proto = Object.getPrototypeOf(el)
+      const desc = Object.getOwnPropertyDescriptor(proto, 'value')
+        || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')
+      if (!desc || typeof desc.set !== 'function') return { ok: false, reason: 'no_setter' }
+      desc.set.call(el, ${JSON.stringify(value)})
+      el.dispatchEvent(new Event('input', { bubbles: true }))
+      el.dispatchEvent(new Event('change', { bubbles: true }))
+      return { ok: el.value === ${JSON.stringify(value)} }
+    })()`
+    const ledgerDialogDiag = () => `(() => JSON.stringify(${ledgerDialogRootsJs}.map((root) => {
+      const r = root.getBoundingClientRect()
+      return {
+        w: Math.round(r.width), h: Math.round(r.height),
+        buttons: [...root.querySelectorAll('button')].map((el) => (el.textContent || '').trim().slice(0, 12)),
+      }
+    })))()`
+    mock.wpsSalvageDelay = 0
+    mock.wpsSalvageForbidden = false
+    mock.wpsRebuildDelay = 0
+
+    // ① 账本正常：这张卡片不该出现（第一次用的人不该被吓一跳）
+    mock.wpsRecovery = {
+      ok: true, contract_version: 1, source: 'local_journal', read_only: true,
+      queried_cloud: false, contains_cloud_checked_records: false, scope: 'admin',
+      counts: ledgerQuietCounts, next_action: 'none', error_code: '',
+      summary: ledgerQuietSummary, operations: [], pending_operations: [],
+      ledger_state: 'ok', ledger_lost: false,
+    }
+    await reloadApp(cdp)
+    await ensureCloudPanel(cdp, '本地恢复记录：无待核对批次')
+    const ledgerQuietText = await cdp.eval('document.body.innerText')
+    record(
+      '账本正常时账本兜底卡片不出现',
+      !ledgerQuietText.includes('本地账本不可信') && !ledgerQuietText.includes('查看重建提案'),
+      `hasCard=${ledgerQuietText.includes('本地账本不可信')}`,
+    )
+
+    // ② 账本损坏：卡片出现，给「重建」与「抢救」两个只读入口，且没有捷径按钮
+    mock.wpsRecovery = { ...mock.wpsRecovery, ledger_state: 'corrupt' }
+    mock.wpsSalvageResult = {
+      ok: true, status: 'salvage_ready', code: 'salvage_ready', reason: '',
+      contract_version: 1, read_only: true, cloud_write: false, ledger_write: false,
+      changed: false, ledger_path: '/tmp/synthetic-ledger.json', backup: '',
+      counts: ledgerSalvageProposalCounts, dropped: ledgerSalvageDropped, warnings: [],
+      next_action: "wps_ledger_salvage(confirm='salvage')",
+    }
+    await reloadApp(cdp)
+    await ensureCloudPanel(cdp, '本地账本不可信：可以重建锚点')
+    const ledgerCorruptText = await cdp.eval('document.body.innerText')
+    const ledgerShortcutButtons = await cdp.eval(`(() => [...document.querySelectorAll('button')]
+      .map((el) => (el.textContent || '').trim())
+      .filter((label) => /删除账本|删除日志|直接重传|强制清除/.test(label)))()`)
+    record(
+      '账本损坏时给出重建与抢救两个入口，且没有捷径按钮',
+      ledgerCorruptText.includes('本地账本损坏') && ledgerCorruptText.includes('查看重建提案（只读）')
+        && ledgerCorruptText.includes('先试着抢救账本（只读清单）')
+        && ledgerCorruptText.includes('cloud_write=false')
+        && (ledgerShortcutButtons || []).length === 0,
+      `shortcuts=${JSON.stringify(ledgerShortcutButtons || [])}`,
+    )
+
+    // ③ 抢救：只读清单 → 勾选 + 逐字确认 → 写回
+    const ledgerSalvageCallsBefore = mock.wpsSalvageCalls
+    assert.ok(await cdp.eval(clickButtonJs('先试着抢救账本（只读清单）')), '找不到抢救按钮')
+    await cdp.waitFor(`document.body.innerText.includes('抢救本地账本：只丢坏掉的那几条')`)
+    const ledgerSalvageDialogText = await cdp.eval('document.body.innerText')
+    record('账本兜底：弹窗环境自检（诊断）', true, await cdp.eval(ledgerDialogDiag()))
+    record(
+      '抢救弹窗逐条列出会丢掉谁、为什么丢',
+      ledgerSalvageDialogText.includes('留下 12 人 · 丢掉 3 条')
+        && ledgerSalvageDialogText.includes('王五（333）')
+        && ledgerSalvageDialogText.includes('账本 slots 值非法')
+        && ledgerSalvageDialogText.includes('还有 2 条没有展开')
+        && mock.wpsSalvageCalls - ledgerSalvageCallsBefore === 1,
+      `calls=${mock.wpsSalvageCalls - ledgerSalvageCallsBefore}`,
+    )
+    record(
+      '只读清单阶段的请求体是空的（没带任何确认参数）',
+      mock.wpsSalvagePayloads[mock.wpsSalvagePayloads.length - 1] === null,
+      JSON.stringify(mock.wpsSalvagePayloads[mock.wpsSalvagePayloads.length - 1] ?? null),
+    )
+    record(
+      '没勾同意框时「确认抢救」点不动',
+      (await cdp.eval(ledgerConfirmDisabledProbe('确认抢救'))) === true,
+      `disabled=${await cdp.eval(ledgerConfirmDisabledProbe('确认抢救'))}`,
+    )
+    assert.ok(await cdp.eval(ledgerClickDialogCheckboxJs), '无法勾选同意框')
+    await new Promise((r) => setTimeout(r, 120))
+
+    // 逐字确认先在**客户端**拦一道：写错就不发请求
+    mock.wpsSalvageResult = {
+      ok: false, status: 'rejected', code: 'confirmation_required',
+      reason: '必须逐字确认：confirm 必须等于 salvage', changed: false,
+    }
+    const ledgerSalvageCallsBeforeWrong = mock.wpsSalvageCalls
+    assert.ok((await cdp.eval(ledgerSetDialogInput('#wps-salvage-note', '账本损坏，按清单抢救')))?.ok, '无法写入说明')
+    assert.ok((await cdp.eval(ledgerSetDialogInput('#wps-salvage-confirm', 'salvag')))?.ok, '无法写入确认串')
+    assert.ok((await cdp.eval(clickDialogButtonJs('确认抢救')))?.ok, '找不到确认抢救按钮')
+    await cdp.waitFor(`document.body.innerText.includes('必须逐字输入 salvage 才能抢救账本')`, 4000)
+    const ledgerClientGateText = await cdp.eval('document.body.innerText')
+    record(
+      '确认词写错时客户端先拦一道：一次请求都不发',
+      ledgerClientGateText.includes('必须逐字输入 salvage 才能抢救账本')
+        && mock.wpsSalvageCalls - ledgerSalvageCallsBeforeWrong === 0,
+      `calls=${mock.wpsSalvageCalls - ledgerSalvageCallsBeforeWrong}`,
+    )
+
+    // 服务端拒绝（确认词写对，服务端仍拒）：弹窗留着、显示原因、不显示成功、不自动重试
+    const ledgerSalvageCallsBeforeReject = mock.wpsSalvageCalls
+    assert.ok((await cdp.eval(ledgerSetDialogInput('#wps-salvage-confirm', 'salvage')))?.ok, '无法写入确认串')
+    assert.ok((await cdp.eval(clickDialogButtonJs('确认抢救')))?.ok, '找不到确认抢救按钮')
+    await cdp.waitFor(`document.body.innerText.includes('必须逐字确认：confirm 必须等于 salvage')`, 6000)
+    await new Promise((r) => setTimeout(r, 300))
+    const ledgerRefusedText = await cdp.eval('document.body.innerText')
+    record(
+      '服务端拒绝时弹窗留着、显示原因、不显示成功',
+      ledgerRefusedText.includes('必须逐字确认：confirm 必须等于 salvage')
+        && ledgerRefusedText.includes('确认抢救')
+        && !ledgerRefusedText.includes('账本已抢救')
+        && mock.wpsSalvageCalls - ledgerSalvageCallsBeforeReject === 1,
+      `calls=${mock.wpsSalvageCalls - ledgerSalvageCallsBeforeReject}`,
+    )
+    record(
+      '提交的请求体是契约对象（confirm/note，没有别的字段）',
+      (() => {
+        const payload = mock.wpsSalvagePayloads[mock.wpsSalvagePayloads.length - 1]
+        return payload && payload.confirm === 'salvage'
+          && String(payload.note || '').length >= 4
+          && Object.keys(payload).sort().join(',') === 'confirm,note'
+      })(),
+      JSON.stringify(mock.wpsSalvagePayloads[mock.wpsSalvagePayloads.length - 1] || null),
+    )
+
+    // 正确提交 + 双击保护
+    mock.wpsSalvageResult = {
+      ok: true, status: 'salvaged', code: 'salvaged', reason: '',
+      contract_version: 1, read_only: false, cloud_write: false, ledger_write: true,
+      changed: true, verified_on_disk: true, ledger_state: 'ok', ledger_lost: false,
+      ledger_path: '/tmp/synthetic-ledger.json',
+      backup: '/tmp/synthetic-ledger.json.pre-salvage-abc123def456',
+      counts: ledgerSalvageProposalCounts, dropped: ledgerSalvageDropped, warnings: [],
+      next_action: 'repreview',
+      audit: {
+        actor: 'local-admin', at: '2026-09-20T10:00:00', note_recorded: true,
+        dropped_people: 2, dropped_batches: 1,
+        effects: { cloud_written: false, ledger_written: true },
+      },
+    }
+    mock.wpsSalvageMaxActive = 0
+    const ledgerSalvageCallsBeforeBurst = mock.wpsSalvageCalls
+    mock.wpsSalvageDelay = 500
+    const ledgerSalvageBurst = await cdp.eval(burstDialogButtonJs('确认抢救', 3))
+    assert.ok(ledgerSalvageBurst && ledgerSalvageBurst.ok, '找不到确认抢救按钮')
+    await cdp.waitFor(`document.body.innerText.includes('账本已抢救')`, 8000)
+    await new Promise((r) => setTimeout(r, 400))
+    record(
+      '抢救双击/连点只提交一次且无并发',
+      mock.wpsSalvageCalls - ledgerSalvageCallsBeforeBurst === 1 && mock.wpsSalvageMaxActive === 1,
+      `calls=${mock.wpsSalvageCalls - ledgerSalvageCallsBeforeBurst} maxActive=${mock.wpsSalvageMaxActive}`,
+    )
+    const ledgerSalvagedText = await cdp.eval('document.body.innerText')
+    record(
+      '抢救成功说清原件留档、没写云端、阻断仍然保留',
+      ledgerSalvagedText.includes('原件已留档') && ledgerSalvagedText.includes('云端一个格子都没动')
+        && ledgerSalvagedText.includes('阻断仍然保留') && !ledgerSalvagedText.includes('删除账本'),
+      '',
+    )
+    mock.wpsSalvageDelay = 0
+
+    // ④ 重建：只读提案 → 勾选 + 逐字 rebuild → 写回
+    mock.wpsRebuildResult = {
+      ok: true, status: 'rebuild_ready', code: '', reason: '',
+      contract_version: 1, read_only: true, cloud_write: false, ledger_write: false,
+      next_action: "wps_ledger_rebuild(confirm='rebuild')",
+      target_date: '2026-09-20', test_mode: true,
+      ledger_state: 'corrupt', ledger_lost: false,
+      ledger_path: '/tmp/synthetic-ledger.json', fingerprint: 'f'.repeat(64),
+      counts: {
+        mark_synced: 1, leave_empty: 1, cloud_person_absent: 1, cloud_cell_marked: 1,
+        cloud_cell_empty: 0, rows: 2, people: 1, sheets: 1, skipped_sheets: 0,
+      },
+      tables: [{
+        sheet: '东湖中餐', file_id: 'F1', target_date: '2026-09-20', skipped_reason: '',
+        counts: { mark_synced: 1, leave_empty: 1, rows: 2, people: 1 },
+        rows: [
+          { name: '合成客户', phone: '13800000000', slot: 1, local_meals: 2, cloud_present: true,
+            cell_marked: true, cell_value: '1', decision: 'mark_synced',
+            reason: 'cloud_cell_marked', anchor: 2, order_no: 'A-1', row: 3 },
+          { name: '新人', phone: '222', slot: 1, local_meals: 1, cloud_present: false,
+            cell_marked: false, cell_value: '', decision: 'leave_empty',
+            reason: 'cloud_person_absent', anchor: 0, order_no: '', row: 0 },
+        ],
+      }],
+      warnings: [], text: '',
+    }
+    await reloadApp(cdp)
+    await ensureCloudPanel(cdp, '查看重建提案（只读）')
+    const ledgerRebuildCallsBefore = mock.wpsRebuildCalls
+    assert.ok(await cdp.eval(clickButtonJs('查看重建提案（只读）')), '找不到重建按钮')
+    await cdp.waitFor(`document.body.innerText.includes('按云端现状重建本批账本锚点')`)
+    const ledgerRebuildDialogText = await cdp.eval('document.body.innerText')
+    record(
+      '重建弹窗逐行列出判断结果，并说明宁漏勿重',
+      ledgerRebuildDialogText.includes('记「已入账」')
+        && ledgerRebuildDialogText.includes('云端还没有这个人')
+        && ledgerRebuildDialogText.includes('宁漏勿重')
+        && mock.wpsRebuildCalls - ledgerRebuildCallsBefore === 1,
+      `calls=${mock.wpsRebuildCalls - ledgerRebuildCallsBefore}`,
+    )
+    record(
+      '没勾同意框时「确认重建」点不动',
+      (await cdp.eval(ledgerConfirmDisabledProbe('确认重建'))) === true,
+      `disabled=${await cdp.eval(ledgerConfirmDisabledProbe('确认重建'))}`,
+    )
+    assert.ok(await cdp.eval(ledgerClickDialogCheckboxJs), '无法勾选同意框')
+    await new Promise((r) => setTimeout(r, 120))
+    assert.ok((await cdp.eval(ledgerSetDialogInput('#wps-rebuild-note', '账本损坏，按云端现状重建')))?.ok, '无法写入说明')
+    assert.ok((await cdp.eval(ledgerSetDialogInput('#wps-rebuild-confirm', 'rebuild')))?.ok, '无法写入确认串')
+    mock.wpsRebuildResult = {
+      ok: true, status: 'rebuilt', code: 'rebuilt',
+      reason: '已按云端现状重建本批锚点，未写云端', changed: true,
+      verified_on_disk: true, cloud_write: false, ledger_write: true,
+      written_people: 1, written_slots: 1,
+      ledger_state: 'ok', ledger_lost: false,
+      backup: '/tmp/synthetic-ledger.json.pre-rebuild-abc123def456',
+      counts: { mark_synced: 1, leave_empty: 1, cloud_person_absent: 1, cloud_cell_marked: 1,
+                cloud_cell_empty: 0, rows: 2, people: 1, sheets: 1, skipped_sheets: 0 },
+      fingerprint: 'f'.repeat(64),
+      audit: {
+        actor: 'local-admin', at: '2026-09-20T10:00:00', note_recorded: true,
+        effects: { cloud_written: false, ledger_written: true, replaced_corrupt: false },
+      },
+    }
+    assert.ok((await cdp.eval(clickDialogButtonJs('确认重建')))?.ok, '找不到确认重建按钮')
+    await cdp.waitFor(`document.body.innerText.includes('账本锚点已重建')`, 8000)
+    const ledgerRebuiltText = await cdp.eval('document.body.innerText')
+    record(
+      '重建提交的请求体是契约对象（confirm/note/expected_fingerprint 三样）',
+      (() => {
+        const payload = mock.wpsRebuildPayloads[mock.wpsRebuildPayloads.length - 1]
+        return payload && payload.confirm === 'rebuild'
+          && String(payload.note || '').length >= 4
+          && typeof payload.expected_fingerprint === 'string'
+          && payload.expected_fingerprint.length === 64
+          && Object.keys(payload).sort().join(',') === 'confirm,expected_fingerprint,note'
+      })(),
+      JSON.stringify(mock.wpsRebuildPayloads[mock.wpsRebuildPayloads.length - 1] || null),
+    )
+    record(
+      '重建成功说清人数、槽位与没写云端',
+      ledgerRebuiltText.includes('已写入 1 人 / 1 个槽位') && ledgerRebuiltText.includes('云端一个格子都没动'),
+      '',
+    )
+
     enterScenario('6 缩小可视视口')
     await cdp.viewport(390, 430)
     await new Promise((r) => setTimeout(r, 300))

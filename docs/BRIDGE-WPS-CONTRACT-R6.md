@@ -133,6 +133,7 @@ Cookie: yikou_session=<token>        # 或 X-Yikou-Token / ?token=（本地直�
 | `missing_excel` / `missing_tables` / `effective_tables_error` | 未选排单表 / 测试副本未配置 / 目标表非法 | 相应配置后重试 |
 | `local_file_unreadable` / `local_file_changed` | 本地表读不到 / 读取期间被改 | 文件稳定后重新预览 |
 | `local_state_blocked` | 账本/意图日志损坏（`status="blocked"`） | 先修复本地日志/账本 |
+| `local_ledger_lost` | 账本丢过锚点：意图日志记着已同步、账本里查不到（`status="blocked"`，`proven_no_write=true`） | 走「账本锚点重建」（§12）后重新预览 |
 | `unauthenticated` | 未授权云文档 | 去授权后重新预览 |
 | `plan_failed` / `preview_format_failed` / `unexpected` | 计划/格式化失败（`status="failed"`） | 查看日志后重试 |
 | `operation_conflict` | W7：上传/任务/其他只读入口占用中 | 等待后重新预览 |
@@ -429,8 +430,153 @@ wps_preview / wps_check_copies / sss_day_orders / wps_recovery_resolve   ← 新
 | `wps_check_copies` | 云文档副本核对 |
 | `sss_day_orders` | 云端当天名单读取 |
 | `wps_recovery_resolve` | 旧任务恢复/退场 |
+| `wps_ledger_rebuild` | 账本锚点重建 |
 
 ---
+
+## 12. `wps_ledger_rebuild(payload)` —— 账本锚点重建（2026-10-15 新增）
+
+账本是唯一的幂等锚点（云端只存总餐次与日期格），锚点一丢增量从任何地方都推算不
+出来。这个入口是账本丢失/损坏之后**唯一**能继续上传的出路；设计与取舍见
+`design/WPS-账本丢失与损坏的兜底.md` 第 7.1 节。
+
+**两段式**（与预览/上传同一套纪律）：
+
+```jsonc
+// ① 只读提案：不写任何东西（不写云端、不写账本、不发令牌）
+{}                       // 或 body=[]、{"confirm": ""}
+
+// ② 确认写入：只写**本地账本**（先留档原件），仍然不写云端
+{"confirm": "rebuild",   // 逐字确认，必须完全等于 rebuild
+ "note": "账本丢失，按云端日期格核对后重建",   // ≥4 字符，写进账本审计
+ "expected_fingerprint": "<① 返回的 fingerprint>"}
+```
+
+① 成功（`ok=true`，`read_only=true`，`ledger_write=false`，`cloud_write=false`）：
+
+```jsonc
+{"status": "rebuild_ready", "target_date": "2026-09-20",
+ "ledger_state": "missing_with_history", "ledger_lost": false,
+ "ledger_path": "…/wps_sync_state.json", "fingerprint": "<64hex>",
+ "counts": {"mark_synced": 3, "leave_empty": 12, "cloud_person_absent": 4,
+            "cloud_cell_marked": 3, "cloud_cell_empty": 8, "rows": 15,
+            "people": 3, "sheets": 2, "skipped_sheets": 1},
+ "tables": [{"sheet": "东湖中餐", "file_id": "…", "target_date": "2026-09-20",
+             "skipped_reason": "",
+             "rows": [{"name": "…", "phone": "…", "slot": 1, "local_meals": 6,
+                       "cloud_present": true, "cell_marked": true,
+                       "cell_value": "1", "decision": "mark_synced",
+                       "reason": "cloud_cell_marked", "anchor": 6,
+                       "order_no": "W1", "row": 3}]}],
+ "warnings": ["…"], "next_action": "wps_ledger_rebuild(confirm='rebuild')"}
+```
+
+逐行判定（**方向永远宁漏勿重**：漏加能人工补，重复加要按云端日期格往回减）：
+
+| 本地这一行 | 云端 | `decision` | 后果 |
+| --- | --- | --- | --- |
+| 云端有这个人 | 目标日期格已有值（我们写的 `1`，或协作者写的 `0` 等） | `mark_synced` | 锚点 = 本地餐次，下一批 +0，不写云端 |
+| 云端有这个人 | 目标日期格是空的 | `leave_empty` | 留空，下一批正常加 |
+| 云端**没有**这个人 | 无所谓 | `leave_empty` | 必须留空，否则这一批的新客户永远建不出来 |
+
+② 失败响应（HTTP 200，`ok=false`，`changed=false`，不改任何文件）：
+
+| `code` | 触发 | `next_action` |
+| --- | --- | --- |
+| `confirmation_required` | `confirm != "rebuild"` | 逐字重新确认 |
+| `note_required` | `note` 少于 4 字符 | 补充 `note` |
+| `rebuild_changed` | 云端或本地表在提案之后变化（指纹不一致） | 重新生成提案 |
+| `wps_disabled` | `wps_enabled=false` | 开启后重试 |
+| `operation_conflict` | 其他互斥操作进行中 | 等待后重试 |
+
+② 成功（`cloud_write=false`；`verified_on_disk` 是**重新读盘**证明锚点已落盘）：
+
+```jsonc
+{"ok": true, "status": "rebuilt", "code": "rebuilt",
+ "changed": true, "ledger_write": true, "verified_on_disk": true,
+ "written_people": 3, "written_slots": 3,
+ "backup": "…/wps_sync_state.json.pre-rebuild-<12hex>",
+ "replaced_corrupt": false,
+ "audit": {"source": "cloud_scan", "fingerprint": "…",
+           "effects": {"cloud_written": false, "ledger_written": true}},
+ "next_action": "repreview"}
+```
+
+语义要点：
+
+- **永不写云端**（`cloud_write` 恒为 `false`），也**不解除**任何防重复闸门：账本锚点
+  与意图日志闸门是两条独立防线。重建完仍然要走「预览 → 上传」。
+- 账本损坏时也能跑：先留档原件（`<账本>.pre-rebuild-<摘要>`），再从空账本重建本批，
+  返回 `replaced_corrupt=true`；健康账本上其它日期/其它表的锚点原样保留。
+- 没有任何一行判成 `mark_synced` 时返回 `status="rebuild_noop"`、`changed=false`，
+  一个字节都不写。
+- 本地批次日期与目标日期不符（整表拒绝写入）的表**不重建**，在 `skipped_reason`
+  里说明 —— 那时本地行与目标日期不对应，没有可推断的前提。
+
+## 13. `wps_ledger_salvage(payload)` —— 账本抢救（2026-10-15 新增）
+
+账本读盘时有一道很严的校验：**一个人的一条数据坏掉，整本账本就读不出来**，预览与
+上传全部失败关闭。但账本结构是「日期 → 表 → 人 → 槽位」互相独立的映射，一处坏不
+该整本陪葬。这个入口把**坏的那几条丢掉**、好的锚点原样留下。
+
+判据与严格校验**完全同源**（同一个检查函数），所以抢救结果一定还能被读回来；
+写盘前还有一道自查，过不了宁可不写。
+
+**两段式**，与重建同一套纪律：
+
+```jsonc
+{}                          // ① 只读清单：不写任何东西
+{"confirm": "salvage",      // ② 逐字确认，必须完全等于 salvage
+ "note": "账本损坏，按清单抢救"}   // ≥4 字符，写进账本审计
+```
+
+① 成功（`ok=true`，`read_only=true`，`ledger_write=false`，`cloud_write=false`）：
+
+```jsonc
+{"status": "salvage_ready", "changed": false, "ledger_path": "…/wps_sync_state.json",
+ "counts": {"kept_people": 12, "kept_batches": 3,
+            "dropped_people": 2, "dropped_batches": 1, "dropped_total": 3},
+ "dropped": [{"scope": "person", "day": "2026-09-20", "file": "…",
+              "name": "张三", "phone": "138…", "reason": "账本 slots 值非法"}],
+ "warnings": [], "next_action": "wps_ledger_salvage(confirm='salvage')"}
+```
+
+`dropped[]` 里带**姓名与电话**（与「账本锚点重建」提案同一口径）：用户必须知道丢的
+是**谁**的锚点，才能去核对那些人这一批到底加没加过。`scope` 是 `person` / `batch` /
+`day`（整层坏掉时没有姓名，只有层级）。清单最多列 64 条，`dropped_total` 是真实总数。
+
+② 成功（`cloud_write=false`；`verified_on_disk` 是重新读盘证明账本能读回来了）：
+
+```jsonc
+{"ok": true, "status": "salvaged", "changed": true, "ledger_write": true,
+ "verified_on_disk": true, "backup": "…/wps_sync_state.json.pre-salvage-<12hex>",
+ "ledger_state": "ok", "ledger_lost": false,
+ "audit": {"source": null, "note_recorded": true,
+           "effects": {"cloud_written": false, "ledger_written": true}},
+ "next_action": "repreview"}
+```
+
+失败与拒绝（HTTP 200，`ok=false`，`changed=false`，不改任何文件）：
+
+| `code` / `status` | 触发 | `next_action` |
+| --- | --- | --- |
+| `confirmation_required` | `confirm != "salvage"` | 逐字重新确认 |
+| `note_required` | `note` 少于 4 字符 | 补充 `note` |
+| `missing` / `unreadable` | 账本文件不在 / 读不出来 | 检查数据目录；改走重建 |
+| `parse_failed` | 连 JSON 都解析不了 | **改走「账本锚点重建」**（原件已留档） |
+| `unsalvageable` | 根节点或 `batches` 结构非法 | 改走重建 |
+| `self_check_failed` | 抢救结果过不了自查（程序 bug） | 报维护者；不要上传 |
+| `nothing_to_salvage` | 账本本来是好的 | 一个字节都没写；重新预览 |
+| `operation_conflict` | 有上传/恢复正持有 `<账本>.oplock` | 等它结束后重来 |
+
+语义要点：
+
+- **只写本地账本**，不读云端、不写云端，也不碰意图日志；
+- **不看 `wps_enabled`**：这是纯本地修复，云同步关着也必须能用（否则用户被锁死）；
+- 与 `apply_plan` / 恢复入口共用 `<账本>.oplock`：上传正在写账本时抢着抢救，会把那
+  一批刚写下的锚点覆盖掉，所以宁可明确拒绝；
+- 写盘前先留档原件（`<账本>.pre-salvage-<内容摘要>`），并在账本根节点记一条审计；
+- 健康账本调用它返回 `nothing_to_salvage`，**不会**做一次无谓的重写。
 
 ## 10. 验证证据（本契约的可复现命令）
 

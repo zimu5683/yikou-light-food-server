@@ -11,7 +11,10 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import os
+import re
+import shutil
 import tempfile
 import threading
 import time
@@ -29,6 +32,13 @@ class LockTimeout(TimeoutError):
 
 class AtomicWriteError(OSError):
     """原子写盘失败（调用方必须失败关闭）。"""
+
+#: 写盘前保留几代 ``.bak``（``.bak`` = 上一版，``.bak.1`` = 再上一版）。
+BACKUP_GENERATIONS = 3
+#: 每日快照 ``<文件名>.<YYYY-MM-DD>.bak`` 保留天数。
+BACKUP_KEEP_DAYS = 7
+#: 损坏原件 / 重建前原件的留档份数。
+PRESERVE_KEEP = 5
 
 
 _LOCK_STATE = threading.Lock()
@@ -76,6 +86,133 @@ def _fsync_parent_dir(parent: Path) -> None:
         raise
     finally:
         os.close(fd)
+
+
+_DAILY_BACKUP_RE = re.compile(r"^(?P<base>.+)\.(?P<day>\d{4}-\d{2}-\d{2})\.bak$")
+
+
+def _backup_name(path: Path, index: int) -> Path:
+    suffix = "" if index <= 0 else f".{index}"
+    return path.with_name(f"{path.name}.bak{suffix}")
+
+
+def rotate_backups(path: str | os.PathLike[str], *,
+                   generations: int = BACKUP_GENERATIONS,
+                   keep_days: int = BACKUP_KEEP_DAYS,
+                   today: str = "") -> list[Path]:
+    """写盘前**尽力**留档：多代 ``.bak`` + 每日快照；任何失败都不抛。
+
+    仿 ``AppConfig.save`` 的 ``.bak`` 先例：备份是加固，绝不能反过来挡住账本写入，
+    所以这里所有 ``OSError`` 一律吞掉（写盘本身的失败仍然由调用方失败关闭）。
+    调用方**必须**已持有该文件的数据锁（:func:`lock_path_for`），否则并发写会让
+    ``.bak`` 指向半新半旧的内容。
+
+    留档两件事：
+
+    * 多代 ``.bak``：``.bak`` 是上一版，``.bak.1`` 再上一版，最多 ``generations`` 代；
+    * 每日快照 ``<文件名>.<YYYY-MM-DD>.bak``：当天**第一次**写盘前留一份，等于
+      "昨天结束时的状态"，跨批次的回退点；只保留最近 ``keep_days`` 天。
+
+    返回本次实际写出的备份路径（可能为空 = 尽力而为地没做成）。
+    """
+    target = Path(path)
+    written: list[Path] = []
+    try:
+        if not target.is_file():
+            return written
+    except OSError:
+        return written
+
+    gens = max(1, int(generations))
+    try:
+        for index in range(gens - 1, 0, -1):
+            older = _backup_name(target, index - 1)
+            newer = _backup_name(target, index)
+            if older.exists():
+                os.replace(older, newer)
+        shutil.copy2(target, _backup_name(target, 0))
+        written.append(_backup_name(target, 0))
+    except OSError:
+        pass
+
+    if keep_days > 0:
+        day = today or time.strftime("%Y-%m-%d")
+        snapshot = target.with_name(f"{target.name}.{day}.bak")
+        try:
+            if not snapshot.exists():
+                shutil.copy2(target, snapshot)
+                written.append(snapshot)
+        except OSError:
+            pass
+        try:
+            _prune_daily_backups(target, keep=max(1, int(keep_days)))
+        except OSError:
+            pass
+    return written
+
+
+def _prune_daily_backups(target: Path, *, keep: int) -> None:
+    """只保留最近 ``keep`` 天的每日快照（按文件名里的日期排序）。"""
+    days: list[tuple[str, Path]] = []
+    for candidate in target.parent.glob(f"{target.name}.*.bak"):
+        match = _DAILY_BACKUP_RE.match(candidate.name)
+        if match and match.group("base") == target.name:
+            days.append((match.group("day"), candidate))
+    days.sort()
+    for _day, candidate in days[:-keep]:
+        try:
+            candidate.unlink()
+        except OSError:
+            pass
+
+
+def preserve_file(path: str | os.PathLike[str], *, tag: str,
+                  keep: int = PRESERVE_KEEP) -> Path | None:
+    """把当前文件另存为 ``<文件名>.<tag>-<内容摘要>``，返回留档路径。
+
+    用于「文件已经坏了/马上要被重建覆盖，先别丢证据」：内容相同的重复留档按摘要
+    去重（读盘失败时退回时间戳命名），只保留最近 ``keep`` 份。任何失败都返回
+    ``None``，绝不抛 —— 留档失败不能把失败关闭变成崩溃。
+    """
+    target = Path(path)
+    try:
+        if not target.is_file():
+            return None
+        raw = target.read_bytes()
+    except OSError:
+        return None
+    name = str(tag or "preserved").strip() or "preserved"
+    try:
+        suffix = hashlib.sha256(raw).hexdigest()[:12]
+    except Exception:  # pragma: no cover - hashlib 不会失败，留个兜底
+        suffix = str(int(time.time()))
+    dest = target.with_name(f"{target.name}.{name}-{suffix}")
+    try:
+        if not dest.exists():
+            shutil.copy2(target, dest)
+    except OSError:
+        return None
+    try:
+        _prune_preserved(target, name, keep=max(1, int(keep)))
+    except OSError:
+        pass
+    return dest
+
+
+def _prune_preserved(target: Path, tag: str, *, keep: int) -> None:
+    """同名 tag 的留档只保留最近 ``keep`` 份（按 mtime，新的留下）。"""
+    items: list[tuple[float, Path]] = []
+    for candidate in target.parent.glob(f"{target.name}.{tag}-*"):
+        try:
+            items.append((candidate.stat().st_mtime, candidate))
+        except OSError:
+            continue
+    items.sort()
+    for _stamp, candidate in items[:-keep]:
+        try:
+            candidate.unlink()
+        except OSError:
+            pass
 
 
 def atomic_write_text(path: str | os.PathLike[str], text: str, *,
@@ -218,9 +355,14 @@ class FileLock:
 
 __all__ = [
     "AtomicWriteError",
+    "BACKUP_GENERATIONS",
+    "BACKUP_KEEP_DAYS",
     "FileLock",
     "LockTimeout",
+    "PRESERVE_KEEP",
     "atomic_write_text",
     "lock_path_for",
     "operation_lock_path_for",
+    "preserve_file",
+    "rotate_backups",
 ]

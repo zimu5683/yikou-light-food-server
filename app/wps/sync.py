@@ -104,9 +104,14 @@ from app.wps.errors import (
 )
 from app.wps.models import Change, CloudOrder, InsertBlock, SheetPlan
 from app.wps.journal import SyncJournal, journal_path_for, new_operation_id
-from app.wps.ledger import SyncLedger, default_state_path
-from app.wps.recovery import (classify_journal_sheet, recover_pending_operations,
-                              recovery_status, resolve_pending_operation,
+from app.wps.ledger import (SyncLedger, default_state_path, salvage_ledger,
+                         salvage_payload)
+from app.wps.rebuild import (REBUILD_CONFIRM_WORD, REBUILD_MIN_NOTE,
+                             build_rebuild, format_rebuild, verify_rebuild,
+                             write_rebuild)
+from app.wps.recovery import (classify_journal_sheet, ledger_loss_evidence,
+                              recover_pending_operations, recovery_status,
+                              resolve_pending_operation,
                               retire_guarded_operation, retire_pending_operation)
 from app.wps.reader import LOCAL_COL, LOCAL_SHEETS, read_local_orders
 from app.wps.planner import (
@@ -320,6 +325,8 @@ __all__ = [
     "MAX_SCAN_ROW",
     "MAX_SORT_COL",
     "RATE_LIMIT_CODES",
+    "REBUILD_CONFIRM_WORD",
+    "REBUILD_MIN_NOTE",
     "SORT_FLAG_BLANK",
     "SORT_FLAG_EXISTING",
     "SORT_FLAG_NEW",
@@ -354,6 +361,7 @@ __all__ = [
     "build_address_ranks",
     "build_format_ops",
     "build_plan",
+    "build_rebuild",
     "atomic_write_text",
     "canonical_address",
     "cell_value_text",
@@ -372,9 +380,11 @@ __all__ = [
     "find_marker_column",
     "find_target_column",
     "format_plan",
+    "format_rebuild",
     "format_sort_key",
     "formula_cells_for_new_rows",
     "learn_row_format",
+    "ledger_loss_evidence",
     "journal_path_for",
     "lock_path_for",
     "natural_key",
@@ -388,6 +398,8 @@ __all__ = [
     "read_person_rows",
     "recover_pending_operations",
     "recovery_status",
+    "salvage_ledger",
+    "salvage_payload",
     "resolve_pending_operation",
     "retire_guarded_operation",
     "retire_pending_operation",
@@ -398,4 +410,6 @@ __all__ = [
     "target_date_for",
     "termux_cli_runtime",
     "weekday_number",
+    "verify_rebuild",
+    "write_rebuild",
 ]

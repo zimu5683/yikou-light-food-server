@@ -70,6 +70,7 @@ const MODE_LABELS: Record<string, string> = {
   wps_check_copies: '云文档副本核对',
   sss_day_orders: '云端当天名单读取',
   wps_recovery_resolve: '旧任务恢复/退场',
+  wps_ledger_rebuild: '账本锚点重建',
 }
 
 export const STATUS_FALLBACK: Record<StatusState, FallbackView> = {

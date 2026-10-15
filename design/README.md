@@ -13,6 +13,7 @@
 - [APK-PLAN.md](APK-PLAN.md) / [APK-STATUS.md](APK-STATUS.md) — Android APK 方案与状态
 - [DESIGN-WEB.md](DESIGN-WEB.md) — 网页版界面设计说明
 - [公网访问现状与域名阻断.md](公网访问现状与域名阻断.md) — Cloudflare Tunnel / 域名阻断证据与切换步骤
+- [WPS-账本丢失与损坏的兜底.md](WPS-账本丢失与损坏的兜底.md) — 账本丢失/损坏的兜底：问题描述 + 已实现的备份/留档/重建/抢救落点（第 7.1 节）
 
 ## 历史归档
 

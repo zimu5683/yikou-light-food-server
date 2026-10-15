@@ -525,6 +525,13 @@ export interface WpsRecoveryStatus {
   pending_operations?: WpsRecoveryOperation[]
   /** R6 新增：管理员带审计退场、但同目标防重复闸门仍保留的批次数。 */
   retired_guarded_count?: number
+  /**
+   * 第 14 项：账本可用性。非 `ok` 表示"本批锚点不可信"，界面必须提示人工核对。
+   * `missing` 正是"卸载重装 / 清过应用数据"的样子，与全新安装无法区分。
+   */
+  ledger_state?: LedgerState
+  /** 可证明的丢失：意图日志记着已同步、账本里查不到（这时上传会整批重加）。 */
+  ledger_lost?: boolean
 }
 
 export type WpsRecoveryDecision =
@@ -591,6 +598,162 @@ export interface WpsRecoveryResolveResult {
   scope?: WpsRecoveryResolveScope
   audit?: WpsRecoveryResolveAudit
   recovery?: WpsRecoveryStatus | null
+}
+
+/** 账本可用性（`wps_status` / `wps_preview` / `wps_recovery_status` 共用）。 */
+export type LedgerState =
+  | 'ok'
+  | 'missing'
+  | 'missing_with_history'
+  | 'corrupt'
+  | 'unreadable'
+  | ''
+
+/** 账本锚点重建里**一行**（本地一个槽位）的判定。 */
+export interface WpsLedgerRebuildRow {
+  name: string
+  phone: string
+  slot: number
+  local_meals: number
+  /** 云端是否已经有这个人（false = 标成"已同步"会让新客户永远建不出来）。 */
+  cloud_present: boolean
+  /** 云端这一天的格子是否已经有值（我们写的 1，或协作者写的 0 等）。 */
+  cell_marked: boolean
+  cell_value: string
+  decision: 'mark_synced' | 'leave_empty'
+  /** 判定理由机器码：cloud_person_absent / cloud_cell_marked / cloud_cell_empty。 */
+  reason: string
+  /** `mark_synced` 时写进账本的锚点（= 本地餐次），否则 0。 */
+  anchor: number
+  order_no: string
+  row: number
+}
+
+/** 账本锚点重建里**一张表**的判定。 */
+export interface WpsLedgerRebuildSheet {
+  sheet: string
+  file_id: string
+  target_date: string
+  /** 非空 = 这张表本次不重建（例如本地批次日期与目标日期不符）。 */
+  skipped_reason: string
+  counts: Record<string, number>
+  rows: WpsLedgerRebuildRow[]
+}
+
+export interface WpsLedgerRebuildCounts {
+  mark_synced: number
+  leave_empty: number
+  cloud_person_absent: number
+  cloud_cell_marked: number
+  cloud_cell_empty: number
+  rows: number
+  people: number
+  sheets: number
+  skipped_sheets: number
+}
+
+/** `wps_ledger_rebuild` 请求体（数组里放**对象**，不要放 JSON 字符串）。 */
+export interface WpsLedgerRebuildPayload {
+  /** 逐字确认：必须与 `rebuild` 完全相同。**不带该字段 = 只读提案**。 */
+  confirm?: string
+  /** 人工核对说明，≥4 字符，写进账本审计。 */
+  note?: string
+  /** 只读提案返回的 `fingerprint`；不一致说明云端或本地表变了，服务端拒绝写入。 */
+  expected_fingerprint?: string
+}
+
+/**
+ * `wps_ledger_rebuild` 返回。**永不写云端**（`cloud_write` 恒为 false）。
+ *
+ * 只读提案：`status="rebuild_ready"`、`read_only=true`、`ledger_write=false`；
+ * 落盘：`status="rebuilt"`、`verified_on_disk=true`（回读证明锚点真的写进去了）。
+ */
+export interface WpsLedgerRebuildResult {
+  ok: boolean
+  status: string
+  code?: string
+  reason?: string
+  next_action: string
+  contract_version?: number
+  read_only?: boolean
+  cloud_write?: boolean
+  ledger_write?: boolean
+  changed?: boolean
+  verified_on_disk?: boolean
+  target_date?: string
+  test_mode?: boolean
+  ledger_state?: LedgerState
+  ledger_lost?: boolean
+  ledger_path?: string
+  fingerprint?: string
+  counts?: WpsLedgerRebuildCounts
+  tables?: WpsLedgerRebuildSheet[]
+  warnings?: string[]
+  text?: string
+  /** 写盘时原账本已经损坏、本次从空账本重建（原件已留档）。 */
+  replaced_corrupt?: boolean
+  /** 重建前原件的留档路径（空 = 当时没有账本文件或留档失败）。 */
+  backup?: string
+  /** 本次实际写进账本的人数 / 槽位数（没有写入时恒为 0）。 */
+  written_people?: number
+  written_slots?: number
+  audit?: Record<string, unknown>
+}
+
+/** `wps_ledger_salvage` 请求体。**不带 `confirm` = 只读清单**。 */
+export interface WpsLedgerSalvagePayload {
+  /** 逐字确认：必须与 `salvage` 完全相同。 */
+  confirm?: string
+  /** 人工核对说明，≥4 字符，写进账本审计。 */
+  note?: string
+}
+
+/** 抢救清单里的一条：丢掉的是谁、在哪一批、为什么丢。 */
+export interface WpsLedgerSalvageDroppedItem {
+  scope: string
+  day: string
+  file: string
+  name: string
+  phone: string
+  reason: string
+}
+
+export interface WpsLedgerSalvageCounts {
+  kept_people: number
+  kept_batches: number
+  dropped_people: number
+  dropped_batches: number
+  dropped_total: number
+}
+
+/**
+ * `wps_ledger_salvage` 返回。**永不写云端**（`cloud_write` 恒为 false）。
+ *
+ * 只读清单：`status="salvage_ready"`、`read_only=true`、`ledger_write=false`；
+ * 落盘：`status="salvaged"`、`verified_on_disk=true`（回读证明账本能读回来了）。
+ * 救不了的情况各有稳定 status：`missing` / `unreadable` / `parse_failed` /
+ * `unsalvageable`，都指向「账本锚点重建」。
+ */
+export interface WpsLedgerSalvageResult {
+  ok: boolean
+  status: string
+  code?: string
+  reason?: string
+  next_action?: string
+  contract_version?: number
+  read_only?: boolean
+  cloud_write?: boolean
+  ledger_write?: boolean
+  changed?: boolean
+  verified_on_disk?: boolean
+  ledger_state?: LedgerState
+  ledger_lost?: boolean
+  ledger_path?: string
+  backup?: string
+  counts?: WpsLedgerSalvageCounts
+  dropped?: WpsLedgerSalvageDroppedItem[]
+  warnings?: string[]
+  audit?: Record<string, unknown>
 }
 
 /** 云端当天名单（bridge.sss_day_orders 返回）。 */
@@ -904,6 +1067,16 @@ interface BackendApi {
    * 不提供“删除账本/直接重传”。
    */
   wps_recovery_resolve(payload: WpsRecoveryResolvePayload): Promise<WpsRecoveryResolveResult>
+  /**
+   * 第 14 项：账本锚点重建。不带 `confirm` 时只返回只读提案；带 `confirm='rebuild'`
+   * 才写**本地账本**（先留档原件）。永不写云端，也不解除任何防重复闸门。
+   */
+  wps_ledger_rebuild(payload?: WpsLedgerRebuildPayload): Promise<WpsLedgerRebuildResult>
+  /**
+   * 第 14 项续：账本抢救。不带 `confirm` 时只返回只读清单；带 `confirm='salvage'`
+   * 才把**坏的那几条丢掉**、好的锚点原样写回本地账本。永不写云端。
+   */
+  wps_ledger_salvage(payload?: WpsLedgerSalvagePayload): Promise<WpsLedgerSalvageResult>
   wps_preview(): Promise<WpsPreviewResult>
   wps_upload(previewId: string): Promise<WpsUploadResult>
   pending_interactions(operationId?: string): Promise<PendingInteractionsResult>
@@ -1001,6 +1174,10 @@ const REQUEST_TIMEOUT_MS: Record<string, number> = {
   sss_diagnostics_read: 30_000,
   // `cloud_verified/cloud_untouched` 需要重新只读云端，给足窗口。
   wps_recovery_resolve: 120_000,
+  // 账本重建：只读提案与确认落盘都要按表读云端（每表最多 3 次往返）。
+  wps_ledger_rebuild: 120_000,
+  // 账本抢救是纯本地读盘写盘，很快；给足 30s 只为覆盖慢磁盘。
+  wps_ledger_salvage: 30_000,
   install_update: 60_000,
   check_updates: 60_000,
   // 配置/启动/状态是短请求。

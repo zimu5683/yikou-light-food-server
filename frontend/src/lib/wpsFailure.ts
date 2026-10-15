@@ -72,7 +72,7 @@ const JOURNAL_COPY: Record<Exclude<JournalIssue, ''>, { title: string; detail: s
   corrupt: {
     title: '本地账本/意图日志损坏或不可读',
     detail: '本地恢复日志无法解析，服务端为保证不重复写入已拒绝本次操作；本次没有写云端。',
-    nextStep: '请联系管理员走「旧任务恢复/退场」入口修复本地日志；修复前不要重新上传或补发。',
+    nextStep: '按实际问题走对应入口：账本问题走「账本锚点重建」（只改本地账本、不写云端），旧任务问题走「旧任务恢复/退场」；处理前不要重新上传或补发。',
   },
   version_unsupported: {
     title: '本地日志版本不受支持',
@@ -185,6 +185,18 @@ export function uploadFailureView(result: WpsUploadResult | null | undefined): F
         nextStep: next || '按「未知」处理：只读核对云端与日志后再决定，不要直接重复上传。',
         needsManualReconcile: true,
       })
+    case 'local_ledger_lost':
+      // 第 14 项：账本丢过锚点（可证明）。上传会把整批餐再加一遍 —— 必须失败关闭。
+      return withGuards({
+        ...base(code, 'danger', '本地账本丢过锚点（未写云端）',
+          '意图日志里记着这一批已经入账，账本里却查不到对应的锚点；照现在这样上传会把整批餐再加一遍。',
+          next),
+        nextStep: next || '先走「账本锚点重建」核对本批是否已入账，再重新预览。',
+        provenNoWrite: true,
+        retryAllowed: false,
+        blockingRetained: true,
+        needsManualReconcile: true,
+      })
     case 'cloud_verify_failed':
     case 'cloud_not_untouched':
       return withGuards({
@@ -295,6 +307,18 @@ export function previewFailureView(result: { code?: string; status?: string; rea
         next),
       nextStep: next || `${CONCURRENT_TASK_TEXT}；可刷新只读状态查看当前是谁在跑。`,
       provenNoWrite: true,
+    }
+  }
+  if (code === 'local_ledger_lost') {
+    return {
+      ...base(code, 'danger', '本地账本丢过锚点',
+        '意图日志里记着这一批已经入账，账本里却查不到对应的锚点；按现在这样上传会把整批餐再加一遍，已在读取云端之前拒绝。',
+        next),
+      nextStep: next || '先走「账本锚点重建」核对本批是否已入账，再重新预览。',
+      provenNoWrite: true,
+      retryAllowed: false,
+      blockingRetained: true,
+      needsManualReconcile: true,
     }
   }
   if (code === 'unauthenticated') {

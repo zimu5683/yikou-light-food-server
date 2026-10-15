@@ -15,6 +15,7 @@ import datetime as _dt
 import hashlib
 import re
 from collections import Counter
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from app.wps.cli import KdocsCli
@@ -1049,6 +1050,132 @@ def _safe_from_full(full: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+#: 账本同目录里能说明"这台机器以前同步过"的痕迹文件（顺序即展示顺序）。
+_LEDGER_TRACE_NAMES = ("journal", "archive", "lock")
+
+
+def _ledger_sibling_paths(ledger_path: Any) -> dict[str, Path]:
+    """账本同目录的三份痕迹：意图日志、日志归档、数据锁。"""
+    journal = journal_path_for(ledger_path)
+    return {
+        "journal": Path(journal),
+        "archive": Path(str(journal) + ".archive"),
+        "lock": Path(lock_path_for(ledger_path)),
+    }
+
+
+def _ledger_traces(ledger_path: Any) -> list[str]:
+    """账本不存在时，同目录还留着哪些痕迹（只读）。"""
+    found: list[str] = []
+    for name in _LEDGER_TRACE_NAMES:
+        item = _ledger_sibling_paths(ledger_path)[name]
+        try:
+            if not item.is_file():
+                continue
+            # 锁文件由 O_CREAT 建成空文件，存在即算痕迹；日志/归档空文件不算。
+            if name != "lock" and item.stat().st_size <= 0:
+                continue
+        except OSError:
+            continue
+        found.append(name)
+    return found
+
+
+def _record_anchors_missing(ledger: SyncLedger, record: Mapping[str, Any]) -> bool:
+    """这条 journal 记录的幂等锚点是否**已经不在**账本里。
+
+    锚点只增不减（云端只加不减），所以判据是「覆盖」而不是「相等」：
+    账本里整条记录没了、槽位比记录里少、或某个槽位的值比记录里小，都算锚点丢了。
+    账本里的值**更大**是正常的（后来又加过餐），不算丢失。
+    """
+    entries = record.get("ledger_entries")
+    if not isinstance(entries, Mapping) or not entries:
+        return False
+    target_date = str(record.get("target_date") or "")
+    file_id = str(record.get("file_id") or "")
+    if not target_date or not file_id:
+        return False
+    for storage_key, payload in entries.items():
+        if not isinstance(payload, Mapping):
+            continue
+        wanted = payload.get("slots")
+        if not isinstance(wanted, (list, tuple)) or not wanted:
+            continue
+        name, separator, phone = str(storage_key).partition("\u0000")
+        if not separator:
+            continue
+        have = ledger.synced_slots(target_date, file_id, name, phone)
+        if have is None or len(have) < len(wanted):
+            return True
+        try:
+            if any(int(old) < int(new) for old, new in zip(have, wanted)):
+                return True
+        except (TypeError, ValueError):
+            return True
+    return False
+
+
+def _missing_anchor_records(ledger: SyncLedger, journal: Any) -> int:
+    """journal 里 ``verified`` 记录中锚点已不在账本里的条数（可证明的丢失）。"""
+    try:
+        operations = journal.operations()
+    except Exception:  # noqa: BLE001 - 读不出日志就证明不了，不能据此阻断
+        return 0
+    if not isinstance(operations, Mapping):
+        return 0
+    missing = 0
+    for operation in operations.values():
+        if not isinstance(operation, Mapping):
+            continue
+        for record in (operation.get("sheets") or {}).values():
+            if not isinstance(record, Mapping):
+                continue
+            # 只有 verified 才能证明"锚点曾经落过盘"：writing/uncertain/
+            # ledger_pending 的锚点本来就不该在账本里。
+            if str(record.get("status") or "") != "verified":
+                continue
+            if _record_anchors_missing(ledger, record):
+                missing += 1
+    return missing
+
+
+def ledger_loss_evidence(ledger: SyncLedger | None = None, *,
+                         path: Any = None, journal: Any = None) -> dict[str, Any]:
+    """只读判断「账本是不是丢过锚点」；不写云端、不写账本、不写日志。
+
+    两档证据，语义**刻意不同**：
+
+    * ``lost=True``：journal 里有 ``verified`` 记录，而它记的锚点**已经不在**账本里。
+      锚点只增不减，所以这是**可证明**的丢失 —— 此时上传就是把整批餐再加一遍，
+      调用方必须失败关闭（见 ``Bridge`` 的 ``local_ledger_lost``）。
+    * ``traces``：账本文件不在，但同目录还留着 journal / archive / lock。只能说明
+      "这台机器以前同步过"，**不能**证明丢过（第一次上传失败也会留下 journal），
+      所以只用来提示，不用来阻断。
+
+    ``ledger=None``（账本读不出来）时只回痕迹，不回 ``lost``：那种情况由
+    ``LedgerCorruptError`` 自己失败关闭，不需要第二套判断。
+    """
+    ledger_path = getattr(ledger, "path", None) if ledger is not None else path
+    if ledger_path is None:
+        return {"lost": False, "records": 0, "traces": [], "reason": ""}
+    traces = _ledger_traces(ledger_path)
+    if ledger is None:
+        return {"lost": False, "records": 0, "traces": traces, "reason": ""}
+    if journal is None:
+        try:
+            journal = _journal_for_ledger(ledger)
+        except Exception:  # noqa: BLE001 - 日志读不出来只说明证明不了
+            return {"lost": False, "records": 0, "traces": traces,
+                    "reason": "journal_unreadable"}
+    missing = _missing_anchor_records(ledger, journal)
+    return {
+        "lost": missing > 0,
+        "records": missing,
+        "traces": traces,
+        "reason": "ledger_anchors_missing" if missing else "",
+    }
+
+
 def recovery_status(ledger: SyncLedger | None = None, *,
                     journal: SyncJournal | None = None) -> dict[str, Any]:
     """对外安全只读恢复查询；字段白名单构造，不复制 journal 原文。
@@ -1185,7 +1312,7 @@ def _recovery_status_full(ledger: SyncLedger | None = None, *,
 
 
 def resolve_pending_operation(
-        ledger: SyncLedger,
+        ledger: SyncLedger | None,
         operation_id: str,
         decision: str,
         *,
@@ -1223,7 +1350,7 @@ def resolve_pending_operation(
 
 
 def _resolve_pending_operation_impl(
-        ledger: SyncLedger,
+        ledger: SyncLedger | None,
         operation_id: str,
         decision: str,
         *,
@@ -1264,6 +1391,14 @@ def _resolve_pending_operation_impl(
                         "retire_guarded"):
         return {"ok": False, "status": "rejected", "reason": "decision_invalid",
                 "operations": results}
+    if ledger is None and decision in ("cloud_verified", "cloud_untouched"):
+        # 云端证明的结论必须并进账本（_merge_ledger）；账本读不出来时结论无处可落，
+        # 只能拒绝，并明确告诉用户"先把账本修好"。
+        # retire_guarded / keep 只写 journal，账本不可用时仍然可用 —— 这正是
+        # "账本损坏时恢复入口还能打开"的关键。
+        return {"ok": False, "status": "blocked",
+                "reason": "ledger_unavailable_requires_repair",
+                "next_action": "manual_reconcile", "operations": results}
     if decision == "retire_guarded" and not confirm_structure_checked:
         return {"ok": False, "status": "rejected",
                 "reason": "manual_confirmation_required",
@@ -1462,7 +1597,7 @@ def _resolve_pending_operation_impl(
 
 
 def retire_pending_operation(
-        ledger: SyncLedger,
+        ledger: SyncLedger | None,
         operation_id: str,
         *,
         journal: Any = None,
@@ -1491,6 +1626,7 @@ def _journal_for_ledger(ledger: SyncLedger) -> Any:
 
 __all__ = [
     "classify_journal_sheet",
+    "ledger_loss_evidence",
     "recover_pending_operations",
     "recovery_status",
     "resolve_pending_operation",
