@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -75,9 +76,12 @@ PACKAGES: tuple[TermuxPackage, ...] = (
         # 2026-09-27：.94 同样被轮转掉（run 36295518213 再次 404）→ 升到 .95。
         # 2026-10-08：.95 也被轮转掉（发布 v3.6.16 的构建 37661179771 再次 404）→ 升到 .96；
         # SHA256 与官方索引一致，并与「本机独立下载 deb 后计算的 sha256」逐字一致。
-        version="5.1.107.96",
-        filename="proot_5.1.107.96_aarch64.deb",
-        sha256="8199dca06dccb693ec09fb1759e3e1ad08b4863f0c11c612f89c20bd9ecdc1a0",
+        # 2026-10-19：.96 也被轮转掉（发布 v3.6.25 的构建 39191763375 再次 404）→ 升到 .97；
+        # 新 SHA256 同样与官方索引、以及本机独立下载 deb 后计算的值逐字一致；该 deb 内
+        # 成员名带 ``./`` 前缀，``_extract_member`` 本就两种写法都接受，成员映射无需改。
+        version="5.1.107.97",
+        filename="proot_5.1.107.97_aarch64.deb",
+        sha256="9a368d879876b1458b03d3936f7b75f94875eca9ece4c5870acf24993648fd94",
         pool_group="p/proot",
         members={
             "data/data/com.termux/files/usr/bin/proot": PROOT_OUT,
@@ -129,19 +133,32 @@ def sha256_of_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _download(url: str, *, timeout: int = 120) -> bytes:
+def _download(url: str, *, timeout: int = 120, attempts: int = 3) -> bytes:
+    """下载；传输层瞬断用有限重试顶住（404 除外：那是包被轮转，重试无用）。"""
     print(f"  下载 {url}")
     request = urllib.request.Request(url, headers={"User-Agent": "yikou-android-runtime/1.0"})
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
-            return response.read()
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            raise SystemExit(
-                f"{url} 返回 404：Termux 轮转包版本时会把旧 .deb 从 pool 移除。"
-                f"请在 {TERMUX_BASE}/dists/stable/main/binary-aarch64/Packages 里查"
-                "新的 Filename 与 SHA256，更新 PACKAGES 后重跑本脚本。") from exc
-        raise
+    last: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise SystemExit(
+                    f"{url} 返回 404：Termux 轮转包版本时会把旧 .deb 从 pool 移除。"
+                    f"请在 {TERMUX_BASE}/dists/stable/main/binary-aarch64/Packages 里查"
+                    "新的 Filename 与 SHA256，更新 PACKAGES 后重跑本脚本。") from exc
+            last = exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            # 实测 packages.termux.dev 会偶发 ``SSL: UNEXPECTED_EOF_WHILE_READING``
+            # （本机取三个包时命中过两次）。kdocs-cli 那条链路有仓库内副本兜底，
+            # Termux 包没有，一次抖动不该让整条 APK 构建失败。
+            last = exc
+        if attempt < attempts:
+            print(f"  下载失败（{type(last).__name__}: {last}），第 {attempt} 次后重试")
+            time.sleep(2 * attempt)
+    assert last is not None
+    raise last
 
 
 def _read_ar_members(data: bytes) -> dict[str, bytes]:

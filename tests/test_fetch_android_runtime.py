@@ -84,7 +84,7 @@ def test_ar_parser_rejects_non_ar_data():
 def test_package_urls_match_termux_repository_paths():
     module = _load()
     expected = {
-        "proot": ("p/proot", "proot_5.1.107.96_aarch64.deb"),
+        "proot": ("p/proot", "proot_5.1.107.97_aarch64.deb"),
         "libtalloc": ("libt/libtalloc", "libtalloc_2.5.0_aarch64.deb"),
         "libandroid-shmem": ("liba/libandroid-shmem", "libandroid-shmem_0.7_aarch64.deb"),
     }
@@ -145,3 +145,44 @@ def test_write_manifest_records_all_required_components_and_ca(tmp_path):
     for name, info in payload["files"].items():
         path = out_dir / name if (out_dir / name).is_file() else assets_dir / name
         assert info["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_download_retries_transient_errors_but_not_404(monkeypatch):
+    """传输层瞬断必须重试（实测 packages.termux.dev 偶发 SSL UNEXPECTED_EOF，
+    一次抖动不该让整条 APK 构建失败）；404 是包被轮转，立刻带更新指引退出。"""
+    module = _load()
+    attempts: list[int] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self) -> bytes:
+            return b"payload"
+
+    def flaky(_request, timeout=None):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise module.urllib.error.URLError(
+                OSError("SSL: UNEXPECTED_EOF_WHILE_READING"))
+        return FakeResponse()
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", flaky)
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    assert module._download("https://example.invalid/x.deb") == b"payload"
+    assert len(attempts) == 3, "前两次瞬断后应重试到第三次才成功"
+
+    def not_found(_request, timeout=None):
+        raise module.urllib.error.HTTPError(
+            "https://example.invalid/x.deb", 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", not_found)
+    try:
+        module._download("https://example.invalid/x.deb")
+    except SystemExit as exc:
+        assert "更新 PACKAGES" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("404 必须立刻退出并给出更新指引")

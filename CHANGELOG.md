@@ -32,6 +32,20 @@
 - 验证：后端全量 1619 passed；ruff / compileall 全绿；前端 `pnpm build`（tsc -b）/ lint /
   254 条用例 / 变异锚点 19/19 通过；浏览器交互检查 287 PASS / 0 FAIL、页面意外报错 0 条。
 
+### 发布补记：Termux 轮转 proot 包 + 下载重试（2026-10-19）
+
+- v3.6.25 首次出包（tag build 39191763375、main build 39191762017）都在「Fetch kdocs-cli
+  and Android runtime」这一步 404：Termux 轮转包版本时把 `proot 5.1.107.96` 从 pool 移除。
+  按官方 `dists/stable/main/binary-aarch64/Packages` 重新冻结为 **5.1.107.97**：新 sha256
+  与官方索引、以及「本机独立下载 deb 后计算的值」逐字一致；该 deb 内成员名带 `./` 前缀，
+  `_extract_member` 本就两种写法都接受，成员映射无需改。另两个包（libtalloc 2.5.0、
+  libandroid-shmem 0.7）与 curl.se 的 CA bundle（`a41b5d35…0505`，188900 字节）复核未变。
+- 顺带给 `_download` 补上有限重试（3 次，退避 2/4 秒）：实测 `packages.termux.dev` 会偶发
+  `SSL: UNEXPECTED_EOF_WHILE_READING`（本机取三个包时命中两次）；404 仍立刻带「更新
+  PACKAGES」的指引退出，不重试。
+- 验证：`tests/test_fetch_android_runtime.py` 全绿（含新增的「瞬断要重试、404 不重试」用例）；
+  ruff / compileall 全绿；后端全量 1620 passed。
+
 同步面：`docs/WPS-SYNC-RULES.md` §1.5、`design/WPS-CLOUD-SYNC-PLAN.md`（2026-10-19 节）。
 
 ## 3.6.24
