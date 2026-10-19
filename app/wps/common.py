@@ -105,10 +105,16 @@ WRITE_BATCH_CELLS = 80
 FONT_SIZE_TO_TWIP = 20
 
 
-FILL_LUXURY = 0xFFFFC000        # 豪华餐整行底色：金黄（与"总餐次"列同色）
+FILL_LUXURY = 0xFFFFC000        # 豪华餐底色：金黄，涂「名字」到「剩余餐」列（与"总餐次"列同色）
 
 
 FILL_GOLD = 0xFFFFC000          # 总餐次/已出餐/剩余餐 的既有底色
+
+
+#: 「删掉底色」用的颜色：alpha=0 的白。底色在接口里是 ARGB 整数，alpha=0 即
+#: 「没有底色」。平台若忽略 alpha，最坏结果是那一格被涂成白色（与整行其它格一致），
+#: 不会报错、不会变黑 —— 这条「删除备注右侧标记列底色」的路子因此是安全的。
+FILL_NONE = 0x00FFFFFF
 
 
 _ALIGN_H = {"haGeneral": 0, "haLeft": 1, "haCenter": 2, "haRight": 3,

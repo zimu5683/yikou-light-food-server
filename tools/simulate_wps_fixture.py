@@ -365,11 +365,12 @@ def main() -> int:
             problems.append(f"清单外地址后面又出现了清单内地址（第 {sequence[idx][0]} 行）")
 
     # 3) 新行底色：A~餐种 整段 = 模板行第 A 列的颜色（含日期与类型之间的空列），
-    #    总餐次/已出餐/剩余餐 三列 = 金黄；豪华行整行金黄。
-    #    （2026-09-15 用户要求：不再逐列照抄模板 —— 接口读不到空格的底色。）
+    #    总餐次/已出餐/剩余餐 三列 = 金黄；豪华行金黄止于「剩余餐」列（备注照抄模板）。
+    #    （2026-09-15 用户要求整段刷；2026-10-19 用户要求豪华餐不涂备注。）
     base_fill = template_fills.get(plan.columns["name"], "")
     band = {c for c in (plan.columns["total"], plan.columns["served"],
                         plan.columns["left"]) if c}
+    lux_end = plan.columns.get("left") or plan.columns.get("remark") or 0
     plain_range = range(1, (plan.columns["remark"] or 15) + 1)
     for change in new_changes:
         row = row_of(person_key(change.name, change.phone), change.slot)
@@ -379,17 +380,24 @@ def main() -> int:
         luxury = str(change.meal_kind).strip() == "豪华"
         for c in plain_range:
             got = cell_fill_hex(cloud.ws.cell(row, c))
-            if luxury:
+            if luxury and c <= lux_end:
                 if got != f"#{GOLD}":
                     problems.append(f"{change.name} 豪华行第 {c} 列底色应为金黄，"
                                     f"实际 {got or '无'}")
                 continue
-            want = f"#{GOLD}" if c in band else base_fill
+            want = f"#{GOLD}" if (c in band and not luxury) else base_fill
             if is_white(want) and is_white(got):
                 continue
             if (want or "") != (got or ""):
                 problems.append(f"{change.name} 第 {c} 列底色应为 {want or '无'}，"
                                 f"实际 {got or '无'}")
+        # 「备注」右侧第 1 列（协作者做标记用）：新行继承来的着色必须被清掉。
+        neighbour = (plan.columns.get("remark") or 0) + 1
+        if neighbour:
+            got = cell_fill_hex(cloud.ws.cell(row, neighbour))
+            if not is_white(got):
+                problems.append(f"{change.name}：备注右侧第 {neighbour} 列底色未清"
+                                f"（{got or '无'}），新行会继承上一行的着色")
 
     # 4) 新行公式：只统计真实日期列
     date_lo, date_hi = min(plan.date_cols), max(plan.date_cols)

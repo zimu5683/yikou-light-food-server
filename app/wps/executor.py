@@ -11,6 +11,7 @@ from app.wps.common import (
     CELL_MARK,
     FILL_GOLD,
     FILL_LUXURY,
+    FILL_NONE,
     FIRST_DATA_ROW,
     FONT_SIZE_TO_TWIP,
     HEADER_ROW,
@@ -821,7 +822,13 @@ def _apply_one_plan(cli: KdocsCli, plan: SheetPlan, worksheet_id: int, *,
                     plain_to=(plan.columns.get("kind") or plan.columns.get("type") or 0),
                     band_cols=tuple(c for c in (plan.columns.get("total"),
                                                 plan.columns.get("served"),
-                                                plan.columns.get("left")) if c))
+                                                plan.columns.get("left")) if c),
+                    # 豪华餐的金黄止于「剩余餐」列（2026-10-19 用户要求：备注不涂金）。
+                    lux_to=int(plan.columns.get("left") or 0),
+                    # 「备注」右侧第 1 列是协作者做标记用的：插入新行时那一列会从
+                    # 上一行继承着色，这里对本次新行显式清掉底色（2026-10-19 要求）。
+                    clear_cols=((int(plan.columns["remark"]) + 1,)
+                                if plan.columns.get("remark") else ()))
                 cli.write_format_ops(plan.file_id, worksheet_id, ops)
             except WpsCloudError as exc:
                 reason = f"新客户格式写入失败/未确认：{exc}"
@@ -1822,7 +1829,9 @@ def build_format_ops(spec: Mapping[str, Any], *, econ_rows: Sequence[int],
                      lux_rows: Sequence[int],
                      col_from: int, col_to: int,
                      plain_to: int = 0,
-                     band_cols: Sequence[int] = ()) -> list[dict[str, Any]]:
+                     band_cols: Sequence[int] = (),
+                     lux_to: int = 0,
+                     clear_cols: Sequence[int] = ()) -> list[dict[str, Any]]:
     """把"新客户行 × 模板格式"压成尽量少的格式操作。
 
     - 经济行：**第 A 列 ~ 「餐种」列整段刷成模板底色**（用户 2026-09-15 要求）。
@@ -1831,7 +1840,11 @@ def build_format_ops(spec: Mapping[str, Any], *, econ_rows: Sequence[int],
       看起来就是"有一格没涂到"。整段刷过去就不会再有漏网的列。
     - 金黄色的三列（总餐次/已出餐/剩余餐）按**列的身份**固定涂金，不依赖模板行
       那几格有没有内容（实测有客户行的总餐次是空的，模板选到它就学不到金色）。
-    - 豪华行：**整行金黄**（名字到备注整段，用户 2026-09-12 确认）；
+    - 豪华行：**名字列 ~ 「剩余餐」列整段金黄**（2026-10-19 用户要求：金黄到
+      「剩余餐」为止，**「备注」不涂金**，按模板底色照抄）。
+    - ``clear_cols`` 里的列（「备注」右侧第 1 列，协作者做标记用）：新行插入时会
+      从上一行继承那一列的着色，这里对**本次新插入的行**显式清掉底色
+      （2026-10-19 用户要求；历史行不动）。
     - 相邻同色列再合并成区间。
 
     这样 25 个新行只要 ~1 次接口调用（逐行设格式要 25 次，曾把当日额度打满）。
@@ -1871,6 +1884,8 @@ def build_format_ops(spec: Mapping[str, Any], *, econ_rows: Sequence[int],
     # 「餐种」列及其左边整段用模板底色；它右边只有金黄三列是特殊的。
     plain_end = plain_to if col_from <= plain_to <= col_to else col_from - 1
     band = {int(c) for c in band_cols if col_from <= int(c) <= col_to}
+    # 豪华行的金黄带右端：给了 lux_to 就止于它（「剩余餐」列），否则退回整段。
+    lux_end = lux_to if col_from <= lux_to <= col_to else col_to
 
     def color_of(column: int) -> int:
         if column <= plain_end:
@@ -1880,22 +1895,32 @@ def build_format_ops(spec: Mapping[str, Any], *, econ_rows: Sequence[int],
         learned = fills.get(column)
         return _argb_to_int(learned) if learned else base_color
 
+    def _paint(rows: Sequence[int], color_of_column: Callable[[int], int]) -> None:
+        """按"逐列颜色函数"把一组行涂成区间合并后的 format 操作。"""
+        for r0, r1 in _runs(rows):
+            col = col_from
+            while col <= col_to:
+                color = color_of_column(col)
+                col_end = col
+                while col_end + 1 <= col_to and color_of_column(col_end + 1) == color:
+                    col_end += 1
+                ops.append({"opType": "format",
+                            "rowFrom": r0 - 1, "rowTo": r1 - 1,
+                            "colFrom": col - 1, "colTo": col_end - 1,
+                            "xf": _xf(color)})
+                col = col_end + 1
+
     ops: list[dict[str, Any]] = []
-    for r0, r1 in _runs(econ_rows):
-        col = col_from
-        while col <= col_to:
-            color = color_of(col)
-            col_end = col
-            while col_end + 1 <= col_to and color_of(col_end + 1) == color:
-                col_end += 1
+    _paint(econ_rows, color_of)
+    _paint(lux_rows,
+           lambda column: FILL_LUXURY if column <= lux_end else color_of(column))
+
+    # 「备注」右侧的标记列：新行继承上一行的着色，这里显式清掉（只动本次新行）。
+    clear = sorted({int(c) for c in clear_cols if int(c) > 0})
+    for r0, r1 in _runs([*econ_rows, *lux_rows]):
+        for column in clear:
             ops.append({"opType": "format",
                         "rowFrom": r0 - 1, "rowTo": r1 - 1,
-                        "colFrom": col - 1, "colTo": col_end - 1,
-                        "xf": _xf(color)})
-            col = col_end + 1
-    for r0, r1 in _runs(lux_rows):
-        ops.append({"opType": "format",
-                    "rowFrom": r0 - 1, "rowTo": r1 - 1,
-                    "colFrom": col_from - 1, "colTo": col_to - 1,
-                    "xf": _xf(FILL_LUXURY)})
+                        "colFrom": column - 1, "colTo": column - 1,
+                        "xf": _xf(FILL_NONE)})
     return ops

@@ -819,7 +819,7 @@ def test_learn_row_format_returns_empty_when_no_reference():
 
 
 def test_new_rows_copy_template_fills():
-    """经济餐新行照抄模板底色（黄带位置一致）；豪华餐整行金黄。"""
+    """经济餐新行照抄模板底色（黄带位置一致）；豪华餐金黄止于「剩余餐」列。"""
     # 模板行整行有值（真实接口只返回非空格，底色缓存才覆盖每一列）
     full_row = {0: "老人", 1: "D1", 2: "111", 3: "0", 4: "1", 5: "0", 6: "中餐",
                 7: "经济", 8: "3", 9: "1", 10: "2", 11: ""}
@@ -833,15 +833,41 @@ def test_new_rows_copy_template_fills():
     ops = cli.format_ops[0]
     econ = [op for op in ops if op["rowFrom"] == 3]        # 1-based 第 4 行
     lux = [op for op in ops if op["rowFrom"] == 4]         # 1-based 第 5 行
-    assert lux and len(lux) == 1, "豪华餐一整个行区间一个操作"
-    assert (lux[0]["colFrom"], lux[0]["colTo"]) == (0, 10), "豪华餐整行（名字到备注列）金黄"
-    assert lux[0]["xf"]["fill"]["back"]["value"] == wc.FILL_LUXURY
+    # 豪华餐：金黄只到「剩余餐」列（BASE_HEADER 里 0-based 9），「备注」不涂金。
+    lux_gold = [op for op in lux
+                if op["xf"]["fill"]["back"]["value"] == wc.FILL_LUXURY]
+    assert len(lux_gold) == 1, "豪华餐的金黄区间只有一个"
+    assert (lux_gold[0]["colFrom"], lux_gold[0]["colTo"]) == (0, 9), \
+        "豪华餐金黄 = 名字~剩余餐，止于「剩余餐」"
+    lux_remark = next(op for op in lux if op["colFrom"] == 10)
+    assert lux_remark["xf"]["fill"]["back"]["value"] == wc._argb_to_int("#FFFFFFFF"), \
+        "豪华餐的「备注」列不涂金，按模板底色照抄"
     white = next(op for op in econ if op["colFrom"] == 0)
     assert white["colTo"] == 6, "第 1~7 列（名字~餐种）合并成一个白底区间"
     assert white["xf"]["fill"]["back"]["value"] == wc._argb_to_int("#FFFFFFFF")
     gold = next(op for op in econ
                 if op["xf"]["fill"]["back"]["value"] == wc.FILL_LUXURY)
     assert (gold["colFrom"], gold["colTo"]) == (7, 9), "总餐次~剩余餐 三列金黄"
+
+
+def test_marker_neighbour_column_fill_is_cleared_on_new_rows():
+    """「备注」右侧第 1 列是协作者做标记用的：插入新行时那一列会继承上一行的着色，
+    必须对本次新插入的行显式清掉底色（2026-10-19 用户要求；历史行不动）。"""
+    # 标记列（0-based 11 = 第 12 列）在模板行里带绿色底色 —— 新行会继承它。
+    cli = TemplateCli(make_grid(BASE_HEADER, [
+        {0: "老人", 2: "111", 7: "3"},
+    ]), row_colors={**TEMPLATE_COLORS, 12: "#FF92D050"})
+    plans = _plan(cli, [CloudOrder("东湖中餐", "新人", "小", "222", "中餐", "经济", 1)],
+                  sort=False)
+    plan = plans[0]
+    apply_plan(cli, plans, ledger=None, marker_enabled=False)
+    ops = cli.format_ops[0]
+    cleared = [op for op in ops if op["colFrom"] == 11 and op["colTo"] == 11]
+    assert len(cleared) == 1, "备注右侧第 1 列（第 12 列）必须有一个清色操作"
+    assert cleared[0]["xf"]["fill"]["back"]["value"] == wc.FILL_NONE
+    row = plan.changes[0].row                       # 1-based 新行行号
+    assert (cleared[0]["rowFrom"] + 1, cleared[0]["rowTo"] + 1) == (row, row), \
+        "只清本次新插入的那一行，老行不动"
 
 
 
