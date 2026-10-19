@@ -48,6 +48,23 @@
 
 同步面：`docs/WPS-SYNC-RULES.md` §1.5、`design/WPS-CLOUD-SYNC-PLAN.md`（2026-10-19 节）。
 
+### 发布与验证
+
+- 提交 `d89ef6a`（功能）、`bfd7b3f`（版本）、`a5e5cd8`（proot 轮转修复）；标签 `v3.6.25`
+  已前移到 `a5e5cd8`；
+- 首次出包（tag build 39191763375、main build 39191762017）因 Termux 轮转掉 proot
+  `5.1.107.96` 在取包步骤 404；修 pin 后重建全部成功：`Android APK`（tag v3.6.25，
+  run 39194407593）、`Android APK`（main，run 39194404657）、`Tests`（main，
+  run 39194404575：python 3.11 / 3.13、前端、卫生四个作业全绿；变异门禁按设计只在
+  PR 与手动触发时跑，本次为 skip）；
+- Release `v3.6.25` 非草稿、非预发布（2026-10-19T03:16:44Z 创建），产物
+  `yikou-light-food-3.6.25-arm64.apk`（19,860,773 字节）与对应 `.apk.sha256`（124 字节）
+  均已上传；
+- 应用内更新检查（GitHub `/releases/latest`）已能看到 v3.6.25 与上述两个附件，文件名符合
+  更新器的 APK / sha256 选取规则；
+- 提交前的本地验证：后端全量 1620 passed；ruff / compileall 全绿；前端 `pnpm build`
+  （tsc -b）/ lint / 254 条用例 / 变异锚点 19/19 通过；浏览器交互检查 287 PASS / 0 FAIL。
+
 ## 3.6.24
 
 账本兜底（第 14 项）。账本是云同步**唯一**的幂等锚点，而它此前没有备份、没有重建入口，
