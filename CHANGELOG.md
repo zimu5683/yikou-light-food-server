@@ -65,6 +65,17 @@
 - 提交前的本地验证：后端全量 1620 passed；ruff / compileall 全绿；前端 `pnpm build`
   （tsc -b）/ lint / 254 条用例 / 变异锚点 19/19 通过；浏览器交互检查 287 PASS / 0 FAIL。
 
+### 发布产物实下载复核
+
+- 从 Release 直接下载 `yikou-light-food-3.6.25-arm64.apk`：19,860,773 字节，与附件登记的
+  大小一致；
+- `sha256sum` 为 `f3054744a92ae9062446f298bc19f4281c37230f6aac0fe0b5921db6fe03422b`，
+  与附件 `.apk.sha256` 逐字一致 —— 应用内更新的校验路径拿到的就是这份值；
+- `file` 识别为 Android package（含 gradle app-metadata.properties）；包内 114 个条目，
+  抽查到 `classes.dex`、`lib/arm64-v8a/`（`libproot.so`、`libproot_loader.so`、
+  `libkdocs_cli.so`、`libtalloc.so`、`libandroid-shmem.so`）与 `assets/runtime/cacert.pem`，
+  不是截断或空壳包。
+
 ## 3.6.24
 
 账本兜底（第 14 项）。账本是云同步**唯一**的幂等锚点，而它此前没有备份、没有重建入口，
