@@ -3,6 +3,54 @@
 只记录**已发布**的版本；开发过程资料见 `design/archive/`（历史，含逐轮迭代日志），
 当前手册与规则见 `README.md` 与 `docs/`。
 
+## 3.6.26
+
+一次 WPS 云同步的「减法」版本：删除上传失败后的整套恢复/退场/账本重建抢救界面，失败只留一条
+警告；只读预览可以反复「重新预览」。安全机制全部保留在后端。
+
+### 云文档同步：失败只给警告（删除兜底 UI）
+
+- 前端删除：恢复卡片（待核对批次/恢复处置…）、旧任务恢复/退场 4 选 1 + 人工核对说明 +
+  逐字确认 + 表结构勾选弹窗、账本重建/抢救卡片与两个逐字确认弹窗；`frontend/src/lib/` 的
+  `recoveryResolve.ts`、`ledgerRepair.ts` 及单测一并删除；`CloudForm` 不再调用
+  `wps_recovery_status` / `wps_recovery_resolve` / `wps_ledger_rebuild` / `wps_ledger_salvage`，
+  `bridge.ts` 的对应方法与类型同步删除（后端接口保留，见下）。
+- 上传失败/结果不确定时只保留一条警告：说明可能已写入、先去 WPS 云端核对；再次上传前
+  服务端会先只读核对上次记录，证明不了「上次未写入」就不会写。结果卡动作统一为「重新预览」。
+- `operationStatus` 的 uncertain/blocked 文案按 mode 分流：`wps_upload` 不再套用闪时送的
+  「可再运行一次补单」「按日志处理后重跑」口径。
+- 修正「启用云文档同步」开关关→开后界面仍以为旧预览有效的窄窗口：开关变化即清空本地预览句柄。
+- 后端**保留**：防重复闸门、意图日志、账本备份/留档、上传前自动只读恢复，以及
+  `wps_recovery_*` / `wps_ledger_*` 接口（只作 API/人工兜底，界面不再出现），不做自动解除阻断。
+
+### 云文档同步：只读预览可重复生成
+
+- 预览成功后底栏新增「重新预览」副按钮（主按钮仍是「确认上传」）；点击只调只读 `wps_preview`，
+  不触发上传；每次预览由服务端签发新令牌，旧令牌按 TTL 自然过期，不放开任何写入。
+- `onPreview` 加单飞闸门；重新预览失败不再清掉手上仍有效的旧预览（成功后整份替换）。
+- 新增后端回归：连续两次 `wps_preview` 均成功、`preview_id` 不同、旧令牌不主动作废、
+  不写账本/云端、不遗留操作占位。
+
+### 界面门禁
+
+- `browser-interaction-check.mjs`：整段删除恢复/退场/账本兜底场景；场景 5 重写为「只读刷新安全」
+  （不上传、恢复类接口 0 次、页面不再出现已删 UI）；新增「预览可重复」6 条与「失败后只有警告」
+  6 条；FE-1 uncertain 断言改为 WPS 口径。`mutation-check.mjs` 只同步被删断言的引用。
+
+### 验证（本机）
+
+- 后端：按相关分组跑 `tests/test_doc_references.py`、`test_release_check.py`、
+  `test_frontend_contract.py`、`test_android_project.py`、`test_architecture_boundaries.py`、
+  全部 `test_bridge_wps_*` / `test_wps_*`：**466 passed**；`ruff check app tests scripts` 通过；
+  `python -m compileall -q app` 通过。
+- 前端：`pnpm build`（tsc -b + vite）、`pnpm lint`（0 警告）、`pnpm test`（**216 passed**）、
+  `pnpm check:anchors`（**19/19**）通过；两个门禁脚本 `node --check` 通过。
+- 本机没有 Chrome：浏览器交互检查与变异门禁未在本机执行，需在 CI/真机补跑；后端全量套件
+  因设备内存限制按相关分组执行（完整全量同样留给 CI）。
+
+同步面：`README.md`、`frontend/README.md`、`docs/WPS-SYNC-RULES.md` §2/§6、
+`docs/BRIDGE-WPS-CONTRACT-R6.md` §6/§7/§12/§13、`design/WPS-账本丢失与损坏的兜底.md`。
+
 ## 3.6.25
 
 云同步底色的两处调整（用户 2026-10-19 要求）：豪华餐的金黄止于「剩余餐」列，「备注」不再
