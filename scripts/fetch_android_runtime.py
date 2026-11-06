@@ -77,11 +77,12 @@ PACKAGES: tuple[TermuxPackage, ...] = (
         # 2026-10-08：.95 也被轮转掉（发布 v3.6.16 的构建 37661179771 再次 404）→ 升到 .96；
         # SHA256 与官方索引一致，并与「本机独立下载 deb 后计算的 sha256」逐字一致。
         # 2026-10-19：.96 也被轮转掉（发布 v3.6.25 的构建 39191763375 再次 404）→ 升到 .97；
-        # 新 SHA256 同样与官方索引、以及本机独立下载 deb 后计算的值逐字一致；该 deb 内
-        # 成员名带 ``./`` 前缀，``_extract_member`` 本就两种写法都接受，成员映射无需改。
-        version="5.1.107.97",
-        filename="proot_5.1.107.97_aarch64.deb",
-        sha256="9a368d879876b1458b03d3936f7b75f94875eca9ece4c5870acf24993648fd94",
+        # 2026-11-07：.97 又被轮转掉（发布 v3.6.26 的构建 42274394267 再次 404）→ 按官方
+        # dists/stable/main/binary-aarch64/Packages 升到 .102；SHA256 与官方索引、以及本机
+        # 独立下载 deb 后计算的值逐字一致；成员名仍带 ``./`` 前缀，映射无需改。
+        version="5.1.107.102",
+        filename="proot_5.1.107.102_aarch64.deb",
+        sha256="10a394b585c2fc2b2c8502544f4e5f1be581dc8bfff79e8ba62f16207423e030",
         pool_group="p/proot",
         members={
             "data/data/com.termux/files/usr/bin/proot": PROOT_OUT,
