@@ -257,3 +257,111 @@ def test_plan_warnings_are_logged_as_warnings(preview_env):
     warned = [e["payload"]["msg"] for e in events
               if e["payload"]["level"] == "WARN" and "云同步预览" in e["payload"]["msg"]]
     assert warned and "清单外地址" in warned[0]
+
+# ----------------------------------------------------------------------
+# 「重新预览」：连续调用 wps_preview 必须每次都签发新令牌
+#
+# 前端允许用户连续点「重新预览」；服务端的设计本来就是每次 create 一个
+# 新 preview_id，旧令牌不主动作废（靠 10 分钟 TTL / 显式失效兜底）。
+# 这组用例钉住：两次都成功、令牌互不相同、旧令牌仍然 valid，且整条只读
+# 路径不落账本、不写云端、不调用 apply/upload，也不遗留互斥占位。
+# ----------------------------------------------------------------------
+def _preview_twice(bridge: Bridge) -> tuple[dict, dict]:
+    first = bridge.wps_preview()
+    assert first["ok"] is True, first
+    second = bridge.wps_preview()
+    assert second["ok"] is True, second
+    return first, second
+
+
+def test_consecutive_previews_both_succeed_with_distinct_tokens(preview_env):
+    bridge, captured, _ = preview_env
+
+    first, second = _preview_twice(bridge)
+
+    assert first["status"] == "preview_ready"
+    assert second["status"] == "preview_ready"
+    first_id, second_id = first["preview_id"], second["preview_id"]
+    assert first_id, "每次预览都必须签发非空 preview_id"
+    assert second_id, "每次预览都必须签发非空 preview_id"
+    assert first_id != second_id, "连续预览必须各自发放新的 preview_id"
+    # 两次都真的重新走了一遍只读计划构建，而不是复用第一次的结果。
+    assert len(captured["build_plan"]) == 2
+    assert len(captured["read_calls"]) == 2
+    for got in (first, second):
+        assert got["next_action"] == "wps_upload(preview_id)"
+        assert got["expires_in"] > 0
+        assert len(got["plan_fingerprint"]) == 64
+
+
+def test_first_token_remains_valid_after_a_second_preview(preview_env):
+    """第二次预览不得 consume/invalidate 第一次的令牌（否则用户无从选择）。"""
+    bridge, _, _ = preview_env
+
+    first, second = _preview_twice(bridge)
+
+    # 沿用本仓库既有观察方式（tests/test_bridge_wps_gates.py 里的
+    # bridge._previews.get(old_id)[1]）：空错误码 = 未被消费/作废。
+    record, code = bridge._previews.get(first["preview_id"])
+    assert code == "", f"第二次预览不得作废旧令牌：{code}"
+    assert record is not None
+    assert record.preview_id == first["preview_id"]
+    assert record.state() == "valid"
+    assert record.consumed_at is None
+    assert record.invalidated_at is None
+    # 两份令牌同时存活，各自可被查到。
+    for preview_id in (first["preview_id"], second["preview_id"]):
+        assert bridge._previews.get(preview_id)[1] == ""
+
+
+def test_consecutive_previews_never_write_ledger_cloud_or_apply(preview_env):
+    bridge, captured, monkeypatch = preview_env
+    apply_calls: list = []
+    upload_calls: list = []
+    cli_calls: dict = {"authenticated": 0}
+
+    monkeypatch.setattr(bridge_module, "apply_plan",
+                        lambda *args, **kwargs: apply_calls.append(args) or {})
+    monkeypatch.setattr(bridge, "wps_upload",
+                        lambda *args, **kwargs: upload_calls.append(args) or {})
+
+    class _ReadOnlyCli:
+        """预览只许做授权探测；任何写云端的方法都算测试失败。"""
+
+        path = "/fake/kdocs-cli"
+
+        def authenticated(self) -> bool:
+            cli_calls["authenticated"] += 1
+            return True
+
+        def __getattr__(self, name):
+            raise AssertionError(f"预览不得调用云端写入方法：{name}")
+
+    monkeypatch.setattr(bridge, "_wps_cli", lambda: _ReadOnlyCli())
+
+    _preview_twice(bridge)
+
+    assert captured["ledger_saves"] == [], "预览是只读的，绝不能落账本"
+    assert apply_calls == [], "预览绝不能调用 apply_plan"
+    assert upload_calls == [], "预览绝不能调用 wps_upload"
+    # build_plan 是替身，云端侧只有两次授权探测，没有任何写方法被触发。
+    assert cli_calls == {"authenticated": 2}
+
+
+def test_consecutive_previews_leave_no_active_operation(preview_env):
+    bridge, _, _ = preview_env
+
+    _preview_twice(bridge)
+
+    status = bridge.operation_status()
+    assert status["active"] is False, status
+    assert status["mode"] == "wps_preview"
+    assert status["status"] == "success"
+    recent = status["operations"]
+    assert [op["mode"] for op in recent[:2]] == ["wps_preview", "wps_preview"]
+    assert [op["status"] for op in recent[:2]] == ["success", "success"]
+    assert all(op["active"] is False for op in recent[:2])
+    # 占位确实释放干净：其他互斥操作立刻能占上（没有遗留锁死）。
+    reservation = bridge._operations.try_reserve("order", summary={"title": "订单"})
+    assert reservation.granted
+    bridge._operations.finish(reservation.operation, status="success")

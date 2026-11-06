@@ -124,7 +124,6 @@ test('R6 §9：新增只读入口 mode 有中文名', () => {
   assert.equal(operationModeLabel('wps_preview'), '云文档预览')
   assert.equal(operationModeLabel('wps_check_copies'), '云文档副本核对')
   assert.equal(operationModeLabel('sss_day_orders'), '云端当天名单读取')
-  assert.equal(operationModeLabel('wps_recovery_resolve'), '旧任务恢复/退场')
   // 未登记的 mode 仍回退原文，不显示 undefined。
   assert.equal(operationModeLabel('brand_new_mode'), 'brand_new_mode')
 })

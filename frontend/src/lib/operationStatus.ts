@@ -69,8 +69,6 @@ const MODE_LABELS: Record<string, string> = {
   wps_preview: '云文档预览',
   wps_check_copies: '云文档副本核对',
   sss_day_orders: '云端当天名单读取',
-  wps_recovery_resolve: '旧任务恢复/退场',
-  wps_ledger_rebuild: '账本锚点重建',
 }
 
 export const STATUS_FALLBACK: Record<StatusState, FallbackView> = {
@@ -298,13 +296,24 @@ function viewOfOperation(operation: OperationInfo): OperationView {
       return resultView(modeLabel, 'insufficient_balance', '余额不足，本批未提交', '任务已安全停止，本批未提交；请先只读核对。', 'warning', true, nextAction, reason, common)
     case 'balance_unknown':
       return resultView(modeLabel, 'balance_unknown', '余额未知，本批未提交', '任务已安全停止，本批未提交；请先只读核对。', 'warning', true, nextAction, reason, common)
-    case 'uncertain':
-      return resultView(modeLabel, 'uncertain', `${modeLabel}结果不确定 · 待核对`, '未能确认全部结果；可再运行一次补单（先对账，列表延迟仍可能重复）。', 'warning', true, nextAction, reason, common)
+    case 'uncertain': {
+      // WPS 云文档：服务端 next_action 固定是「只读核对，不重新上传」，但用户真正需要
+      // 的是「先去 WPS 云端核对；再次上传前程序会先自动只读核对」——不能套用闪时送
+      // 「可再运行一次补单」的口径。
+      const wpsUpload = String(operation.mode || '') === 'wps_upload'
+      const detail = wpsUpload
+        ? '可能已写入但无法确认；请先在 WPS 云端核对。再次上传前服务端会先只读核对，证明不了上次未写入就不会写。'
+        : '未能确认全部结果；可再运行一次补单（先对账，列表延迟仍可能重复）。'
+      const view = resultView(modeLabel, 'uncertain', `${modeLabel}结果不确定 · 待核对`, detail, 'warning', true, nextAction, reason, common)
+      return wpsUpload ? { ...view, detail } : view
+    }
     case 'blocked':
     case 'blocked_uncertain': {
       // 阻断文案固定提示“按日志处理”，服务端 next_action 只作为补充说明；
       // 3.6.19 起闪时送不再有“人工核对后解除”的闸门，此处不再指向已删除的面板。
-      const panelHint = '请按运行日志里的提示处理后再运行；未确认前不要重发。'
+      const panelHint = String(operation.mode || '') === 'wps_upload'
+        ? '本地日志/账本需要人工修复后才能上传；修复前不要重发。'
+        : '请按运行日志里的提示处理后再运行；未确认前不要重发。'
       const extra = (nextAction || reason).trim()
       return {
         key: 'blocked_uncertain',

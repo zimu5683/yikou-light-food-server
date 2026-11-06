@@ -171,6 +171,15 @@ journal 有 `<journal>.archive` 可留档。
 **仍然不做**：自动抢救。抢救**永远**要人工确认（逐字输入 `salvage` + 核对说明），
 程序不会自己决定丢掉谁的锚点。连 JSON 都解析不了的文件也救不了 —— 那条路走重建。
 
+> **状态注记（2026-11-06）**：WPS 恢复/重建/抢救的**界面入口已移除** —— 恢复卡片、
+> 退场处置弹窗、账本重建/抢救卡片与弹窗均已删除（`frontend/src/lib/recoveryResolve.ts`、
+> `frontend/src/lib/ledgerRepair.ts` 一并删除，`CloudForm` 不再调用
+> `wps_recovery_status` / `wps_recovery_resolve` / `wps_ledger_rebuild` /
+> `wps_ledger_salvage`）；**后端能力保留**（备份/留档、上传前自动只读恢复、重建/抢救
+> API），仅作 API/人工兜底。第 7.1 节的界面落点已成为历史，当前行为以
+> [docs/WPS-SYNC-RULES.md](../docs/WPS-SYNC-RULES.md) 与
+> [docs/BRIDGE-WPS-CONTRACT-R6.md](../docs/BRIDGE-WPS-CONTRACT-R6.md) 为准。
+
 ## 8. 相关代码与测试索引
 
 **代码**

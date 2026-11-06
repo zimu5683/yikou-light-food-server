@@ -160,7 +160,9 @@ const UNCERTAIN_MUTATIONS = [
       ...base(code || 'uncertain', 'warning', '上传结果不确定 · 待核对',
         reason || '可能已写入但无法确认；不能当作成功，也不能当作零写入。',
         next),
-      nextStep: next || '只读核对云端与日志，不要重新上传。',
+      // 不照抄服务端的「不重新上传」提示：再次上传时 executor 会先自动只读核对，
+      // 证明不了「上次未写入」就不会写，所以这里给用户一条可执行的警告而不是长流程。
+      nextStep: '请先在 WPS 云端核对这批是否已写入。可以重新预览后再试：写入前服务端会先只读核对上次记录，只有能证明上次未写入才会继续写，证明不了会再次拒绝。',
       needsManualReconcile: true,
     })
   }`,
@@ -181,8 +183,17 @@ const UNCERTAIN_OPERATION_MUTATIONS = [
   {
     file: OPERATION_STATUS,
     name: '权威 uncertain 渲染成“已完成 / success”',
-    find: `    case 'uncertain':
-      return resultView(modeLabel, 'uncertain', \`\${modeLabel}结果不确定 · 待核对\`, '未能确认全部结果；可再运行一次补单（先对账，列表延迟仍可能重复）。', 'warning', true, nextAction, reason, common)`,
+    find: `    case 'uncertain': {
+      // WPS 云文档：服务端 next_action 固定是「只读核对，不重新上传」，但用户真正需要
+      // 的是「先去 WPS 云端核对；再次上传前程序会先自动只读核对」——不能套用闪时送
+      // 「可再运行一次补单」的口径。
+      const wpsUpload = String(operation.mode || '') === 'wps_upload'
+      const detail = wpsUpload
+        ? '可能已写入但无法确认；请先在 WPS 云端核对。再次上传前服务端会先只读核对，证明不了上次未写入就不会写。'
+        : '未能确认全部结果；可再运行一次补单（先对账，列表延迟仍可能重复）。'
+      const view = resultView(modeLabel, 'uncertain', \`\${modeLabel}结果不确定 · 待核对\`, detail, 'warning', true, nextAction, reason, common)
+      return wpsUpload ? { ...view, detail } : view
+    }`,
     replace: `    case 'uncertain':
       return resultView(modeLabel, 'success', \`\${modeLabel}已完成\`, '任务已正常结束，可查看结果与日志。', 'success', false, nextAction, reason, common)`,
   },
@@ -281,11 +292,11 @@ const SCENARIOS = [
     ],
     mustFail: [
       'F2 上传确认连点/双击只提交一次（单飞闸门）',
-      'W3 双击/连点只提交一次且无并发',
     ],
     mustStillPass: [
       '布局无横向溢出 360x800',
-      'W3 备注过短本地拦截，不发出请求',
+      // 控制组：与单飞闸门无关的 W6 断言在变异副本里必须仍然 PASS（页面没崩）。
+      'W6 uncertain 明示这不是已完成',
     ],
   },
   {

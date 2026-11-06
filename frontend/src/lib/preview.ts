@@ -192,16 +192,16 @@ export function uploadNextAction(result: {
   if (result?.status === 'uncertain') {
     return {
       code: code || 'uncertain',
-      label: '重新核对',
-      detail: result?.next_action || result?.reason || '结果不确定，请先核对云端与日志，不要重复提交。',
+      label: '重新预览',
+      detail: '如仍要上传，先重新预览；服务端写入前会先只读核对上次记录，证明不了上次未写入就不会写。',
       tone: 'warning',
     }
   }
   if (result?.status === 'partial') {
     return {
       code: code || 'partial',
-      label: '重新核对',
-      detail: result?.next_action || result?.reason || '部分表未确认，请核对日志与副本后在云端确认。',
+      label: '重新预览',
+      detail: '逐表在 WPS 云端核对失败/不确定项；重新预览后再试时，服务端会先只读核对。',
       tone: 'warning',
     }
   }
@@ -216,8 +216,8 @@ export function uploadNextAction(result: {
   if (result?.status === 'blocked') {
     return {
       code: code || 'blocked',
-      label: '重新核对',
-      detail: result?.next_action || result?.reason || '存在阻断：先核对/修复本地日志与账本，不要重复上传。',
+      label: '重新预览',
+      detail: '本地日志/账本需要人工修复；修复前重新预览也会被拒绝。',
       tone: 'danger',
     }
   }

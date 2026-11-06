@@ -258,6 +258,8 @@ insert_row/detail`
 
 ## 6. `wps_recovery_status()`
 
+> **注记（2026-11-06）**：前端 UI 入口已于 2026-11-06 移除；接口保留，供 API/人工恢复用。
+
 只读，普通用户可调用。普通用户返回 `scope="summary"`（无 `operations`）；
 管理员返回 `scope="admin"`（白名单 DTO）。
 
@@ -290,6 +292,8 @@ insert_row/detail`
 ---
 
 ## 7. `wps_recovery_resolve(payload)` —— 管理员专用（W3）
+
+> **注记（2026-11-06）**：前端 UI 入口已于 2026-11-06 移除；接口保留，供 API/人工恢复用。
 
 请求（数组单对象或对象键值均可）：
 
@@ -436,6 +440,8 @@ wps_preview / wps_check_copies / sss_day_orders / wps_recovery_resolve   ← 新
 
 ## 12. `wps_ledger_rebuild(payload)` —— 账本锚点重建（2026-10-15 新增）
 
+> **注记（2026-11-06）**：前端 UI 入口已于 2026-11-06 移除；接口保留，供 API/人工恢复用。
+
 账本是唯一的幂等锚点（云端只存总餐次与日期格），锚点一丢增量从任何地方都推算不
 出来。这个入口是账本丢失/损坏之后**唯一**能继续上传的出路；设计与取舍见
 `design/WPS-账本丢失与损坏的兜底.md` 第 7.1 节。
@@ -514,6 +520,8 @@ wps_preview / wps_check_copies / sss_day_orders / wps_recovery_resolve   ← 新
   里说明 —— 那时本地行与目标日期不对应，没有可推断的前提。
 
 ## 13. `wps_ledger_salvage(payload)` —— 账本抢救（2026-10-15 新增）
+
+> **注记（2026-11-06）**：前端 UI 入口已于 2026-11-06 移除；接口保留，供 API/人工恢复用。
 
 账本读盘时有一道很严的校验：**一个人的一条数据坏掉，整本账本就读不出来**，预览与
 上传全部失败关闭。但账本结构是「日期 → 表 → 人 → 槽位」互相独立的映射，一处坏不

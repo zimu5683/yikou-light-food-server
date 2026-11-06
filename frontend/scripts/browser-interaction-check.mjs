@@ -141,36 +141,12 @@ const EXPECTED_PAGE_ERRORS = [
     reason: '「验证码提交网络失败」同样故意销毁 socket（验证保留输入、不自动重提），断言要求这次请求失败。',
   },
   {
-    scenario: /恢复查询/,
-    kind: 'resourceError',
-    url: /\/api\/wps_recovery_status$/,
-    content: /status of 403/,
-    max: 1,
-    reason: '「恢复查询被服务端拒绝」场景要求服务端返回 403（验证拒绝提示准确、不误报网络故障、不反复请求）；这条 403 是该场景的预期结果。',
-  },
-  {
     scenario: /断线恢复|FE-1/,
     kind: 'resourceError',
     url: /\/api\/operation_status_unreachable$/,
     content: /ERR_CONNECTION_REFUSED/,
     max: 1,
     reason: '「FE-1 断线错误恢复」故意把 operation_status 重定向到无人监听的端口（避免 Chrome 传输层自动重发污染请求计数），必然产生 1 条连接被拒。',
-  },
-  {
-    scenario: /恢复处置/,
-    kind: 'resourceError',
-    url: /\/api\/wps_recovery_resolve$/,
-    content: /status of 403/,
-    max: 1,
-    reason: '「恢复处置权限不足」场景要求 403（验证阻断保持、不显示成功、不自动重试）。',
-  },
-  {
-    scenario: /恢复处置/,
-    kind: 'resourceError',
-    url: /\/api\/wps_recovery_resolve_unreachable$/,
-    content: /ERR_CONNECTION_REFUSED/,
-    max: 1,
-    reason: '「恢复处置网络失败」用死端口重定向模拟结果未知（验证阻断保持且不自动重试）。',
   },
   {
     scenario: /批3/,
@@ -300,30 +276,12 @@ const mock = {
   wpsUpload: null,
   wpsPreviewCalls: 0,
   wpsPreview: null,
+  /** 已删除的恢复/退场/账本重建/抢救 UI：对应接口只要被调用就计数，门禁断言必须为 0。 */
   wpsRecoveryCalls: 0,
-  wpsRecoveryForbidden: false,
-  wpsResolveCalls: 0,
-  wpsResolveActive: 0,
-  wpsResolveMaxActive: 0,
-  wpsResolveDelay: 0,
-  wpsResolveNetwork: false,
-  wpsResolveForbidden: false,
-  wpsResolveResult: null,
-  wpsResolvePayloads: [],
-  wpsResolveTimes: [],
-  /** 第 14 项：账本锚点重建（提案 / 落盘共用同一端点）。 */
-  wpsRebuildCalls: 0,
-  wpsRebuildPayloads: [],
-  wpsRebuildDelay: 0,
-  wpsRebuildResult: null,
-  /** 第 14 项续：账本抢救。 */
-  wpsSalvageCalls: 0,
-  wpsSalvageActive: 0,
-  wpsSalvageMaxActive: 0,
-  wpsSalvagePayloads: [],
-  wpsSalvageDelay: 0,
-  wpsSalvageForbidden: false,
-  wpsSalvageResult: null,
+  /** wps_upload 收到的 preview_id 载荷（按提交顺序），用于证明重新预览后上传用新令牌。 */
+  wpsUploadPayloads: [],
+  /** 每次 wps_preview 返回的 preview_id（mock 每次签发新令牌），用于核对上传用的是最新一次。 */
+  wpsPreviewIds: [],
   /** 无人监听的本地端口：用于模拟网络失败而又不让请求被传输层重发。 */
   deadPort: 0,
   wpsStatusDelay: 0,
@@ -344,11 +302,6 @@ const mock = {
   saveWpsPayloads: [],
   saveWpsActive: 0,
   saveWpsMaxActive: 0,
-  wpsRecovery: {
-    ok: true, journal_path: '/tmp/synthetic-journal.json', operations: [], pending_operations: [],
-    counts: {}, next_action: 'none', contract_version: 1, source: 'local_journal',
-    read_only: true, queried_cloud: false, contains_cloud_checked_records: false,
-  },
 }
 
 /** W6：合成预览（计划口径 + 执行口径 proven_no_write）。 */
@@ -491,7 +444,7 @@ function createMockServer() {
       case 'worker_alive':
         if (name === 'worker_alive') return json(res, false)
         if (mock.operationStatusNetwork) {
-          // 同 wpsResolveNetwork：用「重定向到无人监听的端口」模拟网络失败，
+          // 用「重定向到无人监听的端口」模拟网络失败，
           // 避免 socket 被销毁时 Chrome 在传输层自动重发而污染请求计数。
           res.writeHead(302, { Location: `http://127.0.0.1:${mock.deadPort || 1}/api/operation_status_unreachable` })
           res.end()
@@ -570,92 +523,14 @@ function createMockServer() {
         else respond()
         return
       }
+      // 恢复/退场/账本重建/抢救入口已随 UI 一起删除：页面只要还在调用，
+      // 计数就会 > 0，由场景断言（应为 0）失败。
       case 'wps_recovery_status':
+      case 'wps_recovery_resolve':
+      case 'wps_ledger_rebuild':
+      case 'wps_ledger_salvage':
         mock.wpsRecoveryCalls += 1
-        if (mock.wpsRecoveryForbidden) {
-          return json(res, { error: '服务端拒绝了本次请求', code: 'refused' }, 403)
-        }
-        return json(res, mock.wpsRecovery)
-      case 'wps_recovery_resolve': {
-        mock.wpsResolveCalls += 1
-        mock.wpsResolvePayloads.push(firstArg || null)
-        mock.wpsResolveTimes.push(Date.now())
-        mock.wpsResolveActive += 1
-        mock.wpsResolveMaxActive = Math.max(mock.wpsResolveMaxActive, mock.wpsResolveActive)
-        if (mock.wpsResolveNetwork) {
-          // 用「重定向到无人监听的端口」模拟网络失败，而不是 req.socket.destroy()：
-          // 实测 Chrome 对 socket 被销毁的 POST 会在传输层自动重发（1 次 fetch → 3 次
-          // 服务端请求），这会让「服务端请求数」无法代表「用户提交次数」。
-          // 重定向目标连接被拒 → 前端同样拿到 Failed to fetch，而本服务端只收到 1 次。
-          mock.wpsResolveActive = Math.max(0, mock.wpsResolveActive - 1)
-          res.writeHead(302, { Location: `http://127.0.0.1:${mock.deadPort || 1}/api/wps_recovery_resolve_unreachable` })
-          res.end()
-          return
-        }
-        const respondResolve = () => {
-          mock.wpsResolveActive = Math.max(0, mock.wpsResolveActive - 1)
-          if (mock.wpsResolveForbidden) {
-            return json(res, { ok: false, status: 'refused', code: 'refused', reason: '服务端拒绝了本次请求', changed: false }, 403)
-          }
-          return json(res, mock.wpsResolveResult || {
-            ok: true, status: 'retired_guarded', code: 'retired_guarded',
-            reason: '已按处置决策处理，本地 journal 已写入审计',
-            next_action: 'manual_reconcile', contract_version: 1, read_only: false,
-            cloud_write: false, operation_id: 'wps-1234567890abcdef',
-            operation_ref: 'wps-op:abcdef123456', changed: true, verified_on_disk: true,
-            scope: {
-              operation_ref: 'wps-op:abcdef123456', target_dates: ['2026-09-20'],
-              target_refs: ['wps-target:abc123def456'], sheet_count: 1,
-              guard_retained: true, blocking: 'retired_guarded',
-            },
-            audit: {
-              actor: 'admin@example.com', at: '2026-09-20T10:00:00', decision: 'retire_guarded',
-              note_recorded: true, duplicate: false,
-              effects: { cloud_written: false, guard_retained: true, blocking: 'retired_guarded', auto_retry_allowed: false },
-            },
-          })
-        }
-        if (mock.wpsResolveDelay > 0) setTimeout(respondResolve, mock.wpsResolveDelay)
-        else respondResolve()
-        return
-      }
-      case 'wps_ledger_rebuild': {
-        mock.wpsRebuildCalls += 1
-        mock.wpsRebuildPayloads.push(firstArg ?? null)
-        const respondRebuild = () => json(res, mock.wpsRebuildResult || {
-          ok: true, status: 'rebuild_ready', code: '', reason: '',
-          contract_version: 1, read_only: true, cloud_write: false, ledger_write: false,
-          next_action: "wps_ledger_rebuild(confirm='rebuild')", target_date: '2026-09-20',
-          counts: { mark_synced: 0, leave_empty: 0, cloud_person_absent: 0, cloud_cell_marked: 0,
-                    cloud_cell_empty: 0, rows: 0, people: 0, sheets: 1, skipped_sheets: 0 },
-          tables: [], warnings: [], fingerprint: '0'.repeat(64), text: '',
-        })
-        if (mock.wpsRebuildDelay > 0) setTimeout(respondRebuild, mock.wpsRebuildDelay)
-        else respondRebuild()
-        return
-      }
-      case 'wps_ledger_salvage': {
-        mock.wpsSalvageCalls += 1
-        mock.wpsSalvageActive += 1
-        mock.wpsSalvageMaxActive = Math.max(mock.wpsSalvageMaxActive, mock.wpsSalvageActive)
-        mock.wpsSalvagePayloads.push(firstArg ?? null)
-        const respondSalvage = () => {
-          mock.wpsSalvageActive = Math.max(0, mock.wpsSalvageActive - 1)
-          if (mock.wpsSalvageForbidden) {
-            return json(res, { ok: false, status: 'refused', code: 'refused', reason: '服务端拒绝了本次请求', changed: false }, 403)
-          }
-          return json(res, mock.wpsSalvageResult || {
-            ok: true, status: 'nothing_to_salvage', code: 'nothing_to_salvage', reason: '',
-            contract_version: 1, read_only: true, cloud_write: false, ledger_write: false,
-            changed: false, ledger_path: '/tmp/synthetic-ledger.json', backup: '',
-            counts: { kept_people: 0, kept_batches: 0, dropped_people: 0, dropped_batches: 0, dropped_total: 0 },
-            dropped: [], warnings: [], next_action: "wps_ledger_salvage(confirm='salvage')",
-          })
-        }
-        if (mock.wpsSalvageDelay > 0) setTimeout(respondSalvage, mock.wpsSalvageDelay)
-        else respondSalvage()
-        return
-      }
+        return json(res, { ok: false, code: 'removed_endpoint', reason: '已删除的恢复/账本 UI 不应再调用该接口' })
       case 'start_order':
         mock.startOrderCalls += 1
         return json(res, { ok: true })
@@ -665,6 +540,7 @@ function createMockServer() {
         return json(res, { ok: true })
       case 'wps_upload': {
         mock.wpsUploadCalls += 1
+        mock.wpsUploadPayloads.push(firstArg ?? null)
         mock.wpsUploadActive += 1
         mock.wpsUploadMaxActive = Math.max(mock.wpsUploadMaxActive, mock.wpsUploadActive)
         const payload = mock.wpsUpload || { ok: false, status: 'rejected', code: 'preview_missing', reason: 'mock 拒绝', next_action: '重新预览', operation_id: '' }
@@ -678,7 +554,15 @@ function createMockServer() {
       }
       case 'wps_preview':
         mock.wpsPreviewCalls += 1
-        if (mock.wpsPreview) return json(res, mock.wpsPreview)
+        if (mock.wpsPreview) {
+          // 真实服务端每次只读预览都会签发新的一次性 preview_id；mock 也每次换一个，
+          // 这样「重新预览后上传必须用新令牌」才能被真实断言（复用旧令牌会失败）。
+          const previewId = mock.wpsPreview.preview_id
+            ? mock.wpsPreview.preview_id + '#' + mock.wpsPreviewCalls
+            : mock.wpsPreview.preview_id
+          if (previewId) mock.wpsPreviewIds.push(previewId)
+          return json(res, { ...mock.wpsPreview, preview_id: previewId })
+        }
         return json(res, {
           ok: false, status: 'rejected', reason: 'mock 预览未启用', code: 'mock', next_action: '重新预览',
           summary: {}, stats: {}, operation_id: '', preview_id: '', created_at: '', expires_at: '',
@@ -829,7 +713,16 @@ class Cdp {
   }
 }
 
-function documentTextIncludes(text, needles) { return needles.every((needle) => String(text).includes(needle)) }
+/** 已整体删除的「兜底/恢复/退场/账本重建抢救」UI 文案：页面任何位置都不应再出现。 */
+const REMOVED_RECOVERY_UI_TEXTS = [
+  '待核对批次（只读可见）',
+  '恢复处置',
+  '本地账本不可信',
+  '查看重建提案',
+  '先试着抢救账本',
+  '旧任务恢复/退场处置',
+  '账本锚点重建',
+]
 
 /** 断言失败时给出目标词附近的上下文，避免只知道 false 不知道为什么。 */
 /** 读取结果卡片上的机器可读语义（不依赖中文措辞）。 */
@@ -869,7 +762,7 @@ const operationSurfaceJs = `(() => {
   const detailEl = h1.nextElementSibling
   const detail = norm(detailEl?.textContent)
   // 与「页签内被删除的那块」逐字相同（标题+正文）才算重复块：
-  // 用精确匹配而不是前缀匹配，避免误伤以同一状态文案开头的 WPS 恢复卡片等合法模块。
+  // 用精确匹配而不是前缀匹配，避免误伤以同一状态文案开头的其它合法模块。
   const duplicateText = label + detail
   const callouts = duplicateText
     ? [...new Set([...document.querySelectorAll('div')]
@@ -893,7 +786,7 @@ const operationSurfaceJs = `(() => {
  * - `headerLabel` / `headerDetail`：头部状态胶囊与说明行的可见文本；
  * - `duplicateBlocks`：**与页签内被删除的那块逐字相同**的可见块
  *   （`label + detail` 精确相等）。用精确匹配而不是 `startsWith(label)`：
- *   WPS 恢复卡片等合法模块也可能以同一状态文案开头，按前缀判重会误伤。
+ *   其它合法模块也可能以同一状态文案开头，按前缀判重会误伤。
  *   删掉页签内重复块之后这里必须为空 —— 这是「状态不再同屏重复」的机器判据；
  * - `detailOccurrences`：说明文本在整页出现几次（就绪态应为 1）；
  * - `detailClipped`：说明行是否被截断。横向（`truncate` 的省略号）与纵向
@@ -1577,7 +1470,6 @@ async function waitForMock(predicate, timeout = 4000) {
 }
 
 /** 在 [role=dialog] / [role=alertdialog] 内点击文本匹配的按钮。 */
-const dialogSelector = `(document.querySelector('[role="dialog"]') || document.querySelector('[role="alertdialog"]'))`
 const clickDialogButtonJs = (text) => `(() => {
   const roots = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')]
   const diag = roots.map((root) => {
@@ -1639,31 +1531,6 @@ const clickDialogCheckboxJs = `(() => {
   if (!anyBox) return false
   if (!anyBox.checked) anyBox.click()
   return anyBox.checked === true
-})()`
-
-const clickDialogRadioJs = (value) => `(() => {
-  const dialog = ${dialogSelector}
-  if (!dialog) return false
-  const boxes = [...dialog.querySelectorAll('input[type="radio"]')]
-  const target = boxes.find((el) => el.closest('label')?.textContent?.includes(${JSON.stringify(value)}))
-  if (!target) return false
-  target.click()
-  return target.checked === true
-})()`
-
-const setDialogInputJs = (selector, value) => `(() => {
-  const dialog = ${dialogSelector}
-  if (!dialog) return { ok: false, reason: 'no_dialog' }
-  const el = dialog.querySelector(${JSON.stringify(selector)})
-  if (!el) return { ok: false, reason: 'not_found' }
-  const proto = Object.getPrototypeOf(el)
-  const desc = Object.getOwnPropertyDescriptor(proto, 'value')
-    || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')
-  if (!desc || typeof desc.set !== 'function') return { ok: false, reason: 'no_setter' }
-  desc.set.call(el, ${JSON.stringify(value)})
-  el.dispatchEvent(new Event('input', { bubbles: true }))
-  el.dispatchEvent(new Event('change', { bubbles: true }))
-  return { ok: el.value === ${JSON.stringify(value)} }
 })()`
 
 /** 点击页面可见按钮（不限于弹窗）。 */
@@ -2097,95 +1964,40 @@ async function main() {
     mock.resolveCaptchaNetwork = false
     mock.pendingItems = []
 
-    // ---------- 5. WPS recovery 只读可见、刷新不触发上传 ----------
-    enterScenario('5 WPS 只读恢复卡片')
-    const recoveryOpLegacy = {
-      operation_id: 'wps-1234567890abcdef', operation_ref: 'wps-op:abcdef123456',
-      status: 'uncertain', pending: true, cloud_checked: true,
-      created_at: '2026-09-19T10:00:00', updated_at: '2026-09-19T10:01:00',
-      target_date: '2026-09-20', target_refs: ['wps-target:abc123def456'], sheet_count: 1,
-      error_code: 'wps_recovery_uncertain', allowed_next_actions: ['manual_reconcile'],
-      manual_required: true,
-      sheets: [{
-        target_date: '2026-09-20', target_ref: 'wps-target:abc123def456',
-        status: 'uncertain', raw_status: 'uncertain', error_code: 'wps_recovery_uncertain',
-        allowed_next_actions: ['manual_reconcile'], manual_required: true,
-        cloud_checked: true, evidence: 'journal+cloud_read',
-      }],
-    }
-    mock.wpsRecovery = {
-      ok: true, contract_version: 1, source: 'local_journal', read_only: true,
-      queried_cloud: false, contains_cloud_checked_records: true, scope: 'admin',
-      counts: { planned: 0, writing: 0, ledger_pending: 0, uncertain: 1, verified: 0, failed: 0, not_started: 0 },
-      next_action: 'manual_reconcile', error_code: 'wps_recovery_uncertain',
-      summary: { operation_count: 1, pending_count: 1, uncertain_count: 1, failed_count: 0, not_started_count: 0, has_pending: true, needs_review: true, guidance: '存在不确定结果：请先只读核对云端与日志，不要直接重传' },
-      operations: [recoveryOpLegacy], pending_operations: [recoveryOpLegacy],
-    }
+    // ---------- 5. WPS 页签：只读刷新不发危险请求、不出现已删除的恢复/账本 UI ----------
+    // 「兜底/恢复/退场/账本重建抢救」整套 UI 已删除，只保留上传失败警告；
+    // 这里锁住：刷新只读状态既不上传，也不能调用已删除的恢复类接口。
+    enterScenario('5 WPS 只读刷新安全')
+    await reloadApp(cdp)
+    mock.wpsStatusCliPath = '/tmp/synthetic-kdocs-cli'
     mock.wpsUploadCalls = 0
-    await cdp.eval(clickByTextJs('button', '云文档同步'))
-    await new Promise((r) => setTimeout(r, 300))
-    if (!(await cdp.eval(`document.body.innerText.includes('刷新状态（只读）')`))) {
-      await cdp.eval(clickByTextJs('button', '高级设置与写入目标'))
+    mock.saveWpsPayloads = []
+    assert.ok(await ensureCloudPanel(cdp), '云文档页签未出现')
+    assert.ok(await cdp.waitFor("document.body.innerText.includes('启用云文档同步')"), '云文档面板未渲染')
+    assert.ok(await cdp.waitFor("document.body.innerText.includes('已授权')"), '云文档授权状态未回填')
+    if (!(await cdp.eval("document.body.innerText.includes('刷新状态（只读）')"))) {
+      assert.ok(await cdp.eval(clickByTextJs('button', '高级设置与写入目标')), '找不到高级设置按钮')
       await new Promise((r) => setTimeout(r, 300))
     }
-    // 先刷新一次让卡片反映本次 mock 的恢复状态，作为"刷新前"基线；
-    // 否则"刷新前后对比"会退化成只看刷新后的快照。
     assert.ok(await cdp.eval(clickByTextJs('button', '刷新状态（只读）')), '找不到刷新状态按钮')
-    await cdp.waitFor(`document.body.innerText.includes('待核对批次（只读可见）')`, 5000)
-    assert.ok(
-      await cdp.eval(`document.body.innerText.includes('待核对批次（只读可见）')`),
-      '首次刷新后恢复卡片仍未显示待核对批次',
-    )
-    const uploadBefore = mock.wpsUploadCalls
-    mock.saveWpsPayloads = []
-    const resolveCallsBeforeRefresh = mock.wpsResolveCalls
-    const recoveryBeforeRefresh = await cdp.eval('document.body.innerText')
-    assert.ok(await cdp.eval(clickByTextJs('button', '刷新状态（只读）')), '找不到刷新状态按钮')
-    await new Promise((r) => setTimeout(r, 600))
-    const recoveryText = await cdp.eval(`document.body.innerText`)
-    record('WPS 只读恢复卡片可见且标明下一步', recoveryText.includes('待核对批次（只读可见）') && recoveryText.includes('只读核对云端与日志') && recoveryText.includes('不会上传、不会解除阻断、不会自动重试'), '')
-    record('恢复状态最小 DTO 不出现 problems/risk_reason/客户明细', !recoveryText.includes('risk_reason') && !recoveryText.includes('problems') && !recoveryText.includes('合成待核对'), '')
-    record('恢复卡片显示 allowed_next_actions 安全动作', documentTextIncludes(await cdp.eval('document.body.textContent'), ['允许动作', 'manual_reconcile']), '')
-    await captureScreenshot(cdp, 'fe-c3-wps-recovery-390x844.png')
-    record('刷新状态不触发 wps_upload', mock.wpsUploadCalls === uploadBefore && mock.wpsUploadCalls === 0, `uploads=${mock.wpsUploadCalls}`)
-    record('纯刷新回填不触发无意义自动保存', mock.saveWpsPayloads.length === 0, `savePayloads=${mock.saveWpsPayloads.length}`)
+    await new Promise((r) => setTimeout(r, 700))
+    const refreshOnlyText = await cdp.eval('document.body.innerText')
+    const refreshRemovedUiHits = REMOVED_RECOVERY_UI_TEXTS.filter((text) => refreshOnlyText.includes(text))
     record(
-      '刷新状态不解除阻断（刷新前后都仍是待核对，且未调用恢复写入）',
-      recoveryBeforeRefresh.includes('待核对批次（只读可见）')
-        && recoveryText.includes('待核对批次（只读可见）')
-        && mock.wpsResolveCalls === resolveCallsBeforeRefresh,
-      `before=${recoveryBeforeRefresh.includes('待核对批次（只读可见）')} after=${recoveryText.includes('待核对批次（只读可见）')} resolveDelta=${mock.wpsResolveCalls - resolveCallsBeforeRefresh}`,
+      'WPS 页签不再出现恢复/退场/账本重建/抢救 UI',
+      refreshRemovedUiHits.length === 0,
+      'hits=' + JSON.stringify(refreshRemovedUiHits),
     )
-    record('本地 journal 与云端只读核对有区分', recoveryText.includes('本查询未调用云端') && recoveryText.includes('云端只读核对'), '')
-
-    // recovery 损坏 -> 失败关闭
-    mock.wpsRecovery = {
-      ok: false, contract_version: 1, source: 'local_journal', read_only: true,
-      queried_cloud: false, contains_cloud_checked_records: false, scope: 'admin',
-      counts: { planned: 0, writing: 0, ledger_pending: 0, uncertain: 0, verified: 0, failed: 0, not_started: 0 },
-      next_action: 'fix_journal', error_code: 'wps_recovery_journal_unreadable',
-      summary: { needs_review: true, guidance: '恢复状态不可用：先只读核对，不要直接重试或重新上传' },
-    }
-    assert.ok(await cdp.eval(clickByTextJs('button', '刷新状态（只读）')), '找不到刷新状态按钮')
-    await cdp.waitFor(`document.body.innerText.includes('本地恢复记录不可读')`)
-    const brokenText = await cdp.eval('document.body.innerText')
-    record('recovery_status 损坏失败关闭，不伪装成无待恢复', brokenText.includes('本地恢复记录不可读') && brokenText.includes('不要直接重试'), '')
-
-    // 服务端强制拒绝（403）：准确提示，不误报网络故障；不得反复请求
-    enterScenario('5 恢复查询：服务端 403 拒绝（预期）')
-    mock.wpsRecoveryForbidden = true
-    await new Promise((r) => setTimeout(r, 500))
-    const callsBeforeForbidden = mock.wpsRecoveryCalls
-    assert.ok(await cdp.eval(clickByTextJs('button', '刷新状态（只读）')), '找不到刷新状态按钮')
-    await cdp.waitFor(`document.body.innerText.includes('服务端拒绝了本次请求')`)
-    await new Promise((r) => setTimeout(r, 800))
-    const forbiddenText = await cdp.eval(`document.body.innerText`)
-    const forbiddenDelta = mock.wpsRecoveryCalls - callsBeforeForbidden
-    record('恢复查询被 403 拒绝时给出准确提示，不误报网络故障', forbiddenText.includes('服务端拒绝了本次请求') && !forbiddenText.includes('网络已断开'), '')
-    record('恢复查询被 403 拒绝后不反复请求', forbiddenDelta === 1, `delta=${forbiddenDelta}`)
-    mock.wpsRecoveryForbidden = false
+    record('刷新状态不触发 wps_upload', mock.wpsUploadCalls === 0, 'uploads=' + mock.wpsUploadCalls)
+    record(
+      'UI 不调用已删除的恢复/退场/账本接口（调用 0 次）',
+      mock.wpsRecoveryCalls === 0,
+      'calls=' + mock.wpsRecoveryCalls,
+    )
+    record('纯刷新回填不触发无意义自动保存', mock.saveWpsPayloads.length === 0, 'savePayloads=' + mock.saveWpsPayloads.length)
 
     // 服务端返回了 pending 项、但 request 明细为空：不打开任何输入、不自动提交。
+    enterScenario('5 pending 明细为空')
     mock.pendingItems = [{
       interaction_id: 'x1', operation_id: 'op-x', kind: 'order_retry', status: 'pending',
       created_at: 1, expires_at: Date.now() / 1000 + 300, request: {},
@@ -2204,6 +2016,17 @@ async function main() {
     async function ensureCloudTab() {
       await cdp.eval(clickButtonJs('云文档同步'))
       await new Promise((r) => setTimeout(r, 250))
+    }
+
+    /** 等底部唯一可见主按钮（隐藏页签的主按钮也在 DOM 里，必须按可见性过滤）文案命中。 */
+    async function waitForPrimaryDockLabel(text, timeout = 5000) {
+      const start = Date.now()
+      while (Date.now() - start < timeout) {
+        const probe = await cdp.eval(primaryDockButtonJs)
+        if (probe?.count === 1 && String(probe.label || '').includes(text)) return true
+        await new Promise((r) => setTimeout(r, 120))
+      }
+      return false
     }
 
     async function runUploadFlow(uploadPayload, options = {}) {
@@ -2228,16 +2051,6 @@ async function main() {
     }
 
     mock.operationStatus = null
-    mock.wpsRecovery = {
-      ok: true, contract_version: 1, source: 'local_journal', read_only: true,
-      queried_cloud: false, contains_cloud_checked_records: false, scope: 'admin',
-      counts: {}, next_action: 'none', error_code: '',
-      summary: {
-        operation_count: 0, pending_count: 0, uncertain_count: 0, failed_count: 0,
-        not_started_count: 0, has_pending: false, needs_review: false, guidance: '没有待恢复操作',
-      },
-      operations: [], pending_operations: [],
-    }
     await reloadApp(cdp)
 
     // 刷新回填回归：hasUnsaved 曾以未绑定方法导出 → refresh() 抛 TypeError，
@@ -2265,6 +2078,110 @@ async function main() {
     mock.wpsStatusCliPath = '/tmp/synthetic-kdocs-cli'
     assert.ok(await cdp.eval(clickButtonJs('刷新状态（只读）')), '找不到刷新状态按钮')
     await new Promise((r) => setTimeout(r, 600))
+
+    // W6-0：重新预览是可重复的只读入口，不带动上传；上传必须用最新一次预览令牌。
+    mock.wpsPreview = syntheticPreview()
+    mock.wpsUpload = {
+      ok: true, status: 'success', code: '', reason: '', next_action: '',
+      operation_id: 'op-mock-preview-repeat',
+      planned_summary: { kind: 'plan', rows: { to_update: 1, to_append: 0, unchanged: 0, skipped: 0, warned: 0 } },
+      execution_summary: {
+        kind: 'execution', status: 'success', executed: true, counts_source: 'apply_plan',
+        sheets: { total: 1, verified: 1, noop: 0, failed: 0, uncertain: 0, skipped: 0, blocked: 0, other: 0 },
+        rows: { verified: 1, failed: 0, uncertain: 0, skipped: 0, planned: 1 },
+        rows_unknown: false, proven_no_write: false, written_sheets: 1, failed_sheets: 0,
+      },
+    }
+    mock.wpsPreviewIds = []
+    mock.wpsUploadPayloads = []
+    mock.wpsPreviewCalls = 0
+    mock.wpsUploadCalls = 0
+    await ensureCloudTab()
+    assert.ok(await cdp.eval(clickButtonJs('生成只读预览')), '找不到生成只读预览按钮')
+    assert.ok(await cdp.waitFor("document.body.innerText.includes('结构化预览')"), '首次预览未渲染')
+    // 等预览请求真正收尾（busy 复位）再读按钮，否则可能读到「预览中…/生成只读预览」的中间态。
+    assert.ok(await waitForPrimaryDockLabel('确认上传'), '预览结束后主按钮未回到确认上传')
+    await new Promise((r) => setTimeout(r, 250))
+    const previewButtons = await cdp.eval(visibleButtonsJs)
+    const previewPrimary = await cdp.eval(primaryDockButtonJs)
+    const repreviewButton = (previewButtons || []).find((item) => item.label === '重新预览')
+    record(
+      '5b 预览后可重复预览：底栏出现副按钮「重新预览」且主按钮仍是确认上传',
+      Boolean(repreviewButton) && repreviewButton.primary === false && repreviewButton.disabled === false
+        && previewPrimary?.count === 1 && previewPrimary.label === '确认上传',
+      JSON.stringify({ repreviewButton, primary: previewPrimary, buttons: (previewButtons || []).map((item) => item.label) }),
+    )
+    const firstPreviewId = mock.wpsPreviewIds[mock.wpsPreviewIds.length - 1]
+    const previewCallsBeforeRepreview = mock.wpsPreviewCalls
+    const uploadsBeforeRepreview = mock.wpsUploadCalls
+    assert.ok(await cdp.eval(clickButtonJs('重新预览')), '找不到重新预览按钮')
+    assert.ok(await waitForMock(() => mock.wpsPreviewCalls > previewCallsBeforeRepreview, 5000), '重新预览请求未发出')
+    assert.ok(await waitForPrimaryDockLabel('确认上传'), '重新预览后主按钮未回到确认上传')
+    await new Promise((r) => setTimeout(r, 300))
+    const afterRepreviewPrimary = await cdp.eval(primaryDockButtonJs)
+    const secondPreviewId = mock.wpsPreviewIds[mock.wpsPreviewIds.length - 1]
+    record(
+      '5b 重新预览只调只读预览：预览计数 +1、上传计数不变、主按钮仍显示确认上传',
+      mock.wpsPreviewCalls - previewCallsBeforeRepreview === 1
+        && mock.wpsUploadCalls === uploadsBeforeRepreview
+        && afterRepreviewPrimary?.label === '确认上传',
+      'previewDelta=' + (mock.wpsPreviewCalls - previewCallsBeforeRepreview)
+        + ' uploadDelta=' + (mock.wpsUploadCalls - uploadsBeforeRepreview)
+        + ' primary=' + JSON.stringify(afterRepreviewPrimary),
+    )
+    record(
+      '5b 每次预览返回新的 preview_id（可重复预览的真实令牌）',
+      Boolean(firstPreviewId) && Boolean(secondPreviewId) && firstPreviewId !== secondPreviewId,
+      JSON.stringify({ firstPreviewId, secondPreviewId, ids: mock.wpsPreviewIds }),
+    )
+    // 连点「重新预览」只能发出一次只读预览（预览单飞闸门），不能把只读入口变成并发风暴。
+    const previewCallsBeforeBurst = mock.wpsPreviewCalls
+    const repreviewBurst = await cdp.eval(`(() => {
+      const target = [...document.querySelectorAll('button')].find((el) => {
+        const r = el.getBoundingClientRect(); const s = getComputedStyle(el)
+        return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && !el.disabled
+          && (el.textContent || '').trim() === '重新预览'
+      })
+      if (!target) return { ok: false, fired: 0 }
+      let fired = 0
+      for (let i = 0; i < 3; i += 1) { target.click(); fired += 1 }
+      return { ok: true, fired }
+    })()`)
+    assert.ok(repreviewBurst?.ok, '找不到重新预览按钮')
+    assert.ok(await waitForMock(() => mock.wpsPreviewCalls > previewCallsBeforeBurst, 5000), '连点重新预览没有发出预览请求')
+    assert.ok(await waitForPrimaryDockLabel('确认上传'), '连点重新预览后主按钮未回到确认上传')
+    await new Promise((r) => setTimeout(r, 300))
+    record(
+      '5b 连点「重新预览」只发一次只读预览（单飞闸门，不上传）',
+      mock.wpsPreviewCalls - previewCallsBeforeBurst === 1
+        && mock.wpsUploadCalls === uploadsBeforeRepreview
+        && (await cdp.eval(primaryDockButtonJs))?.label === '确认上传',
+      'previewDelta=' + (mock.wpsPreviewCalls - previewCallsBeforeBurst)
+        + ' uploadCalls=' + mock.wpsUploadCalls + ' fired=' + (repreviewBurst?.fired),
+    )
+    const latestPreviewId = mock.wpsPreviewIds[mock.wpsPreviewIds.length - 1]
+    // 不勾选明确确认句时，弹窗内的「确认上传」仍然不可点（且没有发出上传请求）。
+    assert.ok(await cdp.eval(clickButtonJs('确认上传')), '找不到确认上传按钮')
+    assert.ok(await cdp.waitFor("document.body.innerText.includes('确认上传云文档')"), '确认弹窗未打开')
+    const confirmBeforeAck = await cdp.eval(openDialogProbeJs)
+    record(
+      '5b 未勾选确认句时上传按钮仍不可点（0 次上传）',
+      confirmBeforeAck?.buttons?.some((item) => item.label === '确认上传' && item.disabled === true) === true
+        && mock.wpsUploadCalls === uploadsBeforeRepreview,
+      JSON.stringify({ buttons: confirmBeforeAck?.buttons || null, uploadCalls: mock.wpsUploadCalls }),
+    )
+    assert.ok(await cdp.eval(clickDialogCheckboxJs), '无法勾选明确确认句')
+    await new Promise((r) => setTimeout(r, 150))
+    assert.ok((await cdp.eval(clickDialogButtonJs('确认上传')))?.ok, '找不到弹窗内的确认上传按钮')
+    assert.ok(await waitForMock(() => mock.wpsUploadPayloads.length >= 1, 6000), '重新预览后的上传请求未发出')
+    await cdp.waitFor("document.body.innerText.includes('确认上传云文档') === false", 6000)
+    await new Promise((r) => setTimeout(r, 400))
+    const uploadedPreviewId = mock.wpsUploadPayloads[mock.wpsUploadPayloads.length - 1]
+    record(
+      '5b 再次上传用的是最新一次预览的 preview_id（旧令牌未被复用）',
+      uploadedPreviewId === latestPreviewId && uploadedPreviewId !== firstPreviewId,
+      JSON.stringify({ uploadedPreviewId, firstPreviewId, latestPreviewId, payloads: mock.wpsUploadPayloads }),
+    )
 
     // W6-A：uncertain 不得出现任何“已完成”暗示
     await runUploadFlow({
@@ -2308,12 +2225,53 @@ async function main() {
     )
     record(
       'W6 uncertain 明示这不是已完成',
-      uncertainText.includes('这不是“已完成”') && uncertainText.includes('下一步：只读核对云端与日志'),
+      uncertainText.includes('这不是“已完成”') && uncertainText.includes('下一步：请先在 WPS 云端核对'),
       '',
     )
     await cdp.eval(`document.querySelector('[data-wps-result="upload"]')?.scrollIntoView({ block: 'center' })`)
     await new Promise((r) => setTimeout(r, 250))
     await captureScreenshot(cdp, 'fe-w6-uncertain-390x844.png')
+
+    // 失败后只保留警告：恢复/退场/账本重建/抢救 UI 与接口都必须消失。
+    const removedRecoveryHits = REMOVED_RECOVERY_UI_TEXTS.filter((text) => uncertainText.includes(text))
+    const uncertainPrimary = await cdp.eval(primaryDockButtonJs)
+    const resultActionLabel = await cdp.eval(`(() => {
+      const card = document.querySelector('[data-wps-result="upload"]')
+      const button = card?.querySelector('button')
+      return button ? (button.textContent || '').trim() : null
+    })()`)
+    const uploadCallsAfterUncertain = mock.wpsUploadCalls
+    await new Promise((r) => setTimeout(r, 600))
+    record(
+      'W6 uncertain 警告文案含「请先在 WPS 云端核对」与「重新预览」',
+      uncertainText.includes('请先在 WPS 云端核对') && uncertainText.includes('重新预览'),
+      nearText(uncertainText, '请先在 WPS 云端核对', 120),
+    )
+    record(
+      'W6 uncertain 结果卡片动作按钮是「重新预览」',
+      resultActionLabel === '重新预览',
+      'action=' + resultActionLabel,
+    )
+    record(
+      'W6 uncertain 失败后主操作变成「生成只读预览」（不再提供立即重传）',
+      uncertainPrimary?.count === 1 && uncertainPrimary.label === '生成只读预览' && uncertainPrimary.disabled === false,
+      JSON.stringify(uncertainPrimary),
+    )
+    record(
+      'W6 uncertain 失败后不再出现恢复/账本/重建/退场 UI',
+      removedRecoveryHits.length === 0,
+      'hits=' + JSON.stringify(removedRecoveryHits),
+    )
+    record(
+      'W6 uncertain 失败后 UI 不调用恢复/账本接口（0 次）',
+      mock.wpsRecoveryCalls === 0,
+      'recoveryCalls=' + mock.wpsRecoveryCalls,
+    )
+    record(
+      'W6 uncertain 失败后没有自动/额外危险上传（上传计数不再增长）',
+      mock.wpsUploadCalls === uploadCallsAfterUncertain,
+      'uploads=' + mock.wpsUploadCalls + ' expected=' + uploadCallsAfterUncertain,
+    )
 
     // W6-B：计划 1 行、实际未核实 → 不能显示“已更新 1 行”
     await runUploadFlow({
@@ -2823,6 +2781,13 @@ async function main() {
         && cloudUncertainSurface.label.includes('待核对'),
       JSON.stringify(cloudUncertainSurface),
     )
+    record(
+      'FE-1 uncertain 云文档权威详情用 WPS 口径（先在云端核对，不照抄闪时送“可再运行一次补单”）',
+      Boolean(cloudUncertainSurface)
+        && cloudUncertainSurface.detail.includes('请先在 WPS 云端核对')
+        && !cloudUncertainSurface.surfaceText.includes('可再运行一次补单'),
+      JSON.stringify(cloudUncertainSurface?.surfaceText || ''),
+    )
     const dangerousBeforeUpload = dangerousCalls()
     await runUploadFlow(uncertainUpload)
     const dangerousAfterUpload = dangerousCalls()
@@ -2846,9 +2811,10 @@ async function main() {
     )
     const afterUncertainText = await cdp.eval('document.body.innerText')
     record(
-      'FE-1 uncertain 主要动作指向核对/只读刷新，而不是“再次上传”',
+      'FE-1 uncertain 警告指向「先在 WPS 云端核对 + 重新预览」，而不是“再次上传”',
       !oneClickRerun.test((buttonsAfterUncertain || []).map((item) => item.label).join('|'))
-        && (afterUncertainText.includes('重新核对') || afterUncertainText.includes('只读核对'))
+        && afterUncertainText.includes('请先在 WPS 云端核对')
+        && afterUncertainText.includes('重新预览')
         && !afterUncertainText.includes('上传完成'),
       JSON.stringify({
         labels: (buttonsAfterUncertain || []).map((item) => item.label),
@@ -2901,7 +2867,7 @@ async function main() {
       JSON.stringify(reloadedUncertainSurface),
     )
 
-    // 复位：不能把本节的 mock 状态泄漏给后面的 W3 恢复流程。
+    // 复位：不能把本节的 mock 状态泄漏给后面的视口/日志场景。
     mock.operationStatus = null
     mock.operationStatusNetwork = false
     mock.wpsPreview = null
@@ -2909,688 +2875,7 @@ async function main() {
     mock.wpsUploadDelay = 0
     await reloadApp(cdp)
 
-    // ---------- 5e. W3：旧任务恢复/退场流程 ----------
-    enterScenario('5e W3 恢复流程')
-    const recoveryOp = {
-      operation_id: 'wps-1234567890abcdef', operation_ref: 'wps-op:abcdef123456',
-      status: 'uncertain', pending: true, cloud_checked: true,
-      created_at: '2026-09-20T09:00:00', updated_at: '2026-09-20T09:01:00',
-      target_date: '2026-09-20', target_refs: ['wps-target:abc123def456'], sheet_count: 1,
-      error_code: 'wps_recovery_uncertain', allowed_next_actions: ['manual_reconcile'],
-      manual_required: true,
-      sheets: [{
-        target_date: '2026-09-20', target_ref: 'wps-target:abc123def456',
-        status: 'uncertain', raw_status: 'uncertain', error_code: 'wps_recovery_uncertain',
-        allowed_next_actions: ['manual_reconcile'], manual_required: true,
-        cloud_checked: true, evidence: 'journal+cloud_read',
-      }],
-    }
-    const adminRecoveryStatus = {
-      ok: true, contract_version: 1, source: 'local_journal', read_only: true,
-      queried_cloud: false, contains_cloud_checked_records: true, scope: 'admin',
-      counts: { planned: 0, writing: 0, ledger_pending: 0, uncertain: 1, verified: 0, failed: 0, not_started: 0, retired_guarded: 0 },
-      next_action: 'manual_reconcile', error_code: 'wps_recovery_uncertain',
-      summary: {
-        operation_count: 1, pending_count: 1, uncertain_count: 1, failed_count: 0,
-        not_started_count: 0, retired_guarded_count: 0, has_pending: true, needs_review: true,
-        guidance: '存在不确定结果：请先只读核对云端与日志，不要直接重传',
-      },
-      operations: [recoveryOp], pending_operations: [recoveryOp],
-    }
-    mock.wpsRecovery = adminRecoveryStatus
-    mock.wpsResolveCalls = 0
-    mock.wpsResolveMaxActive = 0
-    mock.wpsResolvePayloads = []
-    mock.wpsResolveTimes = []
-    mock.wpsResolveResult = null
-    mock.wpsResolveDelay = 0
-    mock.wpsResolveNetwork = false
-    mock.wpsResolveForbidden = false
-
-    await reloadApp(cdp)
-    assert.ok(await ensureCloudPanel(cdp, '待核对批次（只读可见）'), '云文档页签/恢复卡片未出现')
-    const callsAfterRefresh = mock.wpsResolveCalls
-    record('W3 刷新/加载不会自动调用恢复写入', callsAfterRefresh === 0, `resolveCalls=${callsAfterRefresh}`)
-    const panelText = await cdp.eval('document.body.innerText')
-    record(
-      'W3 面板展示目标日期/操作标识/风险/允许动作',
-      documentTextIncludes(panelText, [
-        '目标日期 2026-09-20', 'wps-1234567890abcdef', '风险：', 'manual_reconcile', '人工只读核对',
-      ]),
-      `len=${panelText.length} ` + nearText(panelText, '待核对批次（只读可见）', 320),
-    )
-    assert.ok(await cdp.eval(clickButtonJs('恢复处置')), '找不到恢复处置按钮')
-    await cdp.waitFor(`document.body.innerText.includes('旧任务恢复/退场处置')`)
-    const dialogProbe = await cdp.eval(`(() => {
-      const dialog = document.querySelector('[role="dialog"]')
-      const text = document.body.innerText
-      const buttons = [...(dialog?.querySelectorAll('button') || [])].map((b) => (b.textContent || '').trim())
-      return {
-        text,
-        buttons,
-        decisions: [...(dialog?.querySelectorAll('input[type="radio"]') || [])].length,
-      }
-    })()`)
-    const dialogText = dialogProbe.text
-    // 「删除账本/直接重传」只允许出现在否定说明里，绝不允许作为可点按钮存在。
-    const shortcutButtons = (dialogProbe.buttons || []).filter((label) => /删除账本|删除日志|直接重传|强制清除|重新上传|重传/.test(label))
-    record(
-      'W3 弹窗展示目标日期/操作标识/风险/允许动作/无捷径',
-      documentTextIncludes(dialogText, [
-        '目标日期：', '2026-09-20', 'wps-1234567890abcdef', '操作引用：', '风险：',
-        '允许动作：', '退场不会解除同一目标日期',
-      ])
-        && dialogText.includes('没有「删除账本」或「直接重传」的捷径')
-        && shortcutButtons.length === 0
-        && dialogProbe.decisions >= 2,
-      `shortcutButtons=${JSON.stringify(shortcutButtons)} decisions=${dialogProbe.decisions}`,
-    )
-    const dialogFocus = await cdp.eval(`!!document.activeElement?.closest?.('[role="dialog"]')`)
-    record('W3 弹窗打开后焦点在弹窗内', dialogFocus === true)
-    await captureScreenshot(cdp, 'fe-w3-recovery-resolve-390x844.png')
-
-    // 本地校验：备注过短不提交
-    assert.ok(await cdp.eval(clickDialogRadioJs('keep')), '找不到 keep 决策单选项')
-    await new Promise((r) => setTimeout(r, 120))
-    assert.ok(await cdp.eval(setDialogInputJs('#wps-resolve-note', '短')), '无法写入备注')
-    assert.ok(await cdp.eval(setDialogInputJs('#wps-resolve-confirm', 'keep')), '无法写入确认串')
-    assert.ok((await cdp.eval(clickDialogButtonJs('提交处置')))?.ok, '找不到提交处置按钮')
-    await new Promise((r) => setTimeout(r, 250))
-    const shortNoteText = await cdp.eval('document.body.innerText')
-    record(
-      'W3 备注过短本地拦截，不发出请求',
-      shortNoteText.includes('至少 4 个字') && mock.wpsResolveCalls === 0,
-      `resolveCalls=${mock.wpsResolveCalls}`,
-    )
-
-    // 逐字确认不匹配
-    assert.ok(await cdp.eval(setDialogInputJs('#wps-resolve-note', '已人工只读核对云端排单表')), '无法写入备注')
-    assert.ok(await cdp.eval(setDialogInputJs('#wps-resolve-confirm', 'Keep')), '无法写入确认串')
-    assert.ok((await cdp.eval(clickDialogButtonJs('提交处置')))?.ok, '找不到提交处置按钮')
-    await new Promise((r) => setTimeout(r, 250))
-    record(
-      'W3 逐字确认不匹配本地拦截',
-      (await cdp.eval('document.body.innerText')).includes('请逐字输入') && mock.wpsResolveCalls === 0,
-      `resolveCalls=${mock.wpsResolveCalls}`,
-    )
-
-    // 选择 retire_guarded：必须勾选“已核对云端表结构”
-    assert.ok(await cdp.eval(clickDialogRadioJs('retire_guarded')), '找不到 retire_guarded 单选项')
-    await new Promise((r) => setTimeout(r, 150))
-    assert.ok(await cdp.eval(setDialogInputJs('#wps-resolve-note', '已人工只读核对云端排单表，仍无法判定')), '无法写入备注')
-    assert.ok(await cdp.eval(setDialogInputJs('#wps-resolve-confirm', 'retire_guarded')), '无法写入确认串')
-    assert.ok((await cdp.eval(clickDialogButtonJs('提交处置')))?.ok, '找不到提交处置按钮')
-    await new Promise((r) => setTimeout(r, 250))
-    record(
-      'W3 退场未确认已核对表结构时被拦截',
-      (await cdp.eval('document.body.innerText')).includes('已人工核对云端表结构') && mock.wpsResolveCalls === 0,
-      `resolveCalls=${mock.wpsResolveCalls}`,
-    )
-
-    // 正常提交 + 双击保护
-    assert.ok(await cdp.eval(clickDialogCheckboxJs), '无法勾选结构确认')
-    await new Promise((r) => setTimeout(r, 120))
-    mock.wpsResolveDelay = 500
-    const burst = await cdp.eval(`(() => {
-      const roots = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')]
-      for (const root of roots) {
-        const target = [...root.querySelectorAll('button')].find((el) => !el.disabled && (el.textContent || '').includes('提交处置'))
-        if (!target) continue
-        target.click(); target.click(); target.click()
-        return true
-      }
-      return false
-    })()`)
-    assert.ok(burst, '找不到提交处置按钮')
-    await cdp.waitFor(`document.body.innerText.includes('恢复处置：')`, 6000)
-    await new Promise((r) => setTimeout(r, 400))
-    record(
-      'W3 双击/连点只提交一次且无并发',
-      mock.wpsResolveCalls === 1 && mock.wpsResolveMaxActive === 1,
-      `calls=${mock.wpsResolveCalls} maxActive=${mock.wpsResolveMaxActive}`,
-    )
-    const retiredOutcome = await cdp.eval('document.body.innerText')
-    record(
-      'W3 退场结果仍保留阻断且不声称可重传',
-      retiredOutcome.includes('已带审计退场') && retiredOutcome.includes('阻断仍然保留')
-        && retiredOutcome.includes('不会因此变成可以重传') && !retiredOutcome.includes('强制清除'),
-      '',
-    )
-    record(
-      'W3 请求体是契约对象（含 confirm/note/confirm_structure_checked）',
-      (() => {
-        const payload = mock.wpsResolvePayloads[0]
-        return payload && payload.operation_id === 'wps-1234567890abcdef'
-          && payload.decision === 'retire_guarded'
-          && payload.confirm === 'retire_guarded'
-          && String(payload.note || '').length >= 4
-          && payload.confirm_structure_checked === true
-          && !('delete_ledger' in payload) && !('force' in payload)
-      })(),
-      JSON.stringify(mock.wpsResolvePayloads[0] || null),
-    )
-    // 服务端 403 拒绝：保留阻断、不显示成功、不重试
-    enterScenario('5e 恢复处置：服务端 403 拒绝（预期）')
-    mock.wpsResolveForbidden = true
-    mock.wpsResolveDelay = 0
-    const callsBeforeResolveForbidden = mock.wpsResolveCalls
-    assert.ok(await cdp.eval(clickButtonJs('恢复处置')), '找不到恢复处置按钮')
-    await cdp.waitFor(`document.body.innerText.includes('旧任务恢复/退场处置')`)
-    assert.ok(await cdp.eval(clickDialogRadioJs('keep')), '找不到 keep 决策单选项')
-    assert.ok(await cdp.eval(setDialogInputJs('#wps-resolve-note', '已人工只读核对云端排单表')), '无法写入备注')
-    assert.ok(await cdp.eval(setDialogInputJs('#wps-resolve-confirm', 'keep')), '无法写入确认串')
-    assert.ok((await cdp.eval(clickDialogButtonJs('提交处置')))?.ok, '找不到提交处置按钮')
-    await cdp.waitFor(`document.body.innerText.includes('恢复处置：')`, 6000)
-    await new Promise((r) => setTimeout(r, 900))
-    const resolveForbiddenText = await cdp.eval('document.body.innerText')
-    record(
-      'W3 被 403 拒绝时无法提交恢复：准确提示 + 阻断保持 + 不显示成功',
-      resolveForbiddenText.includes('恢复请求被服务端拒绝')
-        && resolveForbiddenText.includes('阻断仍然保留')
-        && !resolveForbiddenText.includes('恢复处置：已带审计退场')
-        && mock.wpsResolveCalls - callsBeforeResolveForbidden === 1,
-      `delta=${mock.wpsResolveCalls - callsBeforeResolveForbidden}`,
-    )
-    mock.wpsResolveForbidden = false
-
-    // 网络失败：不误报成功、自动不重试、保留阻断
-    enterScenario('5e 恢复处置：网络失败（故意断网）')
-    mock.wpsResolveNetwork = true
-    const callsBeforeNetwork = mock.wpsResolveCalls
-    assert.ok(await cdp.eval(clickButtonJs('恢复处置')), '找不到恢复处置按钮')
-    await cdp.waitFor(`document.body.innerText.includes('旧任务恢复/退场处置')`)
-    assert.ok(await cdp.eval(clickDialogRadioJs('keep')), '找不到 keep 决策单选项')
-    assert.ok(await cdp.eval(setDialogInputJs('#wps-resolve-note', '已人工只读核对云端排单表')), '无法写入备注')
-    assert.ok(await cdp.eval(setDialogInputJs('#wps-resolve-confirm', 'keep')), '无法写入确认串')
-    assert.ok((await cdp.eval(clickDialogButtonJs('提交处置')))?.ok, '找不到提交处置按钮')
-    await cdp.waitFor(`document.body.innerText.includes('恢复请求结果未知')`, 6000)
-    await new Promise((r) => setTimeout(r, 1200))
-    const networkText = await cdp.eval('document.body.innerText')
-    record(
-      'W3 网络失败：结果未知 + 阻断保持 + 不显示成功',
-      networkText.includes('恢复请求结果未知（阻断保持）') && networkText.includes('阻断仍然保留')
-        && !networkText.includes('恢复处置：已带审计退场'),
-      '',
-    )
-    record(
-      'W3 网络失败后不自动重试（只发生一次请求）',
-      mock.wpsResolveCalls - callsBeforeNetwork === 1,
-      `delta=${mock.wpsResolveCalls - callsBeforeNetwork} maxActive=${mock.wpsResolveMaxActive} times=${JSON.stringify(mock.wpsResolveTimes.slice(-4))}`,
-    )
-    mock.wpsResolveNetwork = false
-
-    // 幂等重复提交：already_retired / changed=false 不重复写盘
-    mock.wpsResolveResult = {
-      ok: true, status: 'already_retired', code: 'already_retired', reason: '该批次此前已退场',
-      next_action: 'manual_reconcile', cloud_write: false, changed: false, verified_on_disk: true,
-      scope: { operation_ref: 'wps-op:abcdef123456', target_dates: ['2026-09-20'], target_refs: [], sheet_count: 1, guard_retained: true, blocking: 'retired_guarded' },
-      audit: { actor: 'admin@example.com', at: '2026-09-20T10:05:00', decision: 'retire_guarded', note_recorded: true, duplicate: true, effects: { cloud_written: false, guard_retained: true, blocking: 'retired_guarded', auto_retry_allowed: false } },
-    }
-    assert.ok(await cdp.eval(clickButtonJs('恢复处置')), '找不到恢复处置按钮')
-    await cdp.waitFor(`document.body.innerText.includes('旧任务恢复/退场处置')`)
-    assert.ok(await cdp.eval(clickDialogRadioJs('keep')), '找不到 keep 决策单选项')
-    assert.ok(await cdp.eval(setDialogInputJs('#wps-resolve-note', '已人工只读核对云端排单表')), '无法写入备注')
-    assert.ok(await cdp.eval(setDialogInputJs('#wps-resolve-confirm', 'keep')), '无法写入确认串')
-    assert.ok((await cdp.eval(clickDialogButtonJs('提交处置')))?.ok, '找不到提交处置按钮')
-    await cdp.waitFor(`document.body.innerText.includes('此前已退场')`, 6000)
-    const idempotentText = await cdp.eval('document.body.innerText')
-    record(
-      'W3 重复提交幂等：不重复写盘且阻断保持',
-      idempotentText.includes('此前已退场') && idempotentText.includes('没有再次写盘')
-        && idempotentText.includes('阻断仍然保留'),
-      '',
-    )
-    mock.wpsResolveResult = null
-
-    // 恢复面板：retired_guarded 计数与专用文案
-    mock.wpsRecovery = {
-      ...adminRecoveryStatus,
-      counts: { ...adminRecoveryStatus.counts, uncertain: 0, retired_guarded: 1 },
-      pending_operations: [],
-      operations: [{ ...recoveryOp, status: 'retired_guarded', pending: false, error_code: 'wps_recovery_retired_guarded', allowed_next_actions: ['manual_reconcile'] }],
-      summary: { ...adminRecoveryStatus.summary, pending_count: 0, uncertain_count: 0, retired_guarded_count: 1, has_pending: false, needs_review: true },
-    }
-    await reloadApp(cdp)
-    assert.ok(await ensureCloudPanel(cdp, '已带审计退场'), 'retired_guarded 卡片未出现')
-    const retiredCardText = await cdp.eval('document.body.innerText')
-    record(
-      'W3 retired_guarded 展示计数与保留闸门文案',
-      retiredCardText.includes('已带审计退场（闸门保留）')
-        && retiredCardText.includes('仍被防重复闸门阻断')
-        && retiredCardText.includes('证实之前不能重新上传'),
-      nearText(retiredCardText, '已带审计退场') + ' | ' + nearText(retiredCardText, '待核对批次'),
-    )
-
-    // 恢复状态失败关闭：journal 版本不受支持
-    mock.wpsRecovery = {
-      ok: false, contract_version: 1, source: 'local_journal', read_only: true,
-      queried_cloud: false, contains_cloud_checked_records: false, scope: 'admin',
-      counts: {}, next_action: 'fix_journal', error_code: 'wps_recovery_journal_unreadable',
-      summary: {
-        operation_count: 0, pending_count: 0, uncertain_count: 0, failed_count: 0,
-        not_started_count: 0, has_pending: false, needs_review: true,
-        guidance: '恢复状态不可用：本地账本/意图日志不可用：不支持的意图日志版本',
-      },
-    }
-    await reloadApp(cdp)
-    assert.ok(await ensureCloudPanel(cdp, '本地恢复记录不可读'), '恢复记录不可读卡片未出现')
-    const journalRecoveryText = await cdp.eval('document.body.innerText')
-    record(
-      'recovery 状态 journal 版本不受支持：失败关闭 + 明确下一步',
-      journalRecoveryText.includes('本地日志版本不受支持')
-        && journalRecoveryText.includes('不要删除日志')
-        && !journalRecoveryText.includes('本地恢复记录：无待核对批次'),
-      `len=${journalRecoveryText.length} text=${JSON.stringify(journalRecoveryText.slice(0, 300))}`,
-    )
-
-    // 恢复状态失败关闭：持久化失败
-    mock.wpsRecovery = {
-      ...mock.wpsRecovery,
-      error_code: 'journal_write_failed',
-      summary: { ...mock.wpsRecovery.summary, guidance: '本地日志写入失败：journal_save_failed' },
-    }
-    await reloadApp(cdp)
-    assert.ok(await ensureCloudPanel(cdp, '本地恢复记录不可读'), '恢复记录不可读卡片未出现')
-    record(
-      'recovery 状态持久化失败：说明写入失败与下一步',
-      (await cdp.eval('document.body.innerText')).includes('本地日志持久化失败'),
-      '',
-    )
-
-    // ---------- 5f. 弹窗窄屏/横屏/长错误提示/可达性 ----------
-    enterScenario('5f 弹窗窄屏横屏可达性')
-    mock.wpsRecovery = adminRecoveryStatus
-    await reloadApp(cdp)
-    for (const [label, width, height] of [['360x800', 360, 800], ['800x450 landscape', 800, 450]]) {
-      await cdp.viewport(width, height)
-      assert.ok(await ensureCloudPanel(cdp, '待核对批次（只读可见）'), `云文档页签/恢复卡片未出现 ${label}`)
-      if (await cdp.eval(clickButtonJs('恢复处置'))) {
-        await cdp.waitFor(`document.body.innerText.includes('旧任务恢复/退场处置')`)
-        await new Promise((r) => setTimeout(r, 250))
-        const dialogLayout = await cdp.eval(`(() => {
-          const dialog = document.querySelector('[role="dialog"]')
-          const sw = document.documentElement.scrollWidth, iw = window.innerWidth
-          const submit = [...(dialog?.querySelectorAll('button') || [])].find((b) => (b.textContent || '').includes('提交处置'))
-          const before = submit?.getBoundingClientRect()
-          const dr0 = dialog?.getBoundingClientRect()
-          // 真实可达性：把弹窗滚到底，再看按钮是否完整落在弹窗可视区内。
-          // 不能只判断 overflowY !== 'visible'（对 overflow-y-auto 恒为真，等于没断言）。
-          if (dialog) dialog.scrollTop = dialog.scrollHeight
-          const after = submit?.getBoundingClientRect()
-          const dr = dialog?.getBoundingClientRect()
-          return {
-            overflow: sw <= iw + 1,
-            dialogOverflow: dr ? dr.width <= iw + 1 : false,
-            found: !!submit,
-            // 滚动前按钮确实在弹窗可视区之外（证明"滚到底"这一步是必需的）
-            wasBelowFold: !!(before && dr0 && before.bottom > dr0.bottom + 1),
-            reachable: !!(after && dr && after.width > 0 && after.height > 0
-              && after.top >= dr.top - 1 && after.bottom <= dr.bottom + 1),
-            bottom: after ? after.bottom : -1,
-            inner: window.innerHeight,
-          }
-        })()`)
-        // wasBelowFold 只作为**证据**保留，不能进通过条件：它证明「滚到底」这一步在内容
-        // 确实超出时是必要的；但内容刚好放得下（按钮本来就可见）是更好的结果，按字体度量
-        // 差几像素就会误判。3.6.14 第一次把本门禁接进 CI 时就是它报的 249 PASS / 1 FAIL。
-        record(
-          `W3 恢复弹窗 ${label} 无横向溢出且操作区可达（必要时滚到底后按钮完整可见）`,
-          dialogLayout.overflow && dialogLayout.dialogOverflow && dialogLayout.found
-            && dialogLayout.reachable,
-          JSON.stringify(dialogLayout),
-        )
-        if (label.includes('landscape')) await captureScreenshot(cdp, 'fe-w3-resolve-landscape-800x450.png')
-        await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 })
-        await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 })
-        await new Promise((r) => setTimeout(r, 300))
-        record(
-          `W3 恢复弹窗 ${label} 可用 Escape 关闭`,
-          (await cdp.eval(`!document.body.innerText.includes('旧任务恢复/退场处置')`)) === true,
-          '',
-        )
-      } else {
-        record(`W3 恢复弹窗 ${label} 无横向溢出且操作区可达`, false, '找不到恢复处置按钮')
-      }
-    }
-
-    // 长错误提示：不得横向溢出
-    await cdp.viewport(360, 800)
-    mock.wpsRecovery = {
-      ...adminRecoveryStatus,
-      summary: {
-        ...adminRecoveryStatus.summary,
-        guidance: '存在不确定结果：' + '请先只读核对云端与日志，不要直接重传；'.repeat(12),
-      },
-    }
-    await reloadApp(cdp)
-    assert.ok(await ensureCloudPanel(cdp, '请先只读核对云端与日志'), '超长指引卡片未出现')
-    const longTextLayout = await cdp.eval(`(() => {
-      const text = document.body.innerText
-      return {
-        sw: document.documentElement.scrollWidth,
-        iw: window.innerWidth,
-        repeats: (text.match(/请先只读核对云端与日志/g) || []).length,
-        len: text.length,
-      }
-    })()`)
-    // 与第 1 节的布局断言区分：这里额外证明"超长指引确实渲染出来了"，
-    // 否则一条普通的无溢出断言与前面重复、等于没测。
-    record(
-      'W3 超长恢复指引确实渲染（≥6 段重复文案）且不横向溢出（360 窄屏）',
-      longTextLayout.repeats >= 6 && longTextLayout.sw <= longTextLayout.iw + 1,
-      JSON.stringify(longTextLayout),
-    )
-
     // ---------- 6. 缩小可视视口：底部主按钮仍可达、无横向溢出 ----------
-    // ---------- 5g. 第 14 项：账本兜底（重建 + 抢救） ----------
-    enterScenario('5g 账本兜底（重建与抢救）')
-    const ledgerQuietCounts = {
-      planned: 0, writing: 0, ledger_pending: 0, uncertain: 0,
-      verified: 0, failed: 0, not_started: 0, retired_guarded: 0,
-    }
-    const ledgerQuietSummary = {
-      operation_count: 0, pending_count: 0, uncertain_count: 0, failed_count: 0,
-      not_started_count: 0, retired_guarded_count: 0, has_pending: false,
-      needs_review: false, guidance: '没有待恢复的操作',
-    }
-    const ledgerSalvageProposalCounts = {
-      kept_people: 12, kept_batches: 3, dropped_people: 2, dropped_batches: 1, dropped_total: 3,
-    }
-    const ledgerSalvageDropped = [{
-      scope: 'person', day: '2026-09-20', file: 'F1',
-      name: '王五', phone: '333', reason: '账本 slots 值非法',
-    }]
-    // 页面里可能同时挂着多个 dialog 根（其它页签、已关闭的弹窗），而脚本自带的
-    // setDialogInputJs / clickDialogCheckboxJs 只认**第一个**根 —— 这里改成「在所有
-    // 根里找目标、优先可见的那个」，与本脚本 clickDialogButtonJs 的判据一致。
-    const ledgerDialogRootsJs = `[...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')]`
-    const ledgerPickVisibleJs = (hits) => `((${hits}).find((item) => {
-      const r = item.root.getBoundingClientRect()
-      return r.width > 0 && r.height > 0
-    }) || (${hits})[0])`
-    const ledgerConfirmDisabledProbe = (label) => `(() => {
-      const hits = []
-      for (const root of ${ledgerDialogRootsJs}) {
-        const button = [...root.querySelectorAll('button')]
-          .find((el) => (el.textContent || '').replace(/\\s+/g, '').includes(${JSON.stringify(label)}))
-        if (button) hits.push({ button, root })
-      }
-      if (!hits.length) return null
-      return ${ledgerPickVisibleJs('hits')}.button.disabled
-    })()`
-    const ledgerClickDialogCheckboxJs = `(() => {
-      const hits = []
-      for (const root of ${ledgerDialogRootsJs}) {
-        const box = root.querySelector('input[type="checkbox"]')
-        if (box) hits.push({ box, root })
-      }
-      if (!hits.length) return false
-      const box = ${ledgerPickVisibleJs('hits')}.box
-      if (!box.checked) box.click()
-      return box.checked === true
-    })()`
-    const ledgerSetDialogInput = (selector, value) => `(() => {
-      const hits = []
-      for (const root of ${ledgerDialogRootsJs}) {
-        const el = root.querySelector(${JSON.stringify(selector)})
-        if (el) hits.push({ el, root })
-      }
-      if (!hits.length) return { ok: false, reason: 'not_found' }
-      const el = ${ledgerPickVisibleJs('hits')}.el
-      const proto = Object.getPrototypeOf(el)
-      const desc = Object.getOwnPropertyDescriptor(proto, 'value')
-        || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')
-      if (!desc || typeof desc.set !== 'function') return { ok: false, reason: 'no_setter' }
-      desc.set.call(el, ${JSON.stringify(value)})
-      el.dispatchEvent(new Event('input', { bubbles: true }))
-      el.dispatchEvent(new Event('change', { bubbles: true }))
-      return { ok: el.value === ${JSON.stringify(value)} }
-    })()`
-    const ledgerDialogDiag = () => `(() => JSON.stringify(${ledgerDialogRootsJs}.map((root) => {
-      const r = root.getBoundingClientRect()
-      return {
-        w: Math.round(r.width), h: Math.round(r.height),
-        buttons: [...root.querySelectorAll('button')].map((el) => (el.textContent || '').trim().slice(0, 12)),
-      }
-    })))()`
-    mock.wpsSalvageDelay = 0
-    mock.wpsSalvageForbidden = false
-    mock.wpsRebuildDelay = 0
-
-    // ① 账本正常：这张卡片不该出现（第一次用的人不该被吓一跳）
-    mock.wpsRecovery = {
-      ok: true, contract_version: 1, source: 'local_journal', read_only: true,
-      queried_cloud: false, contains_cloud_checked_records: false, scope: 'admin',
-      counts: ledgerQuietCounts, next_action: 'none', error_code: '',
-      summary: ledgerQuietSummary, operations: [], pending_operations: [],
-      ledger_state: 'ok', ledger_lost: false,
-    }
-    await reloadApp(cdp)
-    await ensureCloudPanel(cdp, '本地恢复记录：无待核对批次')
-    const ledgerQuietText = await cdp.eval('document.body.innerText')
-    record(
-      '账本正常时账本兜底卡片不出现',
-      !ledgerQuietText.includes('本地账本不可信') && !ledgerQuietText.includes('查看重建提案'),
-      `hasCard=${ledgerQuietText.includes('本地账本不可信')}`,
-    )
-
-    // ② 账本损坏：卡片出现，给「重建」与「抢救」两个只读入口，且没有捷径按钮
-    mock.wpsRecovery = { ...mock.wpsRecovery, ledger_state: 'corrupt' }
-    mock.wpsSalvageResult = {
-      ok: true, status: 'salvage_ready', code: 'salvage_ready', reason: '',
-      contract_version: 1, read_only: true, cloud_write: false, ledger_write: false,
-      changed: false, ledger_path: '/tmp/synthetic-ledger.json', backup: '',
-      counts: ledgerSalvageProposalCounts, dropped: ledgerSalvageDropped, warnings: [],
-      next_action: "wps_ledger_salvage(confirm='salvage')",
-    }
-    await reloadApp(cdp)
-    await ensureCloudPanel(cdp, '本地账本不可信：可以重建锚点')
-    const ledgerCorruptText = await cdp.eval('document.body.innerText')
-    const ledgerShortcutButtons = await cdp.eval(`(() => [...document.querySelectorAll('button')]
-      .map((el) => (el.textContent || '').trim())
-      .filter((label) => /删除账本|删除日志|直接重传|强制清除/.test(label)))()`)
-    record(
-      '账本损坏时给出重建与抢救两个入口，且没有捷径按钮',
-      ledgerCorruptText.includes('本地账本损坏') && ledgerCorruptText.includes('查看重建提案（只读）')
-        && ledgerCorruptText.includes('先试着抢救账本（只读清单）')
-        && ledgerCorruptText.includes('cloud_write=false')
-        && (ledgerShortcutButtons || []).length === 0,
-      `shortcuts=${JSON.stringify(ledgerShortcutButtons || [])}`,
-    )
-
-    // ③ 抢救：只读清单 → 勾选 + 逐字确认 → 写回
-    const ledgerSalvageCallsBefore = mock.wpsSalvageCalls
-    assert.ok(await cdp.eval(clickButtonJs('先试着抢救账本（只读清单）')), '找不到抢救按钮')
-    await cdp.waitFor(`document.body.innerText.includes('抢救本地账本：只丢坏掉的那几条')`)
-    const ledgerSalvageDialogText = await cdp.eval('document.body.innerText')
-    record('账本兜底：弹窗环境自检（诊断）', true, await cdp.eval(ledgerDialogDiag()))
-    record(
-      '抢救弹窗逐条列出会丢掉谁、为什么丢',
-      ledgerSalvageDialogText.includes('留下 12 人 · 丢掉 3 条')
-        && ledgerSalvageDialogText.includes('王五（333）')
-        && ledgerSalvageDialogText.includes('账本 slots 值非法')
-        && ledgerSalvageDialogText.includes('还有 2 条没有展开')
-        && mock.wpsSalvageCalls - ledgerSalvageCallsBefore === 1,
-      `calls=${mock.wpsSalvageCalls - ledgerSalvageCallsBefore}`,
-    )
-    record(
-      '只读清单阶段的请求体是空的（没带任何确认参数）',
-      mock.wpsSalvagePayloads[mock.wpsSalvagePayloads.length - 1] === null,
-      JSON.stringify(mock.wpsSalvagePayloads[mock.wpsSalvagePayloads.length - 1] ?? null),
-    )
-    record(
-      '没勾同意框时「确认抢救」点不动',
-      (await cdp.eval(ledgerConfirmDisabledProbe('确认抢救'))) === true,
-      `disabled=${await cdp.eval(ledgerConfirmDisabledProbe('确认抢救'))}`,
-    )
-    assert.ok(await cdp.eval(ledgerClickDialogCheckboxJs), '无法勾选同意框')
-    await new Promise((r) => setTimeout(r, 120))
-
-    // 逐字确认先在**客户端**拦一道：写错就不发请求
-    mock.wpsSalvageResult = {
-      ok: false, status: 'rejected', code: 'confirmation_required',
-      reason: '必须逐字确认：confirm 必须等于 salvage', changed: false,
-    }
-    const ledgerSalvageCallsBeforeWrong = mock.wpsSalvageCalls
-    assert.ok((await cdp.eval(ledgerSetDialogInput('#wps-salvage-note', '账本损坏，按清单抢救')))?.ok, '无法写入说明')
-    assert.ok((await cdp.eval(ledgerSetDialogInput('#wps-salvage-confirm', 'salvag')))?.ok, '无法写入确认串')
-    assert.ok((await cdp.eval(clickDialogButtonJs('确认抢救')))?.ok, '找不到确认抢救按钮')
-    await cdp.waitFor(`document.body.innerText.includes('必须逐字输入 salvage 才能抢救账本')`, 4000)
-    const ledgerClientGateText = await cdp.eval('document.body.innerText')
-    record(
-      '确认词写错时客户端先拦一道：一次请求都不发',
-      ledgerClientGateText.includes('必须逐字输入 salvage 才能抢救账本')
-        && mock.wpsSalvageCalls - ledgerSalvageCallsBeforeWrong === 0,
-      `calls=${mock.wpsSalvageCalls - ledgerSalvageCallsBeforeWrong}`,
-    )
-
-    // 服务端拒绝（确认词写对，服务端仍拒）：弹窗留着、显示原因、不显示成功、不自动重试
-    const ledgerSalvageCallsBeforeReject = mock.wpsSalvageCalls
-    assert.ok((await cdp.eval(ledgerSetDialogInput('#wps-salvage-confirm', 'salvage')))?.ok, '无法写入确认串')
-    assert.ok((await cdp.eval(clickDialogButtonJs('确认抢救')))?.ok, '找不到确认抢救按钮')
-    await cdp.waitFor(`document.body.innerText.includes('必须逐字确认：confirm 必须等于 salvage')`, 6000)
-    await new Promise((r) => setTimeout(r, 300))
-    const ledgerRefusedText = await cdp.eval('document.body.innerText')
-    record(
-      '服务端拒绝时弹窗留着、显示原因、不显示成功',
-      ledgerRefusedText.includes('必须逐字确认：confirm 必须等于 salvage')
-        && ledgerRefusedText.includes('确认抢救')
-        && !ledgerRefusedText.includes('账本已抢救')
-        && mock.wpsSalvageCalls - ledgerSalvageCallsBeforeReject === 1,
-      `calls=${mock.wpsSalvageCalls - ledgerSalvageCallsBeforeReject}`,
-    )
-    record(
-      '提交的请求体是契约对象（confirm/note，没有别的字段）',
-      (() => {
-        const payload = mock.wpsSalvagePayloads[mock.wpsSalvagePayloads.length - 1]
-        return payload && payload.confirm === 'salvage'
-          && String(payload.note || '').length >= 4
-          && Object.keys(payload).sort().join(',') === 'confirm,note'
-      })(),
-      JSON.stringify(mock.wpsSalvagePayloads[mock.wpsSalvagePayloads.length - 1] || null),
-    )
-
-    // 正确提交 + 双击保护
-    mock.wpsSalvageResult = {
-      ok: true, status: 'salvaged', code: 'salvaged', reason: '',
-      contract_version: 1, read_only: false, cloud_write: false, ledger_write: true,
-      changed: true, verified_on_disk: true, ledger_state: 'ok', ledger_lost: false,
-      ledger_path: '/tmp/synthetic-ledger.json',
-      backup: '/tmp/synthetic-ledger.json.pre-salvage-abc123def456',
-      counts: ledgerSalvageProposalCounts, dropped: ledgerSalvageDropped, warnings: [],
-      next_action: 'repreview',
-      audit: {
-        actor: 'local-admin', at: '2026-09-20T10:00:00', note_recorded: true,
-        dropped_people: 2, dropped_batches: 1,
-        effects: { cloud_written: false, ledger_written: true },
-      },
-    }
-    mock.wpsSalvageMaxActive = 0
-    const ledgerSalvageCallsBeforeBurst = mock.wpsSalvageCalls
-    mock.wpsSalvageDelay = 500
-    const ledgerSalvageBurst = await cdp.eval(burstDialogButtonJs('确认抢救', 3))
-    assert.ok(ledgerSalvageBurst && ledgerSalvageBurst.ok, '找不到确认抢救按钮')
-    await cdp.waitFor(`document.body.innerText.includes('账本已抢救')`, 8000)
-    await new Promise((r) => setTimeout(r, 400))
-    record(
-      '抢救双击/连点只提交一次且无并发',
-      mock.wpsSalvageCalls - ledgerSalvageCallsBeforeBurst === 1 && mock.wpsSalvageMaxActive === 1,
-      `calls=${mock.wpsSalvageCalls - ledgerSalvageCallsBeforeBurst} maxActive=${mock.wpsSalvageMaxActive}`,
-    )
-    const ledgerSalvagedText = await cdp.eval('document.body.innerText')
-    record(
-      '抢救成功说清原件留档、没写云端、阻断仍然保留',
-      ledgerSalvagedText.includes('原件已留档') && ledgerSalvagedText.includes('云端一个格子都没动')
-        && ledgerSalvagedText.includes('阻断仍然保留') && !ledgerSalvagedText.includes('删除账本'),
-      '',
-    )
-    mock.wpsSalvageDelay = 0
-
-    // ④ 重建：只读提案 → 勾选 + 逐字 rebuild → 写回
-    mock.wpsRebuildResult = {
-      ok: true, status: 'rebuild_ready', code: '', reason: '',
-      contract_version: 1, read_only: true, cloud_write: false, ledger_write: false,
-      next_action: "wps_ledger_rebuild(confirm='rebuild')",
-      target_date: '2026-09-20', test_mode: true,
-      ledger_state: 'corrupt', ledger_lost: false,
-      ledger_path: '/tmp/synthetic-ledger.json', fingerprint: 'f'.repeat(64),
-      counts: {
-        mark_synced: 1, leave_empty: 1, cloud_person_absent: 1, cloud_cell_marked: 1,
-        cloud_cell_empty: 0, rows: 2, people: 1, sheets: 1, skipped_sheets: 0,
-      },
-      tables: [{
-        sheet: '东湖中餐', file_id: 'F1', target_date: '2026-09-20', skipped_reason: '',
-        counts: { mark_synced: 1, leave_empty: 1, rows: 2, people: 1 },
-        rows: [
-          { name: '合成客户', phone: '13800000000', slot: 1, local_meals: 2, cloud_present: true,
-            cell_marked: true, cell_value: '1', decision: 'mark_synced',
-            reason: 'cloud_cell_marked', anchor: 2, order_no: 'A-1', row: 3 },
-          { name: '新人', phone: '222', slot: 1, local_meals: 1, cloud_present: false,
-            cell_marked: false, cell_value: '', decision: 'leave_empty',
-            reason: 'cloud_person_absent', anchor: 0, order_no: '', row: 0 },
-        ],
-      }],
-      warnings: [], text: '',
-    }
-    await reloadApp(cdp)
-    await ensureCloudPanel(cdp, '查看重建提案（只读）')
-    const ledgerRebuildCallsBefore = mock.wpsRebuildCalls
-    assert.ok(await cdp.eval(clickButtonJs('查看重建提案（只读）')), '找不到重建按钮')
-    await cdp.waitFor(`document.body.innerText.includes('按云端现状重建本批账本锚点')`)
-    const ledgerRebuildDialogText = await cdp.eval('document.body.innerText')
-    record(
-      '重建弹窗逐行列出判断结果，并说明宁漏勿重',
-      ledgerRebuildDialogText.includes('记「已入账」')
-        && ledgerRebuildDialogText.includes('云端还没有这个人')
-        && ledgerRebuildDialogText.includes('宁漏勿重')
-        && mock.wpsRebuildCalls - ledgerRebuildCallsBefore === 1,
-      `calls=${mock.wpsRebuildCalls - ledgerRebuildCallsBefore}`,
-    )
-    record(
-      '没勾同意框时「确认重建」点不动',
-      (await cdp.eval(ledgerConfirmDisabledProbe('确认重建'))) === true,
-      `disabled=${await cdp.eval(ledgerConfirmDisabledProbe('确认重建'))}`,
-    )
-    assert.ok(await cdp.eval(ledgerClickDialogCheckboxJs), '无法勾选同意框')
-    await new Promise((r) => setTimeout(r, 120))
-    assert.ok((await cdp.eval(ledgerSetDialogInput('#wps-rebuild-note', '账本损坏，按云端现状重建')))?.ok, '无法写入说明')
-    assert.ok((await cdp.eval(ledgerSetDialogInput('#wps-rebuild-confirm', 'rebuild')))?.ok, '无法写入确认串')
-    mock.wpsRebuildResult = {
-      ok: true, status: 'rebuilt', code: 'rebuilt',
-      reason: '已按云端现状重建本批锚点，未写云端', changed: true,
-      verified_on_disk: true, cloud_write: false, ledger_write: true,
-      written_people: 1, written_slots: 1,
-      ledger_state: 'ok', ledger_lost: false,
-      backup: '/tmp/synthetic-ledger.json.pre-rebuild-abc123def456',
-      counts: { mark_synced: 1, leave_empty: 1, cloud_person_absent: 1, cloud_cell_marked: 1,
-                cloud_cell_empty: 0, rows: 2, people: 1, sheets: 1, skipped_sheets: 0 },
-      fingerprint: 'f'.repeat(64),
-      audit: {
-        actor: 'local-admin', at: '2026-09-20T10:00:00', note_recorded: true,
-        effects: { cloud_written: false, ledger_written: true, replaced_corrupt: false },
-      },
-    }
-    assert.ok((await cdp.eval(clickDialogButtonJs('确认重建')))?.ok, '找不到确认重建按钮')
-    await cdp.waitFor(`document.body.innerText.includes('账本锚点已重建')`, 8000)
-    const ledgerRebuiltText = await cdp.eval('document.body.innerText')
-    record(
-      '重建提交的请求体是契约对象（confirm/note/expected_fingerprint 三样）',
-      (() => {
-        const payload = mock.wpsRebuildPayloads[mock.wpsRebuildPayloads.length - 1]
-        return payload && payload.confirm === 'rebuild'
-          && String(payload.note || '').length >= 4
-          && typeof payload.expected_fingerprint === 'string'
-          && payload.expected_fingerprint.length === 64
-          && Object.keys(payload).sort().join(',') === 'confirm,expected_fingerprint,note'
-      })(),
-      JSON.stringify(mock.wpsRebuildPayloads[mock.wpsRebuildPayloads.length - 1] || null),
-    )
-    record(
-      '重建成功说清人数、槽位与没写云端',
-      ledgerRebuiltText.includes('已写入 1 人 / 1 个槽位') && ledgerRebuiltText.includes('云端一个格子都没动'),
-      '',
-    )
-
     enterScenario('6 缩小可视视口')
     await cdp.viewport(390, 430)
     await new Promise((r) => setTimeout(r, 300))

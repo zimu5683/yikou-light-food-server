@@ -72,7 +72,7 @@ const JOURNAL_COPY: Record<Exclude<JournalIssue, ''>, { title: string; detail: s
   corrupt: {
     title: '本地账本/意图日志损坏或不可读',
     detail: '本地恢复日志无法解析，服务端为保证不重复写入已拒绝本次操作；本次没有写云端。',
-    nextStep: '按实际问题走对应入口：账本问题走「账本锚点重建」（只改本地账本、不写云端），旧任务问题走「旧任务恢复/退场」；处理前不要重新上传或补发。',
+    nextStep: '本地数据需要人工修复后才能继续上传；修复前不要重新上传或补发，也不要删除账本/日志。',
   },
   version_unsupported: {
     title: '本地日志版本不受支持',
@@ -191,7 +191,7 @@ export function uploadFailureView(result: WpsUploadResult | null | undefined): F
         ...base(code, 'danger', '本地账本丢过锚点（未写云端）',
           '意图日志里记着这一批已经入账，账本里却查不到对应的锚点；照现在这样上传会把整批餐再加一遍。',
           next),
-        nextStep: next || '先走「账本锚点重建」核对本批是否已入账，再重新预览。',
+        nextStep: '本地账本缺了已入账的锚点，现在上传会把整批餐再加一遍，因此已拒绝。请先在 WPS 云端核对本批是否已入账；本地账本需要人工修复后再试。',
         provenNoWrite: true,
         retryAllowed: false,
         blockingRetained: true,
@@ -203,7 +203,7 @@ export function uploadFailureView(result: WpsUploadResult | null | undefined): F
         ...base(code, 'danger', '云端证明不了「已完成/完全未执行」',
           '只读核对没有拿到可以支撑结论的证据，因此不解除阻断。',
           next),
-        nextStep: next || '下一步是人工只读核对（manual_reconcile）；不要当作可以重传。',
+        nextStep: '只能人工只读核对云端；不要当作可以重传。',
         needsManualReconcile: true,
         blockingRetained: true,
       })
@@ -226,7 +226,9 @@ export function uploadFailureView(result: WpsUploadResult | null | undefined): F
       ...base(code || 'uncertain', 'warning', '上传结果不确定 · 待核对',
         reason || '可能已写入但无法确认；不能当作成功，也不能当作零写入。',
         next),
-      nextStep: next || '只读核对云端与日志，不要重新上传。',
+      // 不照抄服务端的「不重新上传」提示：再次上传时 executor 会先自动只读核对，
+      // 证明不了「上次未写入」就不会写，所以这里给用户一条可执行的警告而不是长流程。
+      nextStep: '请先在 WPS 云端核对这批是否已写入。可以重新预览后再试：写入前服务端会先只读核对上次记录，只有能证明上次未写入才会继续写，证明不了会再次拒绝。',
       needsManualReconcile: true,
     })
   }
@@ -235,7 +237,7 @@ export function uploadFailureView(result: WpsUploadResult | null | undefined): F
       ...base(code || 'blocked', 'danger', '上传被阻断 · 待核对',
         reason || '本地账本/意图日志不可用或仍有防重复闸门，服务端拒绝写入。',
         next),
-      nextStep: next || '先修复本地日志或走管理员恢复入口，不要重传。',
+      nextStep: '本地日志/账本需要人工修复后才能上传；修复前不要重传。',
       blockingRetained: true,
       needsManualReconcile: true,
     })
@@ -245,7 +247,7 @@ export function uploadFailureView(result: WpsUploadResult | null | undefined): F
       ...base(code || 'partial', 'warning', '部分表未确认 · 待核对',
         reason || '有表没有拿到确定结果，不能整体当作成功。',
         next),
-      nextStep: next || '逐表只读核对失败/不确定项，不要整批重传。',
+      nextStep: '逐表在 WPS 云端核对失败/不确定项；重新预览后再试时，服务端会先只读核对，证明不了未写入就不会写。',
       needsManualReconcile: true,
     })
   }
@@ -279,7 +281,7 @@ export function uploadFailureView(result: WpsUploadResult | null | undefined): F
     ...base(code || status || 'unknown', 'warning', '上传未完成 · 待核对',
       reason || '没有拿到明确成功标记。',
       next),
-    nextStep: next || '只读核对云端与日志后再决定；不要直接重复上传。',
+    nextStep: '请先在 WPS 云端与日志里核对结果；再次上传前服务端会先自动只读核对，证明不了上次未写入就不会写。',
     needsManualReconcile: true,
   })
 }
@@ -314,7 +316,7 @@ export function previewFailureView(result: { code?: string; status?: string; rea
       ...base(code, 'danger', '本地账本丢过锚点',
         '意图日志里记着这一批已经入账，账本里却查不到对应的锚点；按现在这样上传会把整批餐再加一遍，已在读取云端之前拒绝。',
         next),
-      nextStep: next || '先走「账本锚点重建」核对本批是否已入账，再重新预览。',
+      nextStep: '本地账本缺了已入账的锚点，现在上传会把整批餐再加一遍，已在读取云端之前拒绝。请先在 WPS 云端核对本批是否已入账；账本修复前不能上传。',
       provenNoWrite: true,
       retryAllowed: false,
       blockingRetained: true,

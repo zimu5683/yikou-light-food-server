@@ -93,8 +93,8 @@ test('preview_changed / operation_conflict / uncertain 给出不同的下一步�
   assert.equal(uploadNextAction({ code: 'preview_changed' }).label, '重新预览')
   assert.equal(uploadNextAction({ code: 'preview_expired' }).label, '重新预览')
   assert.equal(uploadNextAction({ code: 'operation_conflict', status: 'rejected' }).label, '查看操作状态')
-  assert.equal(uploadNextAction({ status: 'uncertain' }).label, '重新核对')
-  assert.equal(uploadNextAction({ status: 'partial' }).label, '重新核对')
+  assert.equal(uploadNextAction({ status: 'uncertain' }).label, '重新预览')
+  assert.equal(uploadNextAction({ status: 'partial' }).label, '重新预览')
 })
 
 test('previewLocalKey 对对象键顺序不敏感，对值变化敏感', () => {
@@ -103,9 +103,9 @@ test('previewLocalKey 对对象键顺序不敏感，对值变化敏感', () => {
   assert.equal(blockedItems(preview()).length, 1)
 })
 
-test('recovered/not_started 重新预览，blocked 先重新核对', () => {
+test('recovered/not_started 重新预览，blocked 也走重新预览（危险级别保留）', () => {
   assert.equal(uploadNextAction({ status: 'recovered' }).label, '重新预览')
   assert.equal(uploadNextAction({ status: 'not_started' }).label, '重新预览')
-  assert.equal(uploadNextAction({ status: 'blocked' }).label, '重新核对')
+  assert.equal(uploadNextAction({ status: 'blocked' }).label, '重新预览')
   assert.equal(uploadNextAction({ status: 'blocked' }).tone, 'danger')
 })

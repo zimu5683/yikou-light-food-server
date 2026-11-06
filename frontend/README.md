@@ -140,8 +140,13 @@ node scripts/mutation-check.mjs                 # 全部变异场景
   真实下单确认弹窗（含「可能扣款或占用余额」）与标题栏安全模式继续承载同一语义。
 - 订单页「保存到系统凭据管理器」开关移入高级设置（与闪时送页一致）；默认值、保存语义、
   清除凭据行为均未改动。
-- 恢复入口一律保留：`PendingInteractionRecoveryBanner`、WPS 恢复卡片与退场弹窗、
-  名单预览失败 Callout 的「重新读取云端名单」、验证码／地址补录、上传单飞闸门。
+- **WPS 恢复/重建 UI 已删除（2026-11-06）**：恢复卡片、恢复/退场处置弹窗、账本重建/抢救
+  卡片与弹窗一并移除，`CloudForm` 不再调用 `wps_recovery_status` / `wps_recovery_resolve` /
+  `wps_ledger_rebuild` / `wps_ledger_salvage`；上传失败/结果不确定只显示**一条警告**
+  （可能已写入，先去 WPS 云端核对），底栏另有「重新预览」副按钮 —— 预览是只读的、
+  可反复生成，重新预览不放开任何写入。
+- 这些恢复入口保留：`PendingInteractionRecoveryBanner`、名单预览失败 Callout 的
+  「重新读取云端名单」、验证码／地址补录、上传单飞闸门。
 
 对应门禁：`node scripts/browser-interaction-check.mjs` 的「批2 三页签状态矩阵」（三页签 ×
 就绪／运行／成功／失败／待核对，断言权威状态只在头部一处、页签内无重复块、说明不被截断）

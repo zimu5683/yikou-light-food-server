@@ -28,12 +28,7 @@ import {
   isApiReady,
   isWebTransport,
   type WpsCopyCheck,
-  type WpsLedgerRebuildResult,
-  type WpsLedgerSalvageResult,
   type WpsPreviewResult,
-  type WpsRecoveryDecision,
-  type WpsRecoveryOperation,
-  type WpsRecoveryStatus,
   type WpsStatus,
   type WpsUploadResult,
 } from '@/lib/bridge'
@@ -57,36 +52,6 @@ import {
 } from '@/lib/resultCounts'
 import { SingleFlightGate } from '@/lib/singleFlight'
 import {
-  DECISION_SPECS,
-  buildResolvePayload,
-  recoveryOperationView,
-  recoveryResolveView,
-  retiredGuardedCount,
-  type RecoveryOperationView,
-  type ResolveOutcomeView,
-} from '@/lib/recoveryResolve'
-import {
-  REBUILD_CONFIRM_WORD,
-  REBUILD_MIN_NOTE,
-  REBUILD_RISK_TEXT,
-  SALVAGE_CONFIRM_WORD,
-  SALVAGE_MIN_NOTE,
-  SALVAGE_RISK_TEXT,
-  buildRebuildPayload,
-  buildSalvagePayload,
-  ledgerStateLabel,
-  rebuildCountsSummary,
-  rebuildOutcomeView,
-  rebuildRowText,
-  rebuildVisibility,
-  salvageCountsSummary,
-  salvageDroppedText,
-  salvageOutcomeView,
-  salvageVisibility,
-  type RebuildOutcomeView,
-} from '@/lib/ledgerRepair'
-import {
-  journalIssueOf,
   previewFailureView,
   uploadFailureView,
   type FailureView,
@@ -119,9 +84,6 @@ const addressTextareaClass = cn(
 
 type Tone = 'info' | 'success' | 'warning' | 'danger' | 'neutral'
 
-/** 这两个码是"用户还没填对"，弹窗留着让他改（不是业务失败）。 */
-const WAIT_FOR_INPUT_CODES = new Set(['confirmation_required', 'note_required'])
-
 interface Message {
   tone: Tone
   text: string
@@ -150,8 +112,6 @@ export function CloudForm() {
   } = useApp()
 
   const [status, setStatus] = useState<WpsStatus | null>(null)
-  const [recoveryStatus, setRecoveryStatus] = useState<WpsRecoveryStatus | null>(null)
-  const [recoveryError, setRecoveryError] = useState<{ title: string; detail: string; nextStep: string } | null>(null)
   const [previewHandle, setPreviewHandle] = useState<PreviewHandle | null>(null)
   const [previewError, setPreviewError] = useState('')
   const [previewFailure, setPreviewFailure] = useState<FailureView | null>(null)
@@ -160,35 +120,8 @@ export function CloudForm() {
   const [copyCheck, setCopyCheck] = useState<WpsCopyCheck | null>(null)
   const [message, setMessage] = useState<Message | null>(null)
   const [busy, setBusy] = useState<'' | 'preview' | 'upload' | 'auth' | 'refresh' | 'check'>('')
-  // W3 管理员恢复流程：刷新只读，只有用户在弹窗里显式确认才会调 wps_recovery_resolve。
-  const [resolveTarget, setResolveTarget] = useState<RecoveryOperationView | null>(null)
-  const [resolveDecision, setResolveDecision] = useState<WpsRecoveryDecision | ''>('')
-  const [resolveNote, setResolveNote] = useState('')
-  const [resolveConfirm, setResolveConfirm] = useState('')
-  const [resolveStructure, setResolveStructure] = useState(false)
-  const [resolveError, setResolveError] = useState('')
-  const [resolveBusy, setResolveBusy] = useState(false)
-  const [resolveOutcome, setResolveOutcome] = useState<ResolveOutcomeView | null>(null)
-  const resolveGate = useRef(new SingleFlightGate())
-  // 第 14 项：账本锚点重建（只读提案 → 逐字确认写入；只写本地账本，永不写云端）。
-  const [rebuildProposal, setRebuildProposal] = useState<WpsLedgerRebuildResult | null>(null)
-  const [rebuildError, setRebuildError] = useState('')
-  const [rebuildOpen, setRebuildOpen] = useState(false)
-  const [rebuildConfirm, setRebuildConfirm] = useState('')
-  const [rebuildNote, setRebuildNote] = useState('')
-  const [rebuildBusy, setRebuildBusy] = useState(false)
-  const [rebuildOutcome, setRebuildOutcome] = useState<RebuildOutcomeView | null>(null)
-  const rebuildGate = useRef(new SingleFlightGate())
-  // 第 14 项续：账本抢救（只读清单 → 逐字确认才写；只写本地账本）。
-  const [salvageProposal, setSalvageProposal] = useState<WpsLedgerSalvageResult | null>(null)
-  const [salvageError, setSalvageError] = useState('')
-  const [salvageOpen, setSalvageOpen] = useState(false)
-  const [salvageConfirm, setSalvageConfirm] = useState('')
-  const [salvageNote, setSalvageNote] = useState('')
-  const [salvageBusy, setSalvageBusy] = useState(false)
-  const [salvageOutcome, setSalvageOutcome] = useState<RebuildOutcomeView | null>(null)
-  const salvageGate = useRef(new SingleFlightGate())
   const uploadGateRef = useRef(new SingleFlightGate())
+  const previewGateRef = useRef(new SingleFlightGate())
   const [enabled, setEnabled] = useState(config?.wps_enabled ?? false)
   const [testMode, setTestMode] = useState(config?.wps_test_mode ?? true)
   const [cliPath, setCliPath] = useState(config?.wps_cli_path ?? '')
@@ -232,7 +165,7 @@ export function CloudForm() {
     const startDraftRevision = saveGetDraftRevisionRef.current()
     const startSavedRevision = saveGetSavedRevisionRef.current()
     setBusy((prev) => (prev === '' ? 'refresh' : prev))
-    // 只读刷新：wps_status + wps_recovery_status 都不触发上传/解绑阻断/自动重试。
+    // 只读刷新：wps_status 不触发上传、不解除阻断、不自动重试。
     try {
       const next = await api().wps_status()
       setStatus(next)
@@ -266,14 +199,6 @@ export function CloudForm() {
       }
     } catch (error) {
       setMessage({ tone: 'danger', text: `状态刷新失败：${classifyRequestError(error).detail}` })
-    }
-    try {
-      const recovery = await api().wps_recovery_status()
-      setRecoveryStatus(recovery)
-      setRecoveryError(null)
-    } catch (error) {
-      const view = classifyRequestError(error)
-      setRecoveryError({ title: view.title, detail: view.detail, nextStep: view.nextStep })
     } finally {
       setBusy((prev) => (prev === 'refresh' ? '' : prev))
     }
@@ -386,20 +311,26 @@ export function CloudForm() {
             : '已有操作进行中，请等待结束')
       return
     }
+    // 单飞：连点「重新预览」时只允许一个预览请求在途，避免第二个请求撞上
+    // 服务端的只读互斥占位后 operation_conflict，把刚生成的有效预览覆盖成失败提示。
+    const token = previewGateRef.current.begin()
+    if (token === null) return
     setBusy('preview')
     setPreviewError('')
     setPreviewFailure(null)
-    setPreviewHandle(null)
     setUploadResult(null)
     setNetworkUnknown(false)
     setMessage(null)
     try {
       const result: WpsPreviewResult = await api().wps_preview()
+      if (!previewGateRef.current.isCurrent(token)) return
       if (result.ok && result.preview_id) {
+        // 生成成功后整份替换：旧预览令牌不再使用（服务端留到 TTL 自然过期）。
         setPreviewHandle({ preview: result, localKey: currentLocalKey })
-        setMessage({ tone: 'success', text: `预览已生成（${previewPlanText(result)}），请在有效期内核对后确认上传` })
+        setMessage({ tone: 'success', text: `预览已生成（${previewPlanText(result)}），请在有效期内核对后确认上传；需要刷新可点「重新预览」` })
       } else {
-        // wps_disabled / journal 损坏或版本不支持 / 并发 / 文件变化 都有各自的下一步。
+        // 失败不清掉手上仍有效的旧预览：预览是只读入口，失败不代表旧令牌失效，
+        // 让用户还能按上一次的预览继续确认上传。
         const failure = previewFailureView(result)
         setPreviewFailure(failure)
         setPreviewError('')
@@ -410,6 +341,7 @@ export function CloudForm() {
       setPreviewFailure(null)
       setPreviewError(`${classifyRequestError(error).detail}（预览是只读入口，失败不代表写入了任何内容；可重试。）`)
     } finally {
+      previewGateRef.current.finish(token)
       setBusy('')
     }
   }
@@ -456,235 +388,15 @@ export function CloudForm() {
       setNetworkUnknown(true)
       setMessage({
         tone: 'warning',
-        text: `上传请求结果未知：${classifyRequestError(error).detail}。请先查询操作状态或重新核对，不要直接重复上传。`,
+        // 警告只说事实与安全动作：再次上传前服务端会先自动只读核对上次记录，
+        // 证明不了「上次未写入」就不会写，所以不需要长兜底流程。
+        text: `上传请求结果未知：${classifyRequestError(error).detail}。请先查询权威状态；再次上传前服务端会先只读核对上次记录，证明不了上次未写入就不会写。`,
       })
       void refresh()
     } finally {
       uploadGateRef.current.finish(token)
       setBusy('')
       setConfirmOpen(false)
-    }
-  }
-
-  // ---------- 第 14 项续：账本抢救（只读清单 → 逐字确认才写；只写本地账本） ----------
-
-  async function openSalvage() {
-    if (salvageBusy) return
-    setSalvageBusy(true)
-    setSalvageError('')
-    try {
-      const proposal = await api().wps_ledger_salvage()
-      if (proposal.ok !== true) {
-        setSalvageProposal(null)
-        setSalvageOutcome(salvageOutcomeView(proposal))
-        setSalvageError(String(proposal.reason || '抢救清单没有生成'))
-        return
-      }
-      setSalvageProposal(proposal)
-      setSalvageConfirm('')
-      setSalvageNote('')
-      setSalvageOutcome(null)
-      setRebuildOutcome(null)
-      setSalvageOpen(true)
-    } catch (error) {
-      setSalvageError(classifyRequestError(error).detail)
-    } finally {
-      setSalvageBusy(false)
-    }
-  }
-
-  function closeSalvage() {
-    setSalvageOpen(false)
-    setSalvageError('')
-  }
-
-  async function submitSalvage() {
-    if (!salvageProposal) return
-    const built = buildSalvagePayload({ confirm: salvageConfirm, note: salvageNote })
-    if (!built.ok || !built.payload) {
-      setSalvageError(built.message)
-      return
-    }
-    const token = salvageGate.current.begin()
-    if (token === null) return
-    setSalvageBusy(true)
-    setSalvageError('')
-    try {
-      const result = await api().wps_ledger_salvage(built.payload)
-      if (!salvageGate.current.isCurrent(token)) return
-      if (WAIT_FOR_INPUT_CODES.has(String(result.code || ''))) {
-        // 确认词/说明没填对：弹窗留着让用户改，别把他刚填的东西关掉。
-        setSalvageError(String(result.reason || '确认不完整，未写账本'))
-        return
-      }
-      setSalvageOutcome(salvageOutcomeView(result))
-      setSalvageOpen(false)
-      setSalvageProposal(null)
-      await refresh()
-    } catch (error) {
-      if (!salvageGate.current.isCurrent(token)) return
-      setSalvageOutcome({
-        ok: false,
-        tone: 'danger',
-        title: '抢救请求结果未知',
-        detail: `网络失败：${classifyRequestError(error).detail}。服务端可能没有收到，也可能已经写盘。`,
-        nextStep: '先用「刷新状态（只读）」确认账本状态，再决定要不要重来；不要重复提交。',
-        blockingRetained: true,
-        ledgerChanged: false,
-      })
-    } finally {
-      salvageGate.current.finish(token)
-      setSalvageBusy(false)
-    }
-  }
-
-  // ---------- 第 14 项：账本锚点重建（只写本地账本，永不写云端） ----------
-
-  async function openRebuild() {
-    if (rebuildBusy) return
-    setRebuildBusy(true)
-    setRebuildError('')
-    try {
-      const proposal = await api().wps_ledger_rebuild()
-      if (proposal.ok !== true) {
-        setRebuildProposal(null)
-        setRebuildOutcome(rebuildOutcomeView(proposal))
-        setRebuildError(String(proposal.reason || '重建提案没有生成'))
-        return
-      }
-      setRebuildProposal(proposal)
-      setRebuildConfirm('')
-      setRebuildNote('')
-      setRebuildOutcome(null)
-      setSalvageOutcome(null)
-      setRebuildOpen(true)
-    } catch (error) {
-      setRebuildError(classifyRequestError(error).detail)
-    } finally {
-      setRebuildBusy(false)
-    }
-  }
-
-  function closeRebuild() {
-    setRebuildOpen(false)
-    setRebuildError('')
-  }
-
-  async function submitRebuild() {
-    if (!rebuildProposal) return
-    const built = buildRebuildPayload({
-      confirm: rebuildConfirm,
-      note: rebuildNote,
-      fingerprint: String(rebuildProposal.fingerprint || ''),
-    })
-    if (!built.ok || !built.payload) {
-      setRebuildError(built.message)
-      return
-    }
-    // 双击/并发保护：同一时刻只允许一个重建请求在途。
-    const token = rebuildGate.current.begin()
-    if (token === null) return
-    setRebuildBusy(true)
-    setRebuildError('')
-    try {
-      const result = await api().wps_ledger_rebuild(built.payload)
-      if (!rebuildGate.current.isCurrent(token)) return
-      if (WAIT_FOR_INPUT_CODES.has(String(result.code || ''))) {
-        setRebuildError(String(result.reason || '确认不完整，未写账本'))
-        return
-      }
-      setRebuildOutcome(rebuildOutcomeView(result))
-      setRebuildOpen(false)
-      setRebuildProposal(null)
-      await refresh()
-    } catch (error) {
-      if (!rebuildGate.current.isCurrent(token)) return
-      // 网络未知：不当作成功也不当作失败；本地账本是否已改未知。
-      setRebuildOutcome({
-        ok: false,
-        tone: 'danger',
-        title: '重建请求结果未知',
-        detail: `网络失败：${classifyRequestError(error).detail}。服务端可能没有收到，也可能已经写盘。`,
-        nextStep: '先用「刷新状态（只读）」看账本状态与本地记录，确认后再决定；不要重复提交。',
-        blockingRetained: true,
-        ledgerChanged: false,
-      })
-    } finally {
-      rebuildGate.current.finish(token)
-      setRebuildBusy(false)
-    }
-  }
-
-  // ---------- W3：管理员恢复/退场（永不写云端，失败保持阻断） ----------
-
-  function openResolve(operation: RecoveryOperationView) {
-    setResolveTarget(operation)
-    setResolveDecision(operation.decisions.length === 1 ? operation.decisions[0] : '')
-    setResolveNote('')
-    setResolveConfirm('')
-    setResolveStructure(false)
-    setResolveError('')
-  }
-
-  function closeResolve() {
-    setResolveTarget(null)
-    setResolveError('')
-  }
-
-  async function submitResolve() {
-    // 双击/并发保护：同一时刻只允许一个恢复请求在途。
-    if (!resolveTarget) return
-    const built = buildResolvePayload({
-      operationId: resolveTarget.operationId,
-      decision: resolveDecision,
-      confirm: resolveConfirm,
-      note: resolveNote,
-      structureChecked: resolveStructure,
-      allowedDecisions: resolveTarget.decisions,
-    })
-    if (!built.ok) {
-      setResolveError(built.message)
-      return
-    }
-    const token = resolveGate.current.begin()
-    if (token === null) return
-    setResolveBusy(true)
-    setResolveError('')
-    try {
-      const result = await api().wps_recovery_resolve(built.payload)
-      // 乱序响应保护：更晚的请求已经发出时，丢弃这个过期结果。
-      if (!resolveGate.current.isCurrent(token)) return
-      setResolveOutcome(recoveryResolveView(result))
-      setResolveTarget(null)
-      await refresh()
-    } catch (error) {
-      if (!resolveGate.current.isCurrent(token)) return
-      const view = classifyRequestError(error)
-      const permission = view.kind === 'permission'
-      setResolveOutcome({
-        ok: false,
-        tone: permission ? 'warning' : 'danger',
-        code: permission ? 'forbidden' : 'network_unknown',
-        title: permission ? '恢复请求被服务端拒绝' : '恢复请求结果未知（阻断保持）',
-        detail: permission
-          ? '服务端以 403 拒绝了本次请求，没有改任何文件。'
-          : `网络失败：${view.detail}。服务端可能没有收到这次请求，也可能已经处理；本地状态未知。`,
-        nextStep: permission
-          ? '确认访问地址与令牌正确后重试；不要在结果未知时重复提交。'
-          : '不要重复提交：先点「刷新状态（只读）」核对本地日志与阻断状态，再决定下一步。',
-        blockingRetained: true,
-        cloudWrite: false,
-        changed: false,
-        duplicate: false,
-        autoRetryAllowed: false,
-      })
-      // 网络未知时不自动重试，也不假装成功；保持阻断并提示只读核对。
-      // 同时关闭弹窗：避免用户在没有新结果的情况下连点「提交处置」造成重复提交。
-      setResolveTarget(null)
-      void refresh()
-    } finally {
-      resolveGate.current.finish(token)
-      setResolveBusy(false)
     }
   }
 
@@ -819,7 +531,12 @@ export function CloudForm() {
             </div>
             <Switch
               checked={enabled}
-              onCheckedChange={setEnabled}
+              // 关/开云同步会让服务端立刻作废所有未使用的预览令牌；这里同步清掉手上那份，
+              // 避免开关回到原值后界面误以为旧预览仍然有效。
+              onCheckedChange={(next) => {
+                if (next !== enabled) setPreviewHandle(null)
+                setEnabled(next)
+              }}
               disabled={busy !== '' || operationActive}
               aria-label="启用云文档同步"
             />
@@ -946,45 +663,6 @@ export function CloudForm() {
           </div>
         </AdvancedSection>
 
-        {resolveOutcome && (
-          <Callout
-            tone={resolveOutcome.tone === 'danger' ? 'danger' : resolveOutcome.tone === 'success' ? 'success' : 'warning'}
-            title={`恢复处置：${resolveOutcome.title}`}
-          >
-            <p>{resolveOutcome.detail}</p>
-            <p className="mt-1 font-medium text-foreground">下一步：{resolveOutcome.nextStep}</p>
-            <p className="mt-1 text-muted-foreground">
-              {resolveOutcome.blockingRetained
-                ? '阻断仍然保留：未完成人工只读核对前，不允许重新上传或补发。'
-                : '阻断已按服务端证据解除；仍不需要强制重传。'}
-              {resolveOutcome.duplicate ? ' 本次是重复提交，服务端没有再次写盘。' : ''}
-              {' '}本入口不会写云端（cloud_write=false）。
-            </p>
-            <button type="button" className="mt-1.5 font-medium text-primary underline" onClick={() => setResolveOutcome(null)}>
-              知道了，收起
-            </button>
-          </Callout>
-        )}
-
-        <WpsRecoveryCard
-          status={recoveryStatus}
-          error={recoveryError}
-          busy={busy !== '' || operationActive || resolveBusy}
-          onResolve={openResolve}
-        />
-
-        <LedgerRebuildCard
-          status={recoveryStatus}
-          outcome={salvageOutcome ?? rebuildOutcome}
-          error={salvageError || rebuildError}
-          summary={ledgerCardSummary(rebuildProposal, salvageProposal,
-                                     Boolean(salvageOutcome ?? rebuildOutcome))}
-          busy={rebuildBusy || salvageBusy || busy !== '' || operationActive || resolveBusy}
-          rebuildLabel={rebuildButtonLabel(rebuildBusy, rebuildProposal)}
-          salvageLabel={salvageButtonLabel(salvageBusy, salvageProposal)}
-          onRebuild={() => void openRebuild()}
-          onSalvage={() => void openSalvage()}
-        />
 
         {preview && (
           <StructuredPreview
@@ -1000,8 +678,8 @@ export function CloudForm() {
 
         {uploadResult && (
           <ResultCard result={uploadResult} action={resultAction} onAction={() => {
+            // 失败后的唯一动作是只读复核：重新预览（不直接重传）。
             if (resultAction?.label === '重新预览') void onPreview()
-            else if (resultAction?.label === '重新核对') void onCheckCopies()
             else void refreshAuthority()
           }} />
         )}
@@ -1019,9 +697,21 @@ export function CloudForm() {
           {networkUnknown && <span className="font-medium text-warning">上传结果未知，请先查询权威状态</span>}
         </div>
         <div className="flex gap-2">
+          {/* 只在主按钮是「确认上传」时提供副动作；预览过期时主按钮本身就是「重新预览」，不再重复。 */}
+          {preview && freshness.fresh && (
+            <Button
+              variant="outline"
+              className="h-10 shrink-0 rounded-[8px] text-sm"
+              disabled={previewDisabled}
+              onClick={() => void onPreview()}
+            >
+              {busy === 'preview' ? <Loader2 className="mr-1 size-4 animate-spin" /> : null}
+              {busy === 'preview' ? '预览中…' : '重新预览'}
+            </Button>
+          )}
           <Button
             className="btn-serif-primary h-10 flex-1 rounded-[8px] text-sm"
-            disabled={primaryDisabled || busy === 'upload'}
+            disabled={primaryDisabled || busy !== ''}
             onClick={primaryOnClick}
           >
             {busy === 'upload' ? <Loader2 className="mr-1 size-4 animate-spin" /> : null}
@@ -1048,52 +738,6 @@ export function CloudForm() {
         onConfirm={performUpload}
       />
 
-      <RecoveryResolveDialog
-        target={resolveTarget}
-        decision={resolveDecision}
-        note={resolveNote}
-        confirm={resolveConfirm}
-        structureChecked={resolveStructure}
-        error={resolveError}
-        busy={resolveBusy}
-        onDecision={(next) => {
-          setResolveDecision(next)
-          setResolveConfirm('')
-          setResolveStructure(false)
-          setResolveError('')
-        }}
-        onNote={setResolveNote}
-        onConfirmText={setResolveConfirm}
-        onStructureChecked={setResolveStructure}
-        onClose={closeResolve}
-        onSubmit={submitResolve}
-      />
-
-      <LedgerRebuildDialog
-        open={rebuildOpen}
-        proposal={rebuildProposal}
-        confirm={rebuildConfirm}
-        note={rebuildNote}
-        error={rebuildError}
-        busy={rebuildBusy}
-        onConfirmText={setRebuildConfirm}
-        onNote={setRebuildNote}
-        onClose={closeRebuild}
-        onSubmit={() => void submitRebuild()}
-      />
-
-      <LedgerSalvageDialog
-        open={salvageOpen}
-        proposal={salvageProposal}
-        confirm={salvageConfirm}
-        note={salvageNote}
-        error={salvageError}
-        busy={salvageBusy}
-        onConfirmText={setSalvageConfirm}
-        onNote={setSalvageNote}
-        onClose={closeSalvage}
-        onSubmit={() => void submitSalvage()}
-      />
     </div>
   )
 }
@@ -1104,393 +748,8 @@ function FailureCallout({ view, fallbackTitle }: { view: FailureView; fallbackTi
       <p>{view.detail}</p>
       <p className="mt-1 font-medium text-foreground">下一步：{view.nextStep}</p>
       {view.provenNoWrite && <p className="mt-1 text-muted-foreground">本次没有写入任何云端内容。</p>}
-      {view.blockingRetained && <p className="mt-1 text-muted-foreground">阻断保持：修复/核对完成前不要重新上传。</p>}
+      {view.blockingRetained && <p className="mt-1 text-muted-foreground">本次不会自动重试；在核对清楚之前，程序也不会再写这批云端数据。</p>}
     </Callout>
-  )
-}
-
-/**
- * W3 管理员恢复/退场弹窗。
- *
- * 只提交契约白名单里的 4 个决策；没有「删除账本」「直接重传」「强制清除」入口。
- * 打开弹窗/刷新状态都不会发请求，只有点「提交处置」才调用 `wps_recovery_resolve`。
- */
-function RecoveryResolveDialog({
-  target, decision, note, confirm, structureChecked, error, busy,
-  onDecision, onNote, onConfirmText, onStructureChecked, onClose, onSubmit,
-}: {
-  target: RecoveryOperationView | null
-  decision: WpsRecoveryDecision | ''
-  note: string
-  confirm: string
-  structureChecked: boolean
-  error: string
-  busy: boolean
-  onDecision: (decision: WpsRecoveryDecision) => void
-  onNote: (value: string) => void
-  onConfirmText: (value: string) => void
-  onStructureChecked: (value: boolean) => void
-  onClose: () => void
-  onSubmit: () => void
-}) {
-  const dialogRef = useRef<HTMLDivElement | null>(null)
-  const headingRef = useRef<HTMLHeadingElement | null>(null)
-
-  useEffect(() => {
-    if (target) headingRef.current?.focus()
-  }, [target])
-
-  useEffect(() => {
-    if (!target) return
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        onClose()
-      }
-    }
-    document.addEventListener('keydown', onKeyDown)
-    return () => document.removeEventListener('keydown', onKeyDown)
-  }, [target, onClose])
-
-  if (!target) return null
-  const spec = decision ? DECISION_SPECS[decision] : null
-  const decisions = target.decisions
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/50 p-0 sm:items-center sm:p-4">
-      <div
-        ref={dialogRef}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="wps-recovery-resolve-title"
-        className="scroll-contain max-h-[92vh] w-full max-w-lg overflow-y-auto rounded-t-xl border bg-card p-3 shadow-xl sm:rounded-xl sm:p-4"
-      >
-        <h2
-          id="wps-recovery-resolve-title"
-          ref={headingRef}
-          tabIndex={-1}
-          className="text-sm font-semibold outline-none"
-        >
-          旧任务恢复/退场处置
-        </h2>
-        <p className="mt-1 text-[11px] text-muted-foreground">
-          本入口不写云端，只改本地 journal 审计；退场不会解除同一目标日期 + 云表的防重复闸门，
-          也没有「删除账本」或「直接重传」的捷径。
-        </p>
-
-        <dl className="mt-2 space-y-1 rounded-md border bg-secondary/30 px-2.5 py-2 text-[11px]">
-          <div className="flex flex-wrap gap-x-2">
-            <dt className="text-muted-foreground">目标日期：</dt>
-            <dd className="tabular font-medium">{target.targetDate || UNKNOWN_TEXT}</dd>
-          </div>
-          <div className="flex flex-wrap gap-x-2">
-            <dt className="text-muted-foreground">操作标识：</dt>
-            <dd className="break-all font-mono font-medium">{target.operationId || UNKNOWN_TEXT}</dd>
-          </div>
-          <div className="flex flex-wrap gap-x-2">
-            <dt className="text-muted-foreground">操作引用：</dt>
-            <dd className="break-all font-mono">{target.operationRef || UNKNOWN_TEXT}</dd>
-          </div>
-          <div className="flex flex-wrap gap-x-2">
-            <dt className="text-muted-foreground">当前状态：</dt>
-            <dd className="font-medium">{target.statusLabel}{target.errorCode ? `（${target.errorCode}）` : ''}</dd>
-          </div>
-          <div className="flex flex-wrap gap-x-2">
-            <dt className="text-muted-foreground">表数：</dt>
-            <dd>{target.sheetCount || UNKNOWN_TEXT}</dd>
-          </div>
-          <div className="flex flex-wrap gap-x-2">
-            <dt className="text-muted-foreground">允许动作：</dt>
-            <dd>
-              {target.allowedActions.length
-                ? `${target.allowedActions.join('、')}（${target.allowedActionLabels.join('；')}）`
-                : UNKNOWN_TEXT}
-            </dd>
-          </div>
-          <div className="flex flex-wrap gap-x-2">
-            <dt className="text-muted-foreground">风险：</dt>
-            <dd className="text-warning">{target.risk}</dd>
-          </div>
-        </dl>
-
-        <fieldset className="mt-2.5">
-          <legend className="text-[12px] font-medium">处置动作（只有服务端白名单里的动作可选）</legend>
-          {decisions.length === 0 ? (
-            <p className="mt-1 rounded-md border bg-secondary/30 px-2 py-1.5 text-[11px] text-muted-foreground">
-              该批次没有可用的恢复处置（例如已确认完成或只需重新预览）；请不要强行解阻断。
-            </p>
-          ) : (
-            <div className="mt-1 space-y-1.5">
-              {decisions.map((item) => {
-                const itemSpec = DECISION_SPECS[item]
-                return (
-                  <label key={item} className="flex cursor-pointer gap-2 rounded-md border px-2.5 py-2 text-[11px]">
-                    <input
-                      type="radio"
-                      name="wps-recovery-decision"
-                      className="mt-0.5"
-                      checked={decision === item}
-                      disabled={busy}
-                      onChange={() => onDecision(item)}
-                    />
-                    <span className="min-w-0">
-                      <span className="font-medium">{itemSpec.label}</span>
-                      <span className="ml-1 font-mono text-muted-foreground">{item}</span>
-                      <span className="mt-0.5 block text-muted-foreground">影响：{itemSpec.effect}</span>
-                      <span className="mt-0.5 block text-warning">风险：{itemSpec.risk}</span>
-                    </span>
-                  </label>
-                )
-              })}
-            </div>
-          )}
-        </fieldset>
-
-        <div className="mt-2.5 space-y-2">
-          <label className="block text-[12px]" htmlFor="wps-resolve-note">
-            <span className="font-medium">人工核对说明（≥4 字，写入 journal 审计）</span>
-            <textarea
-              id="wps-resolve-note"
-              rows={2}
-              className={addressTextareaClass}
-              value={note}
-              disabled={busy}
-              onChange={(event) => onNote(event.target.value)}
-              placeholder="例如：已只读核对 2026-09-20 云端排单表，仍无法判定是否写入"
-            />
-          </label>
-          {spec?.requiresStructureCheck && (
-            <label className="flex items-center gap-2 text-[11px]">
-              <input
-                type="checkbox"
-                checked={structureChecked}
-                disabled={busy}
-                onChange={(event) => onStructureChecked(event.target.checked)}
-              />
-              <span>我确认已人工核对云端表结构（retire_guarded 必填）</span>
-            </label>
-          )}
-          <label className="block text-[12px]" htmlFor="wps-resolve-confirm">
-            <span className="font-medium">逐字确认：请输入当前的决策名 <code className="font-mono">{decision || '（先选择动作）'}</code></span>
-            <TextInput
-              id="wps-resolve-confirm"
-              value={confirm}
-              disabled={busy}
-              onChange={(event) => onConfirmText(event.target.value)}
-              placeholder={decision || '例如 retire_guarded'}
-              autoComplete="off"
-            />
-          </label>
-        </div>
-
-        {error && (
-          <p className="mt-2 rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-[11px] text-destructive" role="alert">
-            {error}
-          </p>
-        )}
-
-        <p className="mt-2 text-[11px] text-muted-foreground">
-          网络失败时结果未知：请只读核对后再决定是否重来。
-        </p>
-
-        <div className="mt-3 flex flex-wrap gap-2">
-          <Button
-            className="h-9 flex-1 rounded-[8px] text-sm"
-            disabled={busy || decisions.length === 0}
-            onClick={onSubmit}
-          >
-            {busy ? '提交中…' : '提交处置'}
-          </Button>
-          <Button variant="outline" className="h-9 rounded-[8px] text-sm" disabled={busy} onClick={onClose}>
-            取消
-          </Button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function recoveryNextActionText(nextAction: string): string {
-  const map: Record<string, string> = {
-    manual_reconcile: '先人工核对云端与日志；核对完成前不要重新上传或补发',
-    recover_journal: '需要先按日志恢复/修复，再重新预览；刷新状态本身不会解除阻断',
-    repreview: '需要重新预览并生成新的上传令牌；不要直接重传旧令牌',
-    fix_journal: '本地恢复日志不可用：先修复本地日志再重试，不要直接重新上传',
-    wait_for_recovery_lock: '另一个恢复/上传操作正在进行：请稍后再查询，不要重试',
-    none: '没有待恢复操作',
-  }
-  return map[nextAction] || '恢复状态未知：先只读核对，不要直接重试或重新上传'
-}
-
-function WpsRecoveryCard({ status, error, busy, onResolve }: {
-  status: WpsRecoveryStatus | null
-  error: { title: string; detail: string; nextStep: string } | null
-  busy: boolean
-  onResolve: (operation: RecoveryOperationView) => void
-}) {
-  if (!status && !error) return null
-  if (error) {
-    return (
-      <Callout tone="danger" title={error.title || '本地恢复记录读取失败'}>
-        {error.detail} {error.nextStep} 只读刷新不会触发上传、解除阻断或自动重试。
-      </Callout>
-    )
-  }
-  if (!status) return null
-  if (!status.ok) {
-    const guidance = status.summary?.guidance || '恢复状态不可用：先只读核对，不要直接重试或重新上传'
-    const code = status.error_code ? `（${status.error_code}）` : ''
-    // journal 损坏 / 版本不受支持 / 不可读 各自的下一步不同，不能合并成一句“重试”。
-    const reasonText = `${status.error_code || ''} ${guidance}`
-    const issue = journalIssueOf(status.error_code || '', reasonText)
-    const journalHint = issue === 'version_unsupported'
-      ? '本地日志版本不受支持：请升级到匹配版本或迁移日志，不要删除日志，也不要直接重传。'
-      : issue === 'write_failed'
-        ? '本地日志持久化失败：先修复磁盘/权限，再重新只读核对；确认前不要重复提交。'
-        : issue === 'corrupt'
-          ? '本地账本/意图日志损坏：先修复（可走恢复/退场入口），不要删除账本，也不要直接重传。'
-          : issue === 'unreadable'
-            ? '本地恢复日志不可读：请修复文件权限/磁盘后重试，不要删除账本，也不要直接重传。'
-            : ''
-    return (
-      <Callout tone="danger" title="本地恢复记录不可读">
-        {guidance}{code}。只读刷新不会伪造“没有待恢复”，不会上传，也不会自动解除阻断。
-        下一步：{recoveryNextActionText(status.next_action)}
-        {journalHint ? ` ${journalHint}` : ''}
-      </Callout>
-    )
-  }
-
-  const counts = status.counts || {}
-  const summary = status.summary
-  const pending = status.pending_operations ?? []
-  const operations = status.operations ?? []
-  const uncertainCount = Number(counts.uncertain ?? 0)
-  const failedCount = Number(counts.failed ?? 0)
-  const writingCount = Number(counts.writing ?? 0)
-  const ledgerPendingCount = Number(counts.ledger_pending ?? 0)
-  const retiredCount = retiredGuardedCount(status)
-  const needsAttention = Boolean(summary?.needs_review)
-    || pending.length > 0 || uncertainCount > 0 || failedCount > 0
-    || writingCount > 0 || ledgerPendingCount > 0 || retiredCount > 0
-    || status.next_action === 'manual_reconcile'
-  const labelMap: Record<string, string> = {
-    planned: '已计划', writing: '写入中', ledger_pending: '账本待落盘',
-    verified: '已验证', uncertain: '待核对', failed: '失败', not_started: '未开始',
-    retired_guarded: '已带审计退场（闸门保留）',
-  }
-  const shown = (pending.length ? pending : operations).slice(0, 4)
-  return (
-    <Callout tone={needsAttention ? 'warning' : 'success'} title={needsAttention ? '待核对批次（只读可见）' : '本地恢复记录：无待核对批次'}>
-      <p className="text-muted-foreground">
-        本次刷新为只读查询：不会上传、不会解除阻断、不会自动重试。
-        {status.queried_cloud === false ? ' 当前展示的是本地 journal 记录，本查询未调用云端。' : ' 数据来自只读恢复查询。'}
-      </p>
-      {status.contains_cloud_checked_records && (
-        <p className="mt-0.5 text-muted-foreground">
-          包含此前已做云端只读核对（cloud_checked）的记录；与仅本地 journal 记录不同，逐表状态会以安全摘要字段标注。
-        </p>
-      )}
-      {retiredCount > 0 && (
-        <p className="mt-1 rounded-md border border-warning/40 bg-warning/10 px-2 py-1.5 text-warning">
-          有 {retiredCount} 个批次已带审计退场，但同一「目标日期 + 云表」仍被防重复闸门阻断：证实之前不能重新上传。
-        </p>
-      )}
-      {needsAttention && (
-        <>
-          <div className="mt-1.5 flex flex-wrap gap-1.5">
-            {Object.entries(labelMap).map(([key, label]) => {
-              const value = Number(summary?.[`${key}_count` as keyof typeof summary] ?? counts[key] ?? 0)
-              const display = key === 'uncertain' ? (summary?.uncertain_count ?? value)
-                : key === 'failed' ? (summary?.failed_count ?? value)
-                  : key === 'not_started' ? (summary?.not_started_count ?? value)
-                    : key === 'retired_guarded' ? retiredCount
-                      : value
-              return display > 0 ? (
-                <span key={key} className="rounded-full border bg-card px-2 py-0.5 text-[10px]">
-                  {label} {display}
-                </span>
-              ) : null
-            })}
-          </div>
-          {shown.length > 0 && (
-            <div className="mt-2 space-y-2">
-              {shown.map((operation) => (
-                <WpsRecoveryOperationCard
-                  key={operation.operation_id || operation.operation_ref}
-                  operation={operation}
-                  busy={busy}
-                  onResolve={onResolve}
-                />
-              ))}
-            </div>
-          )}
-          {shown.length === 0 && (
-            <p className="mt-1.5 text-muted-foreground">没有可展示的批次明细；请勿凭摘要猜测，先完成人工只读核对。</p>
-          )}
-        </>
-      )}
-      <p className="mt-1.5 font-medium text-foreground">
-        下一步：{summary?.guidance || recoveryNextActionText(status.next_action)}
-      </p>
-    </Callout>
-  )
-}
-
-function WpsRecoveryOperationCard({ operation, busy, onResolve }: {
-  operation: WpsRecoveryOperation
-  busy: boolean
-  onResolve: (view: RecoveryOperationView) => void
-}) {
-  const view = recoveryOperationView(operation)
-  const actionCodes = view?.allowedActions.join('、') || ''
-  const actionLabels = view?.allowedActionLabels.join('；') || ''
-  const canResolve = (view?.decisions.length ?? 0) > 0
-  return (
-    <details className="rounded-md border bg-card px-2.5 py-2 text-[11px]" open={Boolean(view?.blockingRetained)}>
-      <summary className="cursor-pointer">
-        <span className="font-medium">{operation.operation_id || operation.operation_ref || '（无可展示引用）'}</span>
-        <span className="ml-2 text-muted-foreground">
-          {view?.statusLabel || operation.status || 'unknown'} · {operation.pending ? '待恢复' : '历史记录'}
-          {operation.target_date ? ` · 目标日期 ${operation.target_date}` : ''}
-          {operation.sheet_count ? ` · ${operation.sheet_count} 张表` : ''}
-        </span>
-      </summary>
-      <p className="mt-1 text-muted-foreground">
-        {operation.cloud_checked ? '该批次含云端只读核对记录' : '仅本地 journal 记录'}
-        {operation.error_code ? ` · ${operation.error_code}` : ''}
-        {actionCodes ? ` · 允许动作 ${actionCodes}${actionLabels ? `（${actionLabels}）` : ''}` : ''}
-        {operation.manual_required ? ' · 需要人工处理' : ''}
-      </p>
-      {view && <p className="mt-1 text-warning">风险：{view.risk}</p>}
-      {view?.blockingRetained && (
-        <p className="mt-1 text-muted-foreground">当前仍然阻断：同目标日期的重新写入会被服务端以 uncertain + manual_reconcile 拒绝。</p>
-      )}
-      {operation.sheets?.length ? (
-        <ul className="mt-1 space-y-0.5 text-muted-foreground">
-          {operation.sheets.map((sheet, index) => (
-            <li key={`${operation.operation_id}-${sheet.target_ref || index}`} className="break-words">
-              目标 {sheet.target_ref || '（无引用）'}：{sheet.status || 'unknown'}
-              {sheet.cloud_checked ? '（云端只读核对）' : '（本地记录）'}
-              {sheet.error_code ? ` · ${sheet.error_code}` : ''}
-              {sheet.allowed_next_actions?.length ? ` · 允许动作 ${sheet.allowed_next_actions.join('、')}` : ''}
-              {sheet.manual_required ? ' · 需要人工处理' : ''}
-            </li>
-          ))}
-        </ul>
-      ) : null}
-      {view && view.decisions.length > 0 && (
-        <div className="mt-1.5">
-          {canResolve ? (
-            <Button variant="outline" size="sm" disabled={busy} onClick={() => onResolve(view)}>
-              恢复处置…
-            </Button>
-          ) : (
-            <p className="text-muted-foreground">该批次当前没有允许的恢复处置动作，只能继续人工只读核对。</p>
-          )}
-        </div>
-      )}
-    </details>
   )
 }
 
@@ -1715,262 +974,5 @@ function CopyCheckCard({ check }: { check: WpsCopyCheck }) {
         </>
       )}
     </Callout>
-  )
-}
-
-/**
- * 第 14 项：账本兜底卡片（重建 + 抢救）。
- *
- * 只在账本**确实有问题**时出现（blocking / advisory / 损坏）。普通 `missing`
- * （没有任何历史痕迹）不占地方 —— 那多半就是第一次用，预览里那句"可能是首次
- * 同步"已经说过一次了；这里再吓一次就成了噪音。
- */
-function LedgerRebuildCard({ status, outcome, error, summary, busy, rebuildLabel, salvageLabel, onRebuild, onSalvage }: {
-  status: WpsRecoveryStatus | null
-  outcome: RebuildOutcomeView | null
-  error: string
-  summary: string
-  busy: boolean
-  rebuildLabel: string
-  salvageLabel: string
-  onRebuild: () => void
-  onSalvage: () => void
-}) {
-  const visibility = rebuildVisibility(status)
-  const salvageReady = salvageVisibility(status) === 'available'
-  if (visibility === 'hidden' && !salvageReady && !outcome && !error) return null
-  const stateText = ledgerStateLabel(status?.ledger_state, status?.ledger_lost === true)
-  return (
-    <Callout
-      tone={outcome?.tone ?? (visibility === 'blocking' ? 'danger' : 'warning')}
-      title={outcome?.title || '本地账本不可信：可以重建锚点'}
-    >
-      <p>
-        {outcome
-          ? outcome.detail
-          : `${stateText}。重建只按云端现状逐行推断「这一批是否已经入账」：判成已入账的行下一批不会再加，判错只会漏加。`}
-      </p>
-      {!outcome && summary && <p className="mt-0.5">{summary}</p>}
-      <p className="mt-1 font-medium text-foreground">
-        下一步：{outcome
-          ? outcome.nextStep
-          : '先「查看重建提案（只读）」，逐行核对判定后再确认写入。'}
-      </p>
-      <p className="mt-1 text-muted-foreground">
-        两个入口都只写本地账本，不写云端（cloud_write=false），也不解除防重复闸门。
-        {outcome?.blockingRetained ? ' 阻断仍然保留：未核清前不要上传。' : ''}
-      </p>
-      {error && <p className="mt-1 text-warning">{error}</p>}
-      <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1">
-        <button
-          type="button"
-          className="font-medium text-primary underline"
-          disabled={busy}
-          onClick={onRebuild}
-        >
-          {rebuildLabel}
-        </button>
-        {salvageReady && (
-          <button
-            type="button"
-            className="font-medium text-primary underline"
-            disabled={busy}
-            onClick={onSalvage}
-          >
-            {salvageLabel}
-          </button>
-        )}
-      </div>
-    </Callout>
-  )
-}
-
-/** 卡片上那一行统计：有结果时不重复显示清单统计。 */
-function ledgerCardSummary(rebuild: WpsLedgerRebuildResult | null,
-                           salvage: WpsLedgerSalvageResult | null,
-                           hasOutcome: boolean): string {
-  if (hasOutcome) return ''
-  if (salvage) return salvageCountsSummary(salvage.counts)
-  if (rebuild) return rebuildCountsSummary(rebuild.counts)
-  return ''
-}
-
-function rebuildButtonLabel(busy: boolean, proposal: WpsLedgerRebuildResult | null): string {
-  if (busy) return '处理中…'
-  return proposal ? '重新生成提案（只读）' : '查看重建提案（只读）'
-}
-
-function salvageButtonLabel(busy: boolean, proposal: WpsLedgerSalvageResult | null): string {
-  if (busy) return '处理中…'
-  return proposal ? '重新生成抢救清单（只读）' : '先试着抢救账本（只读清单）'
-}
-
-/**
- * 重建确认弹窗：逐行列出判定，要求人工核对说明 + **逐字**输入确认词。
- *
- * 复用上传用的 `ConfirmActionDialog`（同一套"确认才动"的样式与开关门逻辑）。
- */
-function LedgerRebuildDialog({ open, proposal, confirm, note, error, busy, onConfirmText, onNote, onClose, onSubmit }: {
-  open: boolean
-  proposal: WpsLedgerRebuildResult | null
-  confirm: string
-  note: string
-  error: string
-  busy: boolean
-  onConfirmText: (value: string) => void
-  onNote: (value: string) => void
-  onClose: () => void
-  onSubmit: () => void
-}) {
-  if (!proposal) return null
-  const tables = proposal.tables ?? []
-  const fieldClass = 'mt-1 w-full rounded-[6px] border border-transparent bg-secondary px-2.5 py-1.5 text-xs outline-none focus-visible:border-ring focus-visible:bg-card'
-  return (
-    <ConfirmActionDialog
-      open={open}
-      onOpenChange={(next) => { if (!next) onClose() }}
-      title="按云端现状重建本批账本锚点"
-      description={`${rebuildCountsSummary(proposal.counts)}。方向是宁漏勿重：判成「已入账」的行下一批不会再加，判错只会漏加。`}
-      details={
-        <div className="space-y-2">
-          <p className="text-muted-foreground">{REBUILD_RISK_TEXT}</p>
-          {(proposal.warnings ?? []).map((warning) => (
-            <p key={warning} className="text-warning">⚠ {warning}</p>
-          ))}
-          {tables.map((table) => (
-            <div key={table.sheet} className="rounded-[6px] border bg-card px-2 py-1.5">
-              <p className="font-medium text-foreground">
-                {table.sheet}{table.skipped_reason ? '（本次不重建）' : ''}
-              </p>
-              {table.skipped_reason && (
-                <p className="text-muted-foreground">{table.skipped_reason}</p>
-              )}
-              <ul className="mt-1 max-h-40 space-y-0.5 overflow-y-auto text-[11px]">
-                {table.rows.map((row) => (
-                  <li key={`${table.sheet}:${row.name}:${row.phone}:${row.slot}`}>
-                    {rebuildRowText(row)}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ))}
-          <label className="block">
-            <span className="text-muted-foreground">
-              人工核对说明（至少 {REBUILD_MIN_NOTE} 个字符，写进本地账本审计）
-            </span>
-            <textarea
-              id="wps-rebuild-note"
-              className={fieldClass}
-              rows={2}
-              value={note}
-              onChange={(event) => onNote(event.target.value)}
-            />
-          </label>
-          <label className="block">
-            <span className="text-muted-foreground">
-              逐字输入 {REBUILD_CONFIRM_WORD} 才能写入本地账本
-            </span>
-            <input
-              id="wps-rebuild-confirm"
-              className={fieldClass}
-              value={confirm}
-              autoComplete="off"
-              onChange={(event) => onConfirmText(event.target.value)}
-            />
-          </label>
-          {error && <p className="text-warning">{error}</p>}
-        </div>
-      }
-      acknowledge="我已逐行核对上面的判定（判成「已入账」的行本批不会再加，判错只会漏加），并确认按云端现状重建"
-      confirmLabel="确认重建"
-      busy={busy}
-      danger
-      onConfirm={onSubmit}
-    />
-  )
-}
-
-/**
- * 抢救确认弹窗：逐条列出「会留下谁、会丢掉谁」，要求核对说明 + 逐字输入确认词。
- *
- * 复用上传用的 `ConfirmActionDialog`（同一套"确认才动"的样式与勾选门禁）。
- */
-function LedgerSalvageDialog({ open, proposal, confirm, note, error, busy, onConfirmText, onNote, onClose, onSubmit }: {
-  open: boolean
-  proposal: WpsLedgerSalvageResult | null
-  confirm: string
-  note: string
-  error: string
-  busy: boolean
-  onConfirmText: (value: string) => void
-  onNote: (value: string) => void
-  onClose: () => void
-  onSubmit: () => void
-}) {
-  if (!proposal) return null
-  const dropped = proposal.dropped ?? []
-  const droppedTotal = Number(proposal.counts?.dropped_total || 0)
-  const fieldClass = 'mt-1 w-full rounded-[6px] border border-transparent bg-secondary px-2.5 py-1.5 text-xs outline-none focus-visible:border-ring focus-visible:bg-card'
-  return (
-    <ConfirmActionDialog
-      open={open}
-      onOpenChange={(next) => { if (!next) onClose() }}
-      title="抢救本地账本：只丢坏掉的那几条"
-      description={`${salvageCountsSummary(proposal.counts)}。写之前会先给原件留档，云端一个格子都不动。`}
-      details={
-        <div className="space-y-2">
-          <p className="text-muted-foreground">{SALVAGE_RISK_TEXT}</p>
-          {(proposal.warnings ?? []).map((warning) => (
-            <p key={warning} className="text-warning">⚠ {warning}</p>
-          ))}
-          {dropped.length === 0 ? (
-            <p className="text-muted-foreground">清单里没有被丢弃的条目。</p>
-          ) : (
-            <ul className="max-h-40 space-y-0.5 overflow-y-auto rounded-[6px] border bg-card px-2 py-1.5 text-[11px]">
-              {dropped.map((item, index) => (
-                <li key={`${item.scope}:${item.day}:${item.file}:${item.name}:${index}`}>
-                  {salvageDroppedText(item)}
-                </li>
-              ))}
-            </ul>
-          )}
-          {droppedTotal > dropped.length && (
-            <p className="text-muted-foreground">
-              另外还有 {droppedTotal - dropped.length} 条没有展开，总数以统计为准。
-            </p>
-          )}
-          <label className="block">
-            <span className="text-muted-foreground">
-              人工核对说明（至少 {SALVAGE_MIN_NOTE} 个字符，写进本地账本审计）
-            </span>
-            <textarea
-              id="wps-salvage-note"
-              className={fieldClass}
-              rows={2}
-              value={note}
-              onChange={(event) => onNote(event.target.value)}
-            />
-          </label>
-          <label className="block">
-            <span className="text-muted-foreground">
-              逐字输入 {SALVAGE_CONFIRM_WORD} 才能写回本地账本
-            </span>
-            <input
-              id="wps-salvage-confirm"
-              className={fieldClass}
-              value={confirm}
-              autoComplete="off"
-              onChange={(event) => onConfirmText(event.target.value)}
-            />
-          </label>
-          {error && <p className="text-warning">{error}</p>}
-        </div>
-      }
-      acknowledge="我已逐条核对要丢掉的条目，并确认按这份清单抢救（丢掉的那些人就没有锚点了）"
-      confirmLabel="确认抢救"
-      busy={busy}
-      danger
-      onConfirm={onSubmit}
-    />
   )
 }
