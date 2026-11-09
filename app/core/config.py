@@ -17,17 +17,19 @@ MAX_SPLIT_RATIO = 0.55
 _CONFIG_SAVE_LOCK = threading.RLock()
 
 #: 出厂默认值的迁移版本号。`sss_max_workers` / `sss_read_timeout_s` 在界面上从来
-#: 没有入口，旧配置里保存的只可能是**当时的出厂默认**；直接改默认值对已有安装无效
-#: （`load()` 会把磁盘上的旧值原样读回来）。因此用这个版本号做**一次性**迁移：
-#: 只把仍等于旧出厂默认的取值搬到新默认，用户显式改过的其它取值（2、6、12、20…）
-#: 一律保留。旧配置缺这个键 → 视为 0（迁移前）。
-DEFAULTS_REVISION = 4
+#: 没有入口，杭电地址顺序出厂后也不会自动更新；旧配置里保存的只可能是**当时的
+#: 出厂默认**。直接改默认值对已有安装无效（`load()` 会把磁盘上的旧值原样读回来），
+#: 因此用这个版本号做**一次性**迁移：只把仍等于旧出厂默认的取值搬到新默认，用户
+#: 显式改过的其它取值（2、6、12、20…）一律保留。旧配置缺这个键 → 视为 0（迁移前）。
+DEFAULTS_REVISION = 5
 
 #: v0 → v1：下单并发 4 → 8、读取超时 20 → 30 秒。
 #: v1 → v2：下单并发 8 → 4（读取超时 30 秒不变）。
 #: v2 → v3：下单并发 4 → 1（默认串行；读取超时 30 秒不变）。
 #: v3 → v4：下单并发 1 → 4，提交节流 2.5 秒 → 0（关闭节流），回到提速取向；
 #: 同时把 `wps_test_mode` 的出厂值 True → False（见下方 `_V3_DEFAULT_WPS_TEST_MODE`）。
+#: v4 → v5：杭电取餐点地址顺序「北门、东1门」→「北门、东门、西区」（后台 2026-11
+#: 起地址规则改成三个取餐点，见 `DEFAULT_ADDRESS_ORDER`）。
 #: 并发依据：平台的建单路径存在偶发内部异常（`IndexOutOfBoundsException` 等），
 #: 且失败比例与提交节奏无关——放慢提交并不能减少失败。因此出厂按并发 4 路、不限速；
 #: 需要串行或另行节流时把 `sss_max_workers` 配成 1、`sss_submit_min_interval_s`
@@ -95,10 +97,13 @@ DEFAULT_ADDRESS_ORDER: Dict[str, list] = {
     "衣锦晚餐": ["外卖柜", "校门口"],
     "医学院中餐": [],
     "医学院晚餐": [],
-    # 杭电信工：两个取餐点，北门在前（用户 2026-10-07 确认）。
-    "杭电午餐": ["北门", "东1门"],
-    "杭电晚餐": ["北门", "东1门"],
+    # 杭电信工：2026-11 起三个取餐点，顺序 北门 → 东门 → 西区（用户 2026-11-09 确认）。
+    "杭电午餐": ["北门", "东门", "西区"],
+    "杭电晚餐": ["北门", "东门", "西区"],
 }
+
+#: v4 及更早的杭电出厂地址顺序（迁移用：配置仍等于它才搬到新默认）。
+_V4_DEFAULT_HANGDIAN_ADDRESS_ORDER = ["北门", "东1门"]
 
 
 def default_wps_production_tables() -> Dict[str, Dict[str, str]]:
@@ -447,6 +452,13 @@ class AppConfig:
         self.wps_marker_enabled = bool(wps_marker_enabled)
         self.wps_sort_enabled = bool(wps_sort_enabled)
         self.wps_address_order = normalize_wps_address_order(wps_address_order)
+        if revision < 5:
+            # v4 及更早的出厂顺序是「北门、东1门」：仍等于它的搬到新顺序，
+            # 用户自己改过的（例如把东1门放在最前）一律不动。
+            for sheet in ("杭电午餐", "杭电晚餐"):
+                if (self.wps_address_order.get(sheet)
+                        == _V4_DEFAULT_HANGDIAN_ADDRESS_ORDER):
+                    self.wps_address_order[sheet] = list(DEFAULT_ADDRESS_ORDER[sheet])
         self.config_path = config_path
         # Snapshot used by ``save`` to distinguish "this instance never touched
         # the field" from "another thread/process wrote a newer value".

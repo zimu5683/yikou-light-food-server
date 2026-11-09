@@ -8,7 +8,9 @@ import pytest
 
 from app.order.delivery import (
     detect_campus,
+    get_donghu_delivery_mode,
     normalize_delivery_point as ndp,
+    normalize_donghu_delivery_point as nddp,
 )
 
 # (原文, 期望点名, 期望置信度, 期望校区)
@@ -126,3 +128,73 @@ def test_explicit_west_gate_wins_over_duplicated_generic_prefix():
     res = ndp("浙江农林大学东湖校区-西门 大西门外卖柜")
     assert res["point"] == "大西"
     assert res["confidence"] == "high"
+
+
+# ----------------------------------------------------------------------
+# 东湖：小字先分「存柜 / 寝室楼下」，再到地址里找点位（2026-11 店主口径）
+# ----------------------------------------------------------------------
+def test_donghu_delivery_mode_from_product_note():
+    assert get_donghu_delivery_mode("东湖小西门大西门存柜费用") == "存柜"
+    assert get_donghu_delivery_mode("东湖小西门大西门存柜费") == "存柜"
+    assert get_donghu_delivery_mode("东湖小西门大西门寄存费用") == "存柜"
+    assert get_donghu_delivery_mode("东湖校区配送寝室楼下外卖柜") == "楼下"
+    assert get_donghu_delivery_mode("东湖配送寝室楼下外卖柜") == "楼下"
+    assert get_donghu_delivery_mode("送到楼下") == "楼下"
+    assert get_donghu_delivery_mode("") == ""
+    assert get_donghu_delivery_mode("联建门口外卖柜") == ""
+
+
+# (小字, 地址, 期望点位, 期望置信度)
+DONGHU_SPEC_CASES = [
+    # 存柜单：只写门名 → 门
+    ("东湖小西门大西门存柜费用",
+     "浙江省杭州市临安区浙江农林大学(东湖校区) 大西门", "大西", "high"),
+    ("东湖小西门大西门存柜费",
+     "浙江省杭州市临安区浙江农林大学(东湖校区)-西南1门 小西门外卖柜", "小", "high"),
+    # 存柜单：楼栋与门名并存 → 按寝室楼记录（不需要写门名）
+    ("东湖小西门大西门存柜费用",
+     "浙江省杭州市临安区浙江农林大学(东湖校区)-A6号楼 A6418小西门", "A6", "high"),
+    # 存柜单：只写寝室楼（没写门名）→ 交人工填写
+    ("东湖小西门大西门存柜费用",
+     "浙江省杭州市临安区浙江农林大学(东湖校区) A7", "", "unknown"),
+    ("东湖小西门大西门存柜费用",
+     "浙江省杭州市临安区浙江农林大学(东湖校区) D1宿舍楼", "", "unknown"),
+    # 寝室楼下单：地址里的寝室楼/命名取餐点
+    ("东湖校区配送寝室楼下外卖柜",
+     "浙江省杭州市临安区浙江农林大学(东湖校区) C11", "C11", "high"),
+    ("东湖配送寝室楼下外卖柜",
+     "浙江省杭州市临安区浙江农林大学(东湖校区) D2宿舍", "D2", "high"),
+    ("东湖校区配送寝室楼下外卖柜",
+     "浙江省杭州市临安区浙江农林大学(东湖校区)图书馆 外卖柜", "图书馆", "high"),
+    # 寝室楼下单：门名与楼栋并存时仍按寝室楼
+    ("东湖校区配送寝室楼下外卖柜",
+     "浙江省杭州市临安区浙江农林大学(东湖校区) A6号楼(A6418小西门)", "A6", "high"),
+    # 寝室楼下单：地址里只有门名/没有寝室楼 → 交人工填写
+    ("东湖校区配送寝室楼下外卖柜",
+     "浙江省杭州市临安区浙江农林大学(东湖校区) 大西门", "", "unknown"),
+    ("东湖校区配送寝室楼下外卖柜",
+     "浙江省杭州市临安区浙江农林大学(东湖校区)", "", "unknown"),
+]
+
+
+@pytest.mark.parametrize("note,address,point,confidence", DONGHU_SPEC_CASES)
+def test_donghu_spec_driven_point(note, address, point, confidence):
+    res = nddp(address, note)
+    assert res["point"] == point, f"{address}: {res}"
+    assert res["confidence"] == confidence, f"{address}: {res}"
+
+
+def test_donghu_unknown_spec_falls_back_to_old_address_rule():
+    # 小字认不出（空/其它校区文案）时保持旧行为，不改变历史口径。
+    address = "浙江省杭州市临安区浙江农林大学(东湖校区) A5"
+    for note in ("", "联建门口外卖柜"):
+        res = nddp(address, note)
+        assert (res["point"], res["confidence"]) == ("A5", "high")
+
+
+def test_donghu_alias_hit_is_trusted():
+    address = "浙江省杭州市临安区浙江农林大学(东湖校区) C'6321"
+    res = nddp(address, "东湖小西门大西门存柜费用", aliases={address: "C6"})
+    assert (res["point"], res["confidence"]) == ("C6", "high")
+    assert res["reason"] == "别名表命中"
+

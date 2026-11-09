@@ -71,14 +71,18 @@ def get_address_base_sheet_name(delivery_address: Any, product_note: Any = "") -
 
 
 def get_hangdian_address_from_product_note(product_note: Any, delivery_address: Any = "") -> str:
-    """判定杭电信工取餐点：规格里选的门优先，其次看地址原文；认不出返回空串。
+    """判定杭电信工取餐点：规格（小字）里选的门优先，其次看地址原文；认不出返回空串。
 
-    规格文案即后台商品选项（``杭电信工（北门外卖架）`` / ``杭电信工（东1门）``），
-    地址里通常也会带上门名（``北门三号楼``、``…杭电路1号北门``）。
+    规格文案即后台商品选项，2026-11 起固定为三个取餐点：``杭电信工（北门）`` /
+    ``杭电信工（东门）`` / ``杭电信工（西区）``。历史订单里还有旧文案
+    ``杭电信工（北门外卖架）`` / ``杭电信工（东1门）``，旧「东1门/东一门」
+    与现在的「东门」是同一个门，统一写成「东门」；地址原文仅作兜底。
     """
     for text in (str(product_note or ""), str(delivery_address or "")):
-        if "东1门" in text or "东一门" in text:
-            return "东1门"
+        if "西区" in text:
+            return "西区"
+        if "东门" in text or "东1门" in text or "东一门" in text:
+            return "东门"
         if "北门" in text:
             return "北门"
     return ""
@@ -251,7 +255,7 @@ def _sort_key_for_address(address: Any, campus: str) -> tuple[int, int, int]:
     东湖：大西 → 小/小西 → A/B/C/D（按数字升序）→ 其他；
     衣锦：校门口 → 外卖柜 → 其他；
     医学院：医 N号（按数字升序；兼容旧写法 医N号）→ 其他；
-    杭电：北门 → 东1门 → 其他。
+    杭电：北门 → 东门（旧 东1门/东一门 并入）→ 西区 → 其他。
     """
     value = str(address or "").strip()
     if not value:
@@ -279,10 +283,13 @@ def _sort_key_for_address(address: Any, campus: str) -> tuple[int, int, int]:
             return (0, int(match.group(1)), 0)
         return (9, 0, 0)
     if campus == "杭电":
+        # 2026-11 起三个取餐点：北门 → 东门 → 西区；旧「东1门/东一门」并入东门。
         if "北门" in value:
             return (0, 0, 0)
-        if "东1门" in value or "东一门" in value:
+        if "东门" in value or "东1门" in value or "东一门" in value:
             return (1, 0, 0)
+        if "西区" in value:
+            return (2, 0, 0)
         return (9, 0, 0)
     return (9, 0, 0)
 

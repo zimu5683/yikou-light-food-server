@@ -1500,7 +1500,7 @@ def test_hangdian_local_sheet_plans_against_its_cloud_table(tmp_path: Path):
                        tables={"杭电午餐": {"file_id": "H1"}},
                        target=dt.date(2026, 9, 11), run_date=dt.date(2026, 9, 10),
                        ledger=None,
-                       address_order={"杭电午餐": ["北门", "东1门"]},
+                       address_order={"杭电午餐": ["北门", "东门", "西区"]},
                        sort_enabled=False)
     assert [plan.sheet for plan in plans] == ["杭电午餐"]
     assert [c.name for c in plans[0].changes] == ["陈木"]
@@ -2083,3 +2083,19 @@ def test_排序后地址核对不通过时整表停写():
     assert item["uncertain"] is True and "地址核对不通过" in item["reason"]
     assert cli.grid[(2, 7)] == "3", "定位存疑时不得改动云端总餐次"
     assert "重新上传" in item["reason"]
+
+
+# ----------------------------------------------------------------------
+# 杭电地址别名：旧「东1门/东一门」与新的「东门」是同一组
+# ----------------------------------------------------------------------
+def test_hangdian_legacy_east_gate_is_the_same_address_group():
+    from app.wps.common import _address_key, build_address_ranks, canonical_address
+
+    order = ["北门", "东门", "西区"]
+    assert canonical_address("东1门", order) == "东门"
+    assert canonical_address("东一门", order) == "东门"
+    assert canonical_address("西区", order) == "西区"
+
+    ranks, tail = build_address_ranks(order, ["北门", "东1门", "西区", "未识别写法"])
+    assert ranks[_address_key("东1门")] == ranks[_address_key("东门")] == 1
+    assert ranks.get(_address_key("未识别写法"), tail) == tail

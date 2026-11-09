@@ -292,6 +292,27 @@ def test_load_migrates_test_mode_in_an_old_file(tmp_path):
 
 
 # ----------------------------------------------------------------------
+# v4 → v5：杭电地址顺序「北门、东1门」→「北门、东门、西区」
+# ----------------------------------------------------------------------
+def test_legacy_hangdian_address_order_is_migrated():
+    migrated = AppConfig(defaults_revision=4,
+                         wps_address_order={"杭电午餐": ["北门", "东1门"],
+                                            "杭电晚餐": ["北门", "东1门"]})
+    assert migrated.wps_address_order["杭电午餐"] == ["北门", "东门", "西区"]
+    assert migrated.wps_address_order["杭电晚餐"] == ["北门", "东门", "西区"]
+    assert migrated.defaults_revision == DEFAULTS_REVISION
+
+
+def test_custom_hangdian_address_order_is_kept():
+    custom = AppConfig(defaults_revision=4,
+                       wps_address_order={"杭电午餐": ["东1门", "北门"]})
+    assert custom.wps_address_order["杭电午餐"] == ["东1门", "北门"]
+    current = AppConfig(defaults_revision=DEFAULTS_REVISION,
+                        wps_address_order={"杭电午餐": ["北门", "东1门"]})
+    assert current.wps_address_order["杭电午餐"] == ["北门", "东1门"]
+
+
+# ----------------------------------------------------------------------
 # save → load 往返：**合法**取值必须逐字段保真
 # ----------------------------------------------------------------------
 ROUNDTRIP_FIELDS = {

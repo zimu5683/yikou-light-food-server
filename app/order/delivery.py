@@ -13,6 +13,11 @@
 - 医学院：宿舍楼输出 ``医 N号``（如 医 5号/医 6号，医与数字之间有空格）；
   ``12/34/56/78`` 等相邻楼号写法取每对中的单号（12→1、三四→3、五六→5、七八→7）。
 - 楼与校门并存时放宿舍楼下，取楼码不取校门（prefer_gate_when_both=False）。
+- 东湖取餐点（2026-11 店主新口径）：**先看商品规格（小字）**再找地址——
+  「小西门大西门存柜费用/存柜费」是存柜单，地址只写门名时取「小」/「大西」；
+  同时写了寝室楼和门名时按寝室楼记录（不需要写门名），只写寝室楼没写门名则交
+  人工填写；「配送寝室楼下外卖柜」是寝室楼下单，地址里找寝室楼/命名点，找不到
+  也交人工填写（见 normalize_donghu_delivery_point）。
 
 规则层负责剥前缀、抽楼码/校门/命名点，能自动覆盖绝大多数订单；无法自动
 判定的写法返回 medium/unknown 置信度，由上层人工确认一次并写入别名表，
@@ -22,12 +27,12 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Optional
+from typing import Any, Optional
 
 # 校区判定关键词（与 processing.ADDRESS_SHEET_MAP 保持同源语义）
 CAMPUS_YIXUE_KEYWORDS = ("医学院", "杭州医学院", "medical college")
 CAMPUS_DONGHU_KEYWORDS = ("东湖", "农林", "农大")
-# 杭电信工：后台地址库里有中文全称与英文全称两种写法（取餐点北门/东1门由
+# 杭电信工：后台地址库里有中文全称与英文全称两种写法（取餐点北门/东门/西区由
 # 商品规格决定，见 parsing.get_hangdian_address_from_product_note）。
 CAMPUS_HANGDIAN_KEYWORDS = ("杭电信工", "杭电", "杭州电子科技大学", "信息工程学院",
                             "hangzhou dianzi", "information engineering")
@@ -377,3 +382,99 @@ def normalize_delivery_point(
         "reason": reason, "raw_address": raw,
         "candidates": dict(cands), "cabinet": has_cabinet,
     }
+
+
+# ----------------------------------------------------------------------
+# 东湖：先按商品规格（小字）分「存柜 / 寝室楼下」，再到地址里找点位
+# ----------------------------------------------------------------------
+#: 商品规格（小字）里出现这些词 = 存柜单（后台文案有「存柜费」「存柜费用」「寄存费用」等变体）。
+DONGHU_CABINET_KEYWORDS = ("存柜", "寄存")
+#: 商品规格里出现这些词 = 寝室楼下单。
+DONGHU_DOWNSTAIRS_KEYWORDS = ("寝室楼下", "送到楼下", "送慢至楼下")
+#: 校门柜点位（大西/小）；其余候选一律按寝室楼/命名取餐点处理。
+DONGHU_GATE_POINTS = frozenset(GATE_POINT.values())
+
+
+def get_donghu_delivery_mode(product_note: Any) -> str:
+    """东湖商品规格（小字）→ ``存柜`` / ``楼下`` / ``""``（认不出）。"""
+    note = str(product_note or "")
+    if any(keyword in note for keyword in DONGHU_CABINET_KEYWORDS):
+        return "存柜"
+    if any(keyword in note for keyword in DONGHU_DOWNSTAIRS_KEYWORDS):
+        return "楼下"
+    return ""
+
+
+def normalize_donghu_delivery_point(address: Any, product_note: Any = "", *,
+                                    aliases: Optional[dict[str, str]] = None) -> dict:
+    """东湖取餐点：先看小字是存柜还是寝室楼下，再到地址里找对应点位。
+
+    2026-11 店主口径：
+
+    * 存柜单（「东湖小西门大西门存柜费用」）：
+      - 地址里同时写了寝室楼和门名 → 按寝室楼记录（不需要写门名）；
+      - 只写了门名 → ``大西`` / ``小``；
+      - 只写寝室楼（没写门名）或两个门名都出现 → 交人工填写（unknown）。
+    * 寝室楼下单（「东湖…配送寝室楼下外卖柜」）：
+      - 地址里找到寝室楼/命名取餐点 → 用它；多个候选 → medium（人工确认）；
+      - 地址里没有寝室楼/取餐点 → 交人工填写（unknown）。
+    * 小字认不出/为空、或地址命中别名表 → 退回原地址规则，不改变旧行为。
+    """
+    raw = str(address or "").strip()
+    base = normalize_delivery_point(raw, aliases=aliases)
+    mode = get_donghu_delivery_mode(product_note)
+    if not mode or base.get("reason") == "别名表命中":
+        return base
+    point = str(base.get("point") or "")
+    cands = dict(base.get("candidates") or {})
+    # 「学院楼」「A区」这类只是提示、置信度 unknown 的点位不算已识别点位。
+    if point and point not in cands and base.get("confidence") != "unknown":
+        cands[point] = 1
+    gates = {name: count for name, count in cands.items() if name in DONGHU_GATE_POINTS}
+    rooms = {name: count for name, count in cands.items() if name not in DONGHU_GATE_POINTS}
+    if mode == "存柜":
+        if rooms and gates:
+            # 楼栋与门名并存：按店主口径写寝室楼（不需要写门名）。
+            if len(rooms) == 1:
+                chosen, confidence = next(iter(rooms)), "high"
+            elif base.get("confidence") == "high" and base.get("point") in rooms:
+                # 现有规则已定死的多点（如 D1/D2 并存取 D2）直接沿用。
+                return base
+            else:
+                chosen, _detail = _pick_primary(rooms, False)
+                confidence = "medium"
+            return {**base, "point": _canonical_point_name(chosen),
+                    "confidence": confidence,
+                    "reason": "规格选存柜；地址含寝室楼与门名，按寝室楼记录",
+                    "candidates": rooms}
+        if rooms:
+            return {**base, "point": "", "confidence": "unknown",
+                    "reason": "规格选存柜，但地址只写寝室楼、没写大西门/小西门，请手工填写",
+                    "candidates": rooms}
+        if len(gates) == 1:
+            gate = next(iter(gates))
+            return {**base, "point": gate, "confidence": "high",
+                    "reason": "规格选存柜，地址写明门名", "candidates": gates}
+        if len(gates) > 1:
+            return {**base, "point": "", "confidence": "unknown",
+                    "reason": "规格选存柜，但地址同时出现大西门与小西门，请手工填写",
+                    "candidates": gates}
+        return {**base, "point": "", "confidence": "unknown",
+                "reason": "规格选存柜，但地址里没有门名也没有寝室楼，请手工填写",
+                "candidates": {}}
+    # 寝室楼下单：只认寝室楼/命名取餐点，门名不算。
+    if rooms:
+        if len(rooms) == 1:
+            chosen, confidence, reason = next(iter(rooms)), "high", "规格选寝室楼下，地址定位到寝室楼"
+        elif base.get("confidence") == "high" and base.get("point") in rooms:
+            # 现有规则已定死的多点（如 D1/D2 并存取 D2）直接沿用。
+            return base
+        else:
+            chosen, detail = _pick_primary(rooms, False)
+            confidence = "medium"
+            reason = f"规格选寝室楼下，地址出现多个候选（{detail}）"
+        return {**base, "point": _canonical_point_name(chosen), "confidence": confidence,
+                "reason": reason, "candidates": rooms}
+    return {**base, "point": "", "confidence": "unknown",
+            "reason": "规格选寝室楼下，但地址里没有寝室楼/取餐点，请手工填写",
+            "candidates": gates}

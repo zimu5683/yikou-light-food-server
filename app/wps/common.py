@@ -87,7 +87,8 @@ SORT_FLAG_NEW = 1
 SORT_FLAG_BLANK = 2
 
 
-ADDRESS_ALIASES = {"小西": "小"}
+# 已知地址写法别名（旧/本地写法 → 云端最新口径）。杭电旧「东1门/东一门」= 现在的「东门」。
+ADDRESS_ALIASES = {"小西": "小", "东1门": "东门", "东一门": "东门"}
 
 
 MAX_SCAN_ROW = 400
@@ -225,8 +226,12 @@ def normalize_phone(value: Any) -> str:
 
 
 def _address_key(text: Any) -> str:
-    """地址组匹配键：去空白 + 忽略大小写（云端「b2」和本地「B2」是同一组）。"""
-    return re.sub(r"\s+", "", str(text or "")).casefold()
+    """地址组匹配键：先过别名，再去空白 + 忽略大小写。
+
+    「b2」与「B2」是同一组；杭电旧写法「东1门」/「东一门」与「东门」也是同一组。
+    """
+    raw = ADDRESS_ALIASES.get(str(text or "").strip(), str(text or "").strip())
+    return re.sub(r"\s+", "", raw).casefold()
 
 
 def canonical_address(raw: Any, order: Sequence[str] = ()) -> str:

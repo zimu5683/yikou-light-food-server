@@ -70,8 +70,8 @@ def test_hangdian_lunch_has_a_cloud_table_and_a_default_address_order():
         "bDV7kDE3nxMmpbLBEXvL1xeYd5SMMSTRn")
 
     order = default_wps_address_order()
-    assert order["杭电午餐"] == ["北门", "东1门"]
-    assert order["杭电晚餐"] == ["北门", "东1门"]
+    assert order["杭电午餐"] == ["北门", "东门", "西区"]
+    assert order["杭电晚餐"] == ["北门", "东门", "西区"]
 
 
 # ----------------------------------------------------------------------

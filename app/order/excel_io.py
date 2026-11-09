@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.core.models import MealInfo, OrderInfo
-from app.order.delivery import normalize_delivery_point
+from app.order.delivery import normalize_delivery_point, normalize_donghu_delivery_point
 from app.order.parsing import get_address_base_sheet_name, meal_type_label, order_sheet_name
 
 
@@ -115,7 +115,12 @@ def _write_unrouted_order(wb: Any, order: OrderInfo, meal: MealInfo, meal_type: 
 def _prepare_order_address(order: OrderInfo, aliases: dict[str, str]) -> dict[str, Any]:
     """Apply canonical address rules while retaining the platform address."""
     raw = order.delivery_address or order.address or ""
-    result = normalize_delivery_point(raw, aliases=aliases)
+    if order.address_base_sheet == "东湖":
+        # 东湖：商品规格（小字）先分存柜/寝室楼下，再到地址里找点位。
+        note = str((order.metadata or {}).get("product_note") or "")
+        result = normalize_donghu_delivery_point(raw, note, aliases=aliases)
+    else:
+        result = normalize_delivery_point(raw, aliases=aliases)
     campus = result.get("campus")
     base = order.address_base_sheet
     hangdian = base == "杭电" or campus == "杭电信工"
@@ -149,7 +154,7 @@ def _prepare_order_address(order: OrderInfo, aliases: dict[str, str]) -> dict[st
             "reason": "衣锦沿用商品备注规则", "candidates": {point: 1},
         }
     elif base == "杭电":
-        # 取餐点已在 _order_from_api_data 里按规格（其次地址）判定；认不出来就
+        # 取餐点已在 _order_from_api_data 里按规格（小字，其次地址）判定；认不出来就
         # 降级为待确认：界面弹窗让人工填，没填的以原始地址追加到表尾（与其它
         # 校区 medium 置信度的回退一致），不会丢单。
         point = order.address or ""
@@ -161,7 +166,7 @@ def _prepare_order_address(order: OrderInfo, aliases: dict[str, str]) -> dict[st
         else:
             result = {
                 **result, "campus": "杭电信工", "point": "", "confidence": "unknown",
-                "reason": "杭电订单未识别出取餐点（规格与地址都没有北门/东1门）",
+                "reason": "杭电订单未识别出取餐点（规格与地址都没有北门/东门/西区）",
                 "candidates": {},
             }
     order.metadata["delivery_point"] = result

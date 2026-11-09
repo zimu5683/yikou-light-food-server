@@ -97,18 +97,24 @@ def test_address_base_sheet_maps_hangdian_keywords_and_spec():
 def test_hangdian_point_from_product_note_and_address():
     from app.order.parsing import get_hangdian_address_from_product_note
 
-    # 规格优先（客户在选项里选的门），地址写别的门也不改判
-    assert get_hangdian_address_from_product_note("杭电信工（北门外卖架）") == "北门"
+    # 规格（小字）优先：客户在选项里选的点，地址写别的门也不改判
+    assert get_hangdian_address_from_product_note("杭电信工（北门）", "三号楼") == "北门"
     assert get_hangdian_address_from_product_note("杭电信工（北门外卖架）", "三号楼") == "北门"
-    assert get_hangdian_address_from_product_note("杭电信工（东1门）", "北门三号楼") == "东1门"
-    assert get_hangdian_address_from_product_note("杭电信工（东一门）") == "东1门"
+    assert get_hangdian_address_from_product_note("杭电信工（东门）", "北门三号楼") == "东门"
+    assert get_hangdian_address_from_product_note("杭电信工（西区）", "北门三号楼") == "西区"
+    # 旧文案「东1门/东一门」与现在的「东门」是同一个门，统一写「东门」
+    assert get_hangdian_address_from_product_note("杭电信工（东1门）", "北门三号楼") == "东门"
+    assert get_hangdian_address_from_product_note("杭电信工（东一门）") == "东门"
     # 规格没写门名时回退看地址原文
     assert get_hangdian_address_from_product_note("", "北门三号楼") == "北门"
     assert get_hangdian_address_from_product_note(
         "", "青山湖街道青山湖科技城杭电路1号北门") == "北门"
+    assert get_hangdian_address_from_product_note("", "西区外卖架") == "西区"
     # 两个信号都没有 → 空串（上层降级为待确认）
     assert get_hangdian_address_from_product_note("杭电信工", "三号楼") == ""
     assert get_hangdian_address_from_product_note("东湖配送寝室楼下外卖柜", "三号楼") == ""
+    # 地址里的「东二门」不是「东门」，不能误判（2026-11-08 W20 地址原文就是东二门）
+    assert get_hangdian_address_from_product_note("杭电信工", "东二门") == ""
 
 
 def test_hangdian_sheet_name_and_type_label():
@@ -146,13 +152,83 @@ def test_hangdian_order_from_api_data_uses_spec_then_address():
     _prepare_order_address(order, {})
     assert (order.address_base_sheet, order.address) == ("杭电", "北门")
 
-    # 规格选东1门。
+    # 旧文案「东1门」= 现在的「东门」。
     order = _order_from_api_data("W6", _hangdian_api_data(
         "浙江省杭州市临安区杭州电子科技大学信息工程学院(青山湖校区)", "三号楼",
         spec="杭电信工（东1门）"))
     _prepare_order_address(order, {})
-    assert (order.address_base_sheet, order.address) == ("杭电", "东1门")
+    assert (order.address_base_sheet, order.address) == ("杭电", "东门")
 
+
+
+def _donghu_api_data(address, description,
+                     spec="东湖校区配送寝室楼下外卖柜",
+                     goods="单点经济餐（午餐）"):
+    """构造 /channel/order/{id} 详情接口的 data 片段（字段名照抄实测响应）。"""
+    return {
+        "id": 14300000,
+        "address": {"address": address, "description": description,
+                    "contact": "陈木", "mobile": "15058927816"},
+        "goods": [{"name": goods, "num": 1,
+                   "attrData": {"matal": spec, "material": [{"name": spec}]}}],
+    }
+
+
+def test_hangdian_orders_2026_11_08_fill_three_points_from_spec():
+    """2026-11-08 实测的四张杭电单：小字分别是 东门/西区/北门/西区。"""
+    from app.order.excel_io import _prepare_order_address
+    from app.order.fetching import _order_from_api_data
+
+    cases = [
+        ("W7", "杭电信工（东门）", "西区外卖架", "东门"),
+        ("W11", "杭电信工（西区）",
+         "青山湖街道杭电路1号杭州电子科技大学信息工程学院菜鸟驿站", "西区"),
+        ("W16", "杭电信工（北门）", "北门", "北门"),
+        ("W20", "杭电信工（西区）", "东二门", "西区"),
+    ]
+    for code, spec, description, expected in cases:
+        order = _order_from_api_data(code, _hangdian_api_data(
+            "浙江省杭州市临安区杭州电子科技大学信息工程学院(青山湖校区)",
+            description, spec=spec))
+        result = _prepare_order_address(order, {})
+        assert (order.address_base_sheet, order.address) == ("杭电", expected), code
+        assert result["confidence"] == "high", code
+
+
+def test_donghu_orders_use_product_note_then_address():
+    """2026-11 实测东湖单：小字先分存柜/寝室楼下，再到地址里找点位。"""
+    from app.order.excel_io import _prepare_order_address
+    from app.order.fetching import _order_from_api_data
+
+    base = "浙江省杭州市临安区浙江农林大学(东湖校区)"
+    cases = [
+        # 存柜单：只写门名 → 门
+        ("W25", f"{base}-西南1门", "小西门外卖柜",
+         "东湖小西门大西门存柜费用", "小", "high"),
+        # 存柜单：楼栋与门名并存 → 写寝室楼（不需要写门名）
+        ("W13", f"{base}-A6号楼", "A6418小西门",
+         "东湖小西门大西门存柜费用", "A6", "high"),
+        # 存柜单：只写寝室楼（没写门名）→ 待确认
+        ("W26", base, "A4204", "东湖小西门大西门存柜费", "", "unknown"),
+        # 寝室楼下单：地址里的寝室楼/命名点
+        ("W24", base, "C11", "东湖校区配送寝室楼下外卖柜", "C11", "high"),
+        ("W22", base, "D2宿舍", "东湖配送寝室楼下外卖柜", "D2", "high"),
+        # 寝室楼下单：地址里没有寝室楼 → 待确认（个例先不管）
+        ("W5", f"{base}5楼教学", "教五外卖柜",
+         "东湖校区配送寝室楼下外卖柜", "", "unknown"),
+    ]
+    for code, address, description, spec, expected_point, expected_conf in cases:
+        order = _order_from_api_data(code, _donghu_api_data(address, description, spec))
+        assert order is not None, code
+        assert spec in order.metadata.get("product_note", ""), code
+        result = _prepare_order_address(order, {})
+        assert order.address_base_sheet == "东湖", code
+        assert result["confidence"] == expected_conf, (code, result)
+        if expected_conf == "high":
+            assert order.address == expected_point, (code, order.address)
+        else:
+            # 待确认：保留原始地址，交给界面弹窗人工填写
+            assert order.address == order.delivery_address, code
 
 def test_hangdian_order_without_any_point_goes_pending():
     from app.order.excel_io import _prepare_order_address
@@ -201,13 +277,14 @@ def test_sort_and_clear_cover_hangdian_sheets():
 
     wb = Workbook()
     lunch = wb.active
-    _build_sheet(lunch, ["东1门", "北门", "未识别写法"], "杭电午餐")
+    _build_sheet(lunch, ["西区", "东1门", "北门", "未识别写法"], "杭电午餐")
     dinner = wb.create_sheet("杭电晚餐")
-    _build_sheet(dinner, ["北门", "东1门"], "杭电晚餐")
+    _build_sheet(dinner, ["西区", "东门", "北门"], "杭电晚餐")
 
     sort_campus_sub_sheets(wb)
-    assert _col_c(lunch) == ["北门", "东1门", "未识别写法"]
-    assert _col_c(dinner) == ["北门", "东1门"]
+    # 顺序：北门 → 东门（旧「东1门」并入）→ 西区 → 认不出的排表尾
+    assert _col_c(lunch) == ["北门", "东1门", "西区", "未识别写法"]
+    assert _col_c(dinner) == ["北门", "东门", "西区"]
 
     cleared = clear_campus_sub_sheets(wb)
     assert sorted(cleared) == ["杭电午餐", "杭电晚餐"]

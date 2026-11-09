@@ -110,6 +110,8 @@ def _order_from_api_data(code: str, data: dict[str, Any]) -> OrderInfo | None:
         address = get_hangdian_address_from_product_note(notes_text, address)
     metadata = {
         "order_id": str(data.get("id") or ""),
+        # 商品规格（小字）：衣锦/杭电的取餐点、东湖的存柜/寝室楼下分流都要用。
+        "product_note": notes_text,
         "created_at": next((data.get(key) for key in
                              ("created_at", "createdAt", "create_time", "createTime", "order_time", "orderTime")
                              if data.get(key) not in (None, "")), None),
