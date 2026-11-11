@@ -44,16 +44,37 @@
   `pnpm build` 通过，`pnpm check:anchors` 19/19；
 - `python -m ruff check app tests scripts` 与 `python -m compileall -q app tests scripts`
   通过；
-- 本机全量 `python -m pytest -q` 复跑：仅剩 **4 项本机环境失败**（均为环境问题，
-  与本次改动无关）：root 下 `chmod 000` 不可读用例 ×2（root 仍可读）、独立验收
-  mutation 用例超时 ×1（真机跑 21 场景 180s 超时）、`vendor/kdocs-cli` 旧产物导致
-  「无 CLI」用例 ×1（该二进制是 .gitignore 的本地产物）；新增/受影响用例 39 条
-  单独复跑全绿（14:32），CI 上 Python 3.11 / 3.13 全量测试为准。
+- 本机全量 `python -m pytest -q`（改动冻结后复跑）：**1678 passed / 4 failed（22:44）**；
+  4 项均为**本机环境问题**，与本次改动无关：root 下 `chmod 000` 不可读用例 ×2（root
+  仍可读）、独立验收 mutation 用例超时 ×1（真机跑 21 场景 180s 超时）、
+  `vendor/kdocs-cli` 旧产物导致「无 CLI」用例 ×1（该二进制是 .gitignore 的本地产物）；
+  新增/受影响用例 39 条单独复跑全绿；CI 上 Python 3.11 / 3.13 全量测试均通过。
 
 ### 发布与验证
 
-- 版本号 `3.6.27 → 3.6.28`（`app/__init__.py` 与 `android/version.properties` 同步）；
-  发版 tag / APK / Release 产物与 CI run 待发版后补记。
+- 版本号 `3.6.27 → 3.6.28`（`app/__init__.py` 与 `android/version.properties` 同步，
+  `versionCode 3062800`）；提交 `49031d3`（功能）、`a70746b`（版本）、`589d278`（修复：
+  写失败不动账本 + 半成品行判定，发布前审查发现的 2 个问题）；标签 `v3.6.28` 指向 `589d278`；
+- `Android APK`（tag v3.6.28，run 42971604179）、`Android APK`（main，run 42971598987）、
+  `Tests`（main，run 42971598994）全部成功（变异门禁按设计只在 PR 与手动触发时跑，本次 skip）；
+- Release `v3.6.28` 非草稿、非预发布（2026-11-11T06:19:03Z 创建 / 06:27:54Z 发布），产物
+  `yikou-light-food-3.6.28-arm64.apk`（19,931,477 字节）与对应 `.apk.sha256`（124 字节）
+  均已上传；
+- 应用内更新检查（GitHub `/releases/latest`）已能看到 v3.6.28 与上述两个附件。
+
+### 发布产物实下载复核
+
+- 从 Release 直接下载 `yikou-light-food-3.6.28-arm64.apk`：19,931,477 字节，与附件登记的
+  大小一致；`sha256sum` 为
+  `e1bc87e16203afb1f7853e2f63d03c08a17ffad99c99576cb110086938e8a99a`，与附件
+  `.apk.sha256` 逐字一致 —— 应用内更新校验拿到的就是这份值；
+- 包内 114 个条目，抽查 `classes.dex`、`lib/arm64-v8a/`（`libproot.so`、`libkdocs_cli.so` 等
+  14 个）与 `assets/runtime/cacert.pem` 均在，不是截断或空壳包；`AndroidManifest.xml`
+  里 `versionName=3.6.28`（CI 的 Collect artifact 步骤也会校验 tag 与
+  `version.properties` 一致）；
+- APK v2 签名证书与 v3.6.27 完全一致（SHA-256 指纹
+  `E8:E2:B0:6D:AB:A6:A6:79:6C:AB:8B:61:0A:18:D1:79:D9:22:12:25:A7:A3:88:31:A4:80:27:39:EA:72:B9:C5`，
+  `CN=Yikou Light Food` 的 release 密钥），应用内「下载并安装」可覆盖安装。
 
 ## 3.6.27
 
