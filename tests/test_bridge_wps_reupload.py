@@ -392,3 +392,41 @@ def test_reupload_check_noop_satisfies_contract(reupload_env):
     _upload_once(env)
     checked = env.bridge.wps_reupload_check([_SHEET])
     assert_required_present("WpsReuploadCheckResult", checked)
+
+
+# ----------------------------------------------------------------------
+# 写失败/结果未知：绝不能把没写进去的餐记成已同步（账本锚点必须不动）
+# ----------------------------------------------------------------------
+@pytest.mark.parametrize("sheet_status", ["failed", "uncertain"])
+def test_unsuccessful_write_leaves_ledger_untouched(reupload_env, monkeypatch,
+                                                    sheet_status):
+    env = reupload_env
+    _upload_once(env)
+    env.cloud.grid = dict(env.baseline_grid)
+    checked = env.bridge.wps_reupload_check([_SHEET])
+    assert checked["ok"] is True
+    ledger_before = Path(env.ledger_path).read_text(encoding="utf-8")
+
+    def fake_apply_plan(*args, **kwargs):
+        return {
+            "status": sheet_status, "uncertain": sheet_status == "uncertain",
+            "reason": "测试：云端没有写成功", "next_action": "manual_reconcile",
+            "sheets": [{"sheet": _SHEET, "status": sheet_status,
+                        "reason": "测试：云端没有写成功",
+                        "uncertain": sheet_status == "uncertain"}],
+            "written": 0, "failed": 1,
+        }
+
+    monkeypatch.setattr(bridge_module, "apply_plan", fake_apply_plan)
+    repaired = env.bridge.wps_reupload_upload(checked["check_id"])
+    assert repaired["ok"] is False, repaired
+    assert repaired["tables"][0]["write"]["status"] == sheet_status
+
+    # 账本锚点不得被 refresh_plan_ledger_entries 提前记成「已同步」：
+    # 否则下次普通预览直接 no-op，漏传再也补不回来。
+    assert Path(env.ledger_path).read_text(encoding="utf-8") == ledger_before
+    ledger = SyncLedger(env.ledger_path)
+    assert ledger.synced_local(env.target.isoformat(), _FILE_ID,
+                               "老王", "111") == 2
+    assert ledger.synced_local(env.target.isoformat(), _FILE_ID,
+                               "小李", "222") == 1

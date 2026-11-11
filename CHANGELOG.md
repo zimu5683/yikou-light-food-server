@@ -25,6 +25,9 @@
 - 核对令牌绑定目标表配置、目标日期、云端现状指纹、计划指纹、日志记录身份；
   核对到写入之间任何变化都零写入并要求重新核对；与普通上传共用互斥锁；
   测试/正式目标变化、未结案记录直接拒绝；只支持已结案的最近一次上传；
+- **账本只记「逐表回读校验通过」的表**：failed / uncertain / blocked 等没写成功或
+  结果未知的表一律不补记锚点（与普通上传口径一致），避免「没写进去的餐」被记成
+  已同步、下次普通预览直接 no-op；
 - 前端新增常驻「核对并补传」面板（「云文档同步」页签 + 上传结果下方）：勾选子表、
   逐单查看「缺什么」、确认弹窗、逐表补传结果；失败/不确定不冒充完成；
 - 同步更新 `docs/WPS-SYNC-RULES.md` 第 9 节、`docs/BRIDGE-WPS-CONTRACT-R6.md` 第 13 节
@@ -32,19 +35,20 @@
 
 ### 验证（本机）
 
-- 新增后端测试 `tests/test_wps_reupload.py`（核对判定矩阵、补传计划只补缺失、账本锚点
-  不翻倍、二次补传幂等、归档记录、只读零写入）与 `tests/test_bridge_wps_reupload.py`
-  （Bridge 端到端、令牌一次性/失效、核对后云端变化零写入、未结案/目标变化/互斥拒绝、
-  选表补传、前端契约），共 **32 条**；
+- 新增后端测试 `tests/test_wps_reupload.py`（核对判定矩阵、半成品行缺类型/餐种/公式、
+  补传计划只补缺失、账本锚点不翻倍、二次补传幂等、归档记录、只读零写入）与
+  `tests/test_bridge_wps_reupload.py`（Bridge 端到端、令牌一次性/失效、核对后云端
+  变化零写入、未结案/目标变化/互斥拒绝、选表补传、写失败不动账本、前端契约），
+  共 **39 条**；
 - 前端新增 `src/lib/reupload.test.ts` **8 条**单测（216 → 224 条）；`pnpm lint`、
   `pnpm build` 通过，`pnpm check:anchors` 19/19；
 - `python -m ruff check app tests scripts` 与 `python -m compileall -q app tests scripts`
   通过；
-- 本机全量 `python -m pytest -q`：**1670 passed / 5 failed（21:26）**；5 个失败均为
-  **本机环境问题**，与本次改动无关（与 3.6.27 发布验证记录里的 5 项同类）：
-  root 下 `chmod 000` 不可读用例 ×2（root 仍可读）、独立验收 mutation 用例超时 ×2
-  （真机跑 21 场景 180s 超时）、`vendor/kdocs-cli` 旧产物导致「无 CLI」用例 ×1
-  （该二进制是 .gitignore 的本地产物）；改动冻结后单独复跑全部新增/受影响用例全绿。
+- 本机全量 `python -m pytest -q` 复跑：仅剩 **4 项本机环境失败**（均为环境问题，
+  与本次改动无关）：root 下 `chmod 000` 不可读用例 ×2（root 仍可读）、独立验收
+  mutation 用例超时 ×1（真机跑 21 场景 180s 超时）、`vendor/kdocs-cli` 旧产物导致
+  「无 CLI」用例 ×1（该二进制是 .gitignore 的本地产物）；新增/受影响用例 39 条
+  单独复跑全绿（14:32），CI 上 Python 3.11 / 3.13 全量测试为准。
 
 ### 发布与验证
 

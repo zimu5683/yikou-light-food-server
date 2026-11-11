@@ -54,6 +54,8 @@ export type OperationMode =
   | 'wps_preview'
   | 'wps_check_copies'
   | 'sss_day_orders'
+  | 'wps_reupload_check'
+  | 'wps_reupload_upload'
 
 export type OperationLifecycle =
   | 'idle'

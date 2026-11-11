@@ -367,9 +367,14 @@ class IntentState:
 
 
 def _classify_intent(detail: Mapping[str, Any], *,
-                     person_rows: Mapping[tuple[str, str], Sequence[int]]
-                     ) -> IntentState:
-    """把一条意图的云端实际值判成 present / missing_* / manual。"""
+                     person_rows: Mapping[tuple[str, str], Sequence[int]],
+                     columns: Mapping[str, Any] | None = None) -> IntentState:
+    """把一条意图的云端实际值判成 present / missing_* / manual。
+
+    ``columns`` 是上次上传记录里的列号（``type`` / ``kind`` 等），用来判断
+    「类型/餐种格子空着、planner 还能补写」的情形 —— 只靠意图里的 ``need_type``
+    会漏掉协作方把格子清空、或上次上传本来就不需要写类型的半成品行。
+    """
     state = IntentState(detail=dict(detail))
     name = _text(detail.get("name"))
     row = _int(detail.get("row"), 0)
@@ -392,6 +397,9 @@ def _classify_intent(detail: Mapping[str, Any], *,
     actual_kind = _text(detail.get("actual_kind")).strip()
     want_type = _text(detail.get("meal_type")).strip()
     want_kind = _text(detail.get("meal_kind")).strip()
+    columns = columns if isinstance(columns, Mapping) else {}
+    type_col = _int(columns.get("type"), 0)
+    kind_col = _int(columns.get("kind"), 0)
 
     def manual(reason: str) -> IntentState:
         state.status = STATUS_MANUAL
@@ -460,6 +468,26 @@ def _classify_intent(detail: Mapping[str, Any], *,
                       f"不自动覆盖")
     if not bool(detail.get("address_match")):
         return manual("云端地址与期望不一致，不自动覆盖")
+    # 总餐次与日期格都已对，但行内还有**空着的**格子（类型 / 餐种 / 已出餐与
+    # 剩余公式）—— 这是上次写入中断留下的半成品行，planner 能按空单元格补写。
+    # 非空且与期望不一致的格子不算「空着」：那是协作者/别人改过的值，一律不覆盖。
+    half_row_fields: list[str] = []
+    if type_col and want_type and not actual_type:
+        half_row_fields.append("type")
+    if kind_col and want_kind and not actual_kind:
+        half_row_fields.append("kind")
+    if bool(detail.get("formula_needed")) and not bool(detail.get("formula_ok")):
+        served_actual = _text(detail.get("actual_served_formula"))
+        left_actual = _text(detail.get("actual_left_formula"))
+        if not served_actual and not left_actual:
+            half_row_fields.append("formula")
+        else:
+            return manual("云端已出餐/剩余公式与期望不一致（不是空格），不自动覆盖")
+    if half_row_fields:
+        state.status = STATUS_MISSING_FIELDS
+        state.missing = ["fields"]
+        state.synth_prev = local_meals
+        return state
     state.status = STATUS_PRESENT
     state.synth_prev = local_meals
     return state
@@ -779,8 +807,9 @@ def check_sheet(cli: Any, ref: UploadRecordRef, *,
         check.reason = "上次上传记录里没有订单明细，无法核对（请重新预览上传）"
         return check
     person_rows = _parse_person_rows(details)
+    columns = details.get("columns") if isinstance(details, Mapping) else {}
 
-    states = [_classify_intent(item, person_rows=person_rows)
+    states = [_classify_intent(item, person_rows=person_rows, columns=columns)
               for item in intent_details]
     # 同一个人只要有一条无法判定，整人跳过（不写他的任何一行）。
     manual_keys = {state.key for state in states if state.manual}

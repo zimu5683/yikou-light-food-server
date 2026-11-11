@@ -69,6 +69,8 @@ const MODE_LABELS: Record<string, string> = {
   wps_preview: '云文档预览',
   wps_check_copies: '云文档副本核对',
   sss_day_orders: '云端当天名单读取',
+  wps_reupload_check: '云文档核对补传（只读核对）',
+  wps_reupload_upload: '云文档补传',
 }
 
 export const STATUS_FALLBACK: Record<StatusState, FallbackView> = {

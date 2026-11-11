@@ -328,3 +328,103 @@ def test_check_does_not_modify_cloud_ledger_or_journal(tmp_path):
     assert len(cli.writes) == writes_before
     assert ledger.path.read_text(encoding="utf-8") == ledger_before
     assert journal.path.read_text(encoding="utf-8") == journal_before
+
+
+# ----------------------------------------------------------------------
+# 半成品行（总餐次/日期格都对，但类型、餐种或公式空着）
+# ----------------------------------------------------------------------
+def test_check_half_finished_row_reports_missing_fields(tmp_path):
+    cli, ledger, journal, _baseline = _make_env(tmp_path)
+    # 上传成功后类型/餐种格子被清空（中断或协作者），总餐次与日期格仍对。
+    cli.grid.pop((2, 5), None)   # 0-based 第 3 行「类型」
+    cli.grid.pop((2, 6), None)   # 0-based 第 3 行「餐种」
+
+    check = _check(cli, journal, ledger)
+
+    by_name = {order["name"]: order for order in check.orders}
+    assert by_name["老王"]["status"] == "missing_fields"
+    assert by_name["老王"]["missing"] == ["fields"]
+    assert by_name["小李"]["status"] == "present"
+    assert by_name["小赵"]["status"] == "present"
+    assert check.status == "ready", check.reason
+    assert check.plan is not None
+
+    result = apply_plan(cli, [check.plan], ledger=ledger,
+                        marker_enabled=False, journal=journal)
+    assert result["status"] == "ok", result
+    assert cli.grid.get((2, 5)) == "中餐"
+    assert cli.grid.get((2, 6)) == "经济"
+
+
+def test_check_half_finished_new_row_fills_formulas(tmp_path):
+    cli, ledger, journal, _baseline = _make_env(tmp_path)
+    # 新客户行已建好、总餐次/日期格/类型餐种都在，但「已出餐/剩余」公式空着。
+    cli.grid.pop((3, COL_SERVED), None)
+    cli.grid.pop((3, COL_LEFT), None)
+
+    check = _check(cli, journal, ledger)
+
+    by_name = {order["name"]: order for order in check.orders}
+    assert by_name["小李"]["status"] == "missing_fields"
+    assert by_name["老王"]["status"] == "present"
+    assert check.plan is not None
+
+    result = apply_plan(cli, [check.plan], ledger=ledger,
+                        marker_enabled=False, journal=journal)
+    assert result["status"] == "ok", result
+    served = cli.grid.get((3, COL_SERVED), "")
+    left = cli.grid.get((3, COL_LEFT), "")
+    assert served.startswith("=") and left.startswith("="), (served, left)
+
+
+def _intent_detail(**overrides):
+    base = {
+        "name": "老王", "phone": "111", "phone_key": "111", "slot": 1,
+        "kind": "existing", "row": 3, "local_meals": 7,
+        "total_before": 7, "total_after": 7, "actual_total": 7,
+        "total_match": True, "before_total_match": False,
+        "target_before": "1", "target_expected": "1", "actual_target": "1",
+        "target_match": True, "before_target_match": True,
+        "need_type": False, "need_kind": False,
+        "actual_type": "中餐", "actual_kind": "经济",
+        "meal_type": "中餐", "meal_kind": "经济",
+        "address_match": True, "formula_needed": False, "formula_ok": True,
+        "actual_served_formula": "", "actual_left_formula": "",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_classify_flags_empty_cells_even_when_intent_did_not_need_them():
+    # 上次上传本来不需要写类型（need_type=False），协作者之后把类型清空：
+    # 仍要判成半成品行，而不是「已在云端」。
+    state = reupload._classify_intent(
+        _intent_detail(actual_type=""),
+        person_rows={}, columns={"type": 6, "kind": 7})
+    assert state.status == reupload.STATUS_MISSING_FIELDS
+    assert state.missing == ["fields"]
+    state = reupload._classify_intent(
+        _intent_detail(actual_kind=""),
+        person_rows={}, columns={"type": 6, "kind": 7})
+    assert state.status == reupload.STATUS_MISSING_FIELDS
+
+
+def test_classify_keeps_changed_non_empty_cells_untouched():
+    # 非空且与期望不一致：是别人写的值，一律不覆盖、也不当作可补传。
+    state = reupload._classify_intent(
+        _intent_detail(actual_type="晚餐"),
+        person_rows={}, columns={"type": 6})
+    assert state.status == reupload.STATUS_PRESENT
+
+
+def test_classify_formula_empty_is_missing_fields_wrong_formula_is_manual():
+    empty = reupload._classify_intent(
+        _intent_detail(formula_needed=True, formula_ok=False),
+        person_rows={}, columns={"served": 9, "left": 10})
+    assert empty.status == reupload.STATUS_MISSING_FIELDS
+    # 公式不是空单元格而是别的公式/数值：不自动覆盖，归为无法判定。
+    wrong = reupload._classify_intent(
+        _intent_detail(formula_needed=True, formula_ok=False,
+                       actual_served_formula="=SUM(A1:A2)"),
+        person_rows={}, columns={"served": 9, "left": 10})
+    assert wrong.status == reupload.STATUS_MANUAL

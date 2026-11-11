@@ -4987,7 +4987,21 @@ class Bridge:
                     planned_summary=planned_summary, executed=False))
         # 补传计划只含缺失的人：把本次计划里所有人的槽位位置/身份重新记回账本
         # （排序可能改变其他人行序）。幂等、失败只警告，不影响本次云端结论。
+        #
+        # 只对**逐表确认写入成功**（ok / noop）的表补记：failed / uncertain /
+        # stale_batch / blocked 等没写成功或结果未知的表一律不碰账本 —— 否则
+        # merge_entries 会把「没写进去的餐」按 ledger_prev + delta 记成已同步，
+        # 下次普通预览直接 no-op，漏传再也补不回来（与普通上传「只有 ok 才记账」
+        # 的口径保持一致）。
+        raw_sheets = [item for item in (raw.get("sheets") or [])
+                      if isinstance(item, dict)]
+        written_sheets = {str(item.get("sheet") or "")
+                          for item in raw_sheets
+                          if str(item.get("status") or "").strip().lower()
+                          in ("ok", "noop")}
         for plan in plans:
+            if plan.sheet not in written_sheets:
+                continue
             try:
                 refreshed, reason = refresh_plan_ledger_entries(ledger, plan)
             except Exception as exc:  # noqa: BLE001
