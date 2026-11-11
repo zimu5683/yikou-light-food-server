@@ -111,8 +111,15 @@ def _expected_formulas(record: Mapping[str, Any], intent: Mapping[str, Any],
 
 
 def classify_journal_sheet(cli: KdocsCli,
-                           record: Mapping[str, Any]) -> dict[str, Any]:
-    """只读云端，对一条子表日志分类；任何异常/歧义都归为 uncertain。"""
+                           record: Mapping[str, Any],
+                           *,
+                           with_details: bool = False) -> dict[str, Any]:
+    """只读云端，对一条子表日志分类；任何异常/歧义都归为 uncertain。
+
+    ``with_details=True`` 时额外返回 ``details``：逐条意图的云端实际值、期望值、
+    行号与结构核对结果（供「核对并补传」逐单分析用）。默认关闭，恢复/执行路径
+    的行为与返回字段保持原样。
+    """
     raw_status = str(record.get("status") or "")
     if raw_status not in SHEET_STATUSES:
         return _uncertain("unsupported_status")
@@ -182,6 +189,7 @@ def classify_journal_sheet(cli: KdocsCli,
         return _uncertain(f"recovery_error:{type(exc).__name__}:{exc}")
 
     # 读取云端人员行（姓名+电话做键，保留槽位顺序）。
+    intent_details: list[dict[str, Any]] = []
     rows_by_key: dict[tuple[str, str], list[int]] = {}
     actual_signature: list[tuple[int, str, str]] = []
     address_by_row: dict[int, str] = {}
@@ -373,6 +381,69 @@ def classify_journal_sheet(cli: KdocsCli,
                     orig_match = False
         original_matches.append(orig_match)
 
+        total_match = (not total_col) or actual_total == expected_total
+        before_total_match = (not total_col) or actual_total == before_total
+        target_match = actual_target == expected_target
+        before_target_match = actual_target == before_target
+        type_match = (not need_type) or actual_type == want_type
+        kind_match = (not need_kind) or actual_kind == want_kind
+        address_match = True
+        if kind == "new" and address_col and item.get("address"):
+            address_match = (_address_key(actual_address)
+                             == _address_key(item.get("address")))
+        served_formula = ""
+        left_formula = ""
+        served_expected = ""
+        left_expected = ""
+        if formulas and row:
+            exp_served, exp_left = formulas
+            served_expected, left_expected = exp_served, exp_left
+            served_formula = str(formula_grid.get((row - 1, served_col - 1), ""))
+            left_formula = str(formula_grid.get((row - 1, left_col - 1), ""))
+        intent_details.append({
+            "index": index,
+            "row": int(row or 0),
+            "name": name,
+            "phone": str(item.get("phone") or ""),
+            "phone_key": str(item.get("phone_key") or ""),
+            "slot": slot,
+            "kind": kind,
+            "order_no": str(item.get("order_no") or ""),
+            "address": str(item.get("address") or ""),
+            "meal_type": str(item.get("meal_type") or ""),
+            "meal_kind": str(item.get("meal_kind") or ""),
+            "fill_type": bool(item.get("fill_type")),
+            "fill_kind": bool(item.get("fill_kind")),
+            "local_meals": _as_int_field(item, "local_meals"),
+            "total_before": before_total,
+            "total_after": expected_total,
+            "target_before": before_target,
+            "target_expected": expected_target,
+            "target_occupied": str(item.get("target_occupied") or ""),
+            "actual_total": actual_total,
+            "actual_target": actual_target,
+            "actual_type": actual_type,
+            "actual_kind": actual_kind,
+            "actual_address": actual_address,
+            "actual_served_formula": served_formula,
+            "actual_left_formula": left_formula,
+            "expected_served_formula": served_expected,
+            "expected_left_formula": left_expected,
+            "need_type": bool(need_type),
+            "need_kind": bool(need_kind),
+            "formula_needed": bool(formulas),
+            "total_match": bool(total_match),
+            "before_total_match": bool(before_total_match),
+            "target_match": bool(target_match),
+            "before_target_match": bool(before_target_match),
+            "type_match": bool(type_match),
+            "kind_match": bool(kind_match),
+            "address_match": bool(address_match),
+            "formula_ok": bool(formula_ok),
+            "expected_match": bool(exp_match),
+            "original_match": bool(orig_match),
+        })
+
         if not exp_match:
             problems.append(
                 f"{name} 槽位 {slot}：期望 total={expected_total}/mark={expected_target!r}，"
@@ -387,18 +458,60 @@ def classify_journal_sheet(cli: KdocsCli,
         structure_ok = False
     if verified_problems:
         problems = verified_problems + problems
+    details_payload: dict[str, Any] = {}
+    if with_details:
+        details_payload = {
+            "sheet": str(record.get("sheet") or ""),
+            "file_id": file_id,
+            "target_date": target.isoformat(),
+            "worksheet_id": worksheet_id,
+            "target_col": target_col,
+            "target_header": header_text,
+            "columns": {str(key): int(value or 0)
+                        for key, value in (columns or {}).items()},
+            "date_cols": [int(c) for c in (record.get("date_cols") or [])
+                          if int(c or 0) > 0],
+            "marker_col": marker_col,
+            "marker_expected": marker_expected,
+            "marker_actual": marker_actual,
+            "marker_ok": bool(marker_ok),
+            "sort_key_col": sort_key_col,
+            "helper_nonempty": bool(helper_nonempty),
+            "last_data_row": int(record.get("last_data_row") or 0),
+            "append_row": int(record.get("append_row") or 0),
+            "weekday_number": int(record.get("weekday_number") or 0),
+            "marker_enabled": bool(record.get("marker_enabled", False)),
+            "structure_ok": bool(structure_ok),
+            "baseline_ok": bool(baseline_structure_ok),
+            "baseline_name_rows": [[int(row), str(name), str(phone)]
+                                   for row, name, phone in baseline_signature],
+            "person_rows": [
+                {"name": key[0], "phone_key": key[1],
+                 "rows": [int(row) for row in rows]}
+                for key, rows in sorted(rows_by_key.items())
+            ],
+            "address_by_row": {str(int(row)): str(address)
+                               for row, address in address_by_row.items()},
+            "intents": intent_details,
+            "problems": problems,
+        }
+    details_field = ({"details": details_payload} if with_details else {})
     if all_expected and structure_ok and marker_ok and not helper_nonempty:
         return {"state": "verified", "reason": "", "problems": [],
-                "next_action": "none"}
+                "next_action": "none", **details_field}
     if all_original and baseline_structure_ok and not helper_nonempty and not (
             marker_expected and marker_actual == marker_expected):
         return {"state": "not_started", "reason": "云端与基线一致，未发现本操作写入痕迹",
-                "problems": [], "next_action": "repreview"}
+                "problems": [], "next_action": "repreview", **details_field}
     if not problems:
         problems.append("云端状态既不是完整期望值，也不是完整原值：无法确认是否写入")
     if marker_expected and not marker_ok:
         problems.append(f"通讯记号应为 {marker_expected}，实际 {marker_actual!r}")
-    return _uncertain("partial_or_ambiguous", problems[:20])
+    if with_details and details_payload:
+        details_payload["problems"] = problems[:20]
+    payload = _uncertain("partial_or_ambiguous", problems[:20])
+    payload.update(details_field)
+    return payload
 
 
 def _intent_slots_by_key(intents: Sequence[Any]) -> dict[str, dict[int, int]]:

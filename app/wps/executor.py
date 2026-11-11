@@ -1139,6 +1139,35 @@ def _apply_one_plan(cli: KdocsCli, plan: SheetPlan, worksheet_id: int, *,
             "sort_mismatch": bool(plan.sort_mismatch), "problems": []}
 
 
+def refresh_plan_ledger_entries(ledger: SyncLedger | None,
+                                plan: SheetPlan) -> tuple[bool, str]:
+    """补传成功后把计划里**所有人**的槽位身份/物理位置写回账本（幂等）。
+
+    普通上传的计划覆盖整批所有人，``_apply_plan_impl`` 只会按 pending 的人记账；
+    「核对并补传」的计划只包含缺失的人，但插入/排序可能改变**其它人**（含本次
+    无需写的人）的行序 —— 他们的 ``positions`` 也必须按执行后的实际行号重算，
+    否则下一批增量可能配错行。本函数用计划里已经由执行器回填的实际 ``change.row``
+    重算条目并合并进账本：数值与普通上传成功后的锚点一致，重复调用无副作用。
+
+    返回 ``(ok, reason)``；失败只是位置信息可能过时，不改变本次云端写入结论。
+    """
+    if ledger is None or not plan.file_id or not plan.changes:
+        return True, ""
+    date_key = plan.target_date.isoformat() if plan.target_date else ""
+    if not date_key:
+        return True, ""
+    try:
+        entries = _ledger_entries(
+            plan.changes, ledger=ledger, date_key=date_key,
+            file_id=plan.file_id, slot_rows=_plan_slot_rows(plan))
+        if not entries:
+            return True, ""
+        ledger.merge_entries(date_key, plan.file_id, entries)
+    except Exception as exc:  # noqa: BLE001 - 补记失败不影响已完成的云端写入
+        return False, f"ledger_refresh_failed:{type(exc).__name__}:{exc}"
+    return True, ""
+
+
 def _plan_ledger_digests(plans: Sequence[SheetPlan]) -> set[str]:
     """计划构建时携带的 ledger 磁盘快照摘要集合（忽略旧计划 None）。"""
     return {str(plan.ledger_digest) for plan in plans

@@ -59,6 +59,7 @@ import {
 import { classifyRequestError } from '@/lib/requestError'
 import { splitAddressLines } from '@/lib/format'
 import { saveStateView } from '@/lib/saveState'
+import { ReuploadPanel } from '@/components/ReuploadPanel'
 import { cn } from '@/lib/utils'
 
 /** 地址排序涉及的 8 张子表（顺序与后端 DEFAULT_ADDRESS_ORDER 一致）。 */
@@ -682,6 +683,10 @@ export function CloudForm() {
             if (resultAction?.label === '重新预览') void onPreview()
             else void refreshAuthority()
           }} />
+        )}
+
+        {enabled && status?.cli_found && status?.authenticated && (
+          <ReuploadPanel disabled={busy !== ''} />
         )}
 
         {copyCheck && <CopyCheckCard check={copyCheck} />}

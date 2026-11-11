@@ -47,6 +47,7 @@ Cookie: yikou_session=<token>        # 或 X-Yikou-Token / ?token=（本地直�
 | --- | --- | --- |
 | `wps_status` / `wps_recovery_status` / `pending_interactions` / `operation_status` | ✅ | ✅ |
 | `wps_preview` / `wps_upload` / `wps_check_copies` / `sss_day_orders` | ✅ | ✅ |
+| `wps_reupload_check` / `wps_reupload_upload`（核对并补传，2026-11-10 新增） | ✅ | ✅ |
 | `start_order` / `start_sss` / `stop_task` / `drain_events` / `resolve_*` | ✅ | ✅ |
 | **`wps_recovery_resolve`**（恢复/退场旧任务） | ❌ **403 `admin_only`** | ✅ |
 | `save_order_config` / `save_sss_config` / `save_wps_config` / `clear_password` / `new_template` / `choose_excel` / `check_updates` / `install_update` / `wps_authorize` / `wps_logout` | ❌ 403 | ✅ |
@@ -423,7 +424,8 @@ insert_row/detail`
 
 ```text
 order / sss / wps_upload / wps_authorize / wps_logout / check_update / install_update
-wps_preview / wps_check_copies / sss_day_orders / wps_recovery_resolve   ← 新增
+wps_preview / wps_check_copies / sss_day_orders / wps_recovery_resolve
+wps_reupload_check / wps_reupload_upload                                ← 新增
 ```
 
 因此 `operation_status().mode` 与 `_MODE_LABELS` 的中文名可用于“谁在跑”的提示：
@@ -435,6 +437,8 @@ wps_preview / wps_check_copies / sss_day_orders / wps_recovery_resolve   ← 新
 | `sss_day_orders` | 云端当天名单读取 |
 | `wps_recovery_resolve` | 旧任务恢复/退场 |
 | `wps_ledger_rebuild` | 账本锚点重建 |
+| `wps_reupload_check` | 核对并补传（只读核对） |
+| `wps_reupload_upload` | 云文档补传 |
 
 ---
 
@@ -640,3 +644,121 @@ ruff check app tests
 `bridge.ts` 的 `OperationMode` / 状态联合类型也要补上
 `wps_preview` / `wps_check_copies` / `sss_day_orders` / `wps_recovery_resolve`
 与 `blocked_concurrent`（见第 8、9 节）。
+
+---
+
+## 13. `wps_reupload_check(sheets)` / `wps_reupload_upload(check_id)` —— 核对并补传（2026-11-10 新增）
+
+用途：上传成功后云端可能「看不到」这批餐，而账本已记「本批已同步」，重新预览只会是
+no-op。本入口先**只读核对**最近一次上传在云端缺哪些订单，确认后**只补缺失的格子**
+（规则见 [WPS-SYNC-RULES.md](WPS-SYNC-RULES.md) 第 9 节）。
+
+### 13.1 `wps_reupload_check(sheets?)` —— 只读核对 + 一次性令牌
+
+请求：
+
+```jsonc
+[]                          // 或 {} = 全部有上传记录的子表
+[["东湖中餐", "衣锦中餐"]]   // 或 {"sheets": [...]}：只核对指定子表
+[]                          // 单表也允许用字符串数组：["东湖中餐"]
+```
+
+成功（`ok=true`；**零云端写入、零账本/日志写入**）：
+
+```jsonc
+{"ok": true, "status": "check_ready",   // check_ready / noop / blocked
+ "reason": "", "code": "",
+ "next_action": "wps_reupload_upload(rw-…)",
+ "check_id": "rw-1712345678901-abcdef123456",   // 一次性令牌（前缀 rw-）
+ "created_at": "2026-11-10T21:00:00", "expires_at": "2026-11-10T21:10:00",
+ "expires_in": 600, "ttl_seconds": 600, "state": "valid",
+ "target_date": "2026-11-11", "test_mode": false,
+ "context_fingerprint": "<64hex>", "plan_fingerprint": "<64hex>",
+ "fingerprint": {"context": "<64hex>", "plan": "<64hex>"},
+ "summary": {"sheets": 1, "writeable_sheets": 1, "to_resend": 3,
+             "present": 10, "manual": 1, "complete_sheets": 0,
+             "blocked_sheets": 0},
+ "tables": [{
+   "sheet": "东湖中餐", "file_id": "…", "target_date": "2026-11-11",
+   "status": "ready",        // ready / partial / complete / manual / blocked
+   "reason": "", "pending": false,
+   "counts": {"total": 3, "to_resend": 3, "present": 0, "manual": 0},
+   "orders": [{
+     "order_no": "W1", "name": "张三", "phone": "138…", "slot": 1,
+     "kind": "existing",           // existing / new
+     "local_meals": 2,
+     "status": "missing_meals",    // present / missing_row / missing_meals /
+                                   // missing_mark / missing_fields / manual
+     "missing": ["meals", "mark"], // row / meals / mark / fields
+     "missing_meals": 2,
+     "expected_total": 7, "before_total": 5, "actual_total": 5,
+     "expected_mark": "1", "actual_mark": "", "actual_row": 3,
+     "reason": ""                  // manual 时写原因
+   }],
+   "warnings": [], "target_col": 4, "target_header": "11.11 周三",
+   "last_upload": {"operation_id": "wps-…", "sheet_key": "…",
+                   "updated_at": "…", "op_status": "verified",
+                   "status": "verified"},
+   "plan_fingerprint": "<64hex>"
+ }],
+ "warnings": [], "archive_warnings": [],
+ "target_tables": {"东湖中餐": {"file_id": "…", "target_date": "2026-11-11"}}}
+```
+
+要点：
+
+- **只读**：不写云端、不写账本/日志；不发任何写请求；
+- 只核对每张子表**最近一次**上传记录（热日志 + `.archive`）；该记录仍未结案时
+  `tables[].pending=true`、整表 `blocked`，只读展示云端实际值但不能补传；
+- 目标云文档与当前生效目标不一致（测试/正式切换、换了文件）→ 整表 `blocked`；
+- `summary` 是**核对口径**（订单数），不是行数。
+
+拒绝（`ok=false`，全部可证明零写入）：
+
+| `code` | 触发 | `next_action` |
+| --- | --- | --- |
+| `wps_disabled` | 云同步关闭 | 开启后重试 |
+| `missing_check` / `check_not_found` / `check_expired` / `check_consumed` / `check_invalidated` / `check_changed` | 令牌缺失/不存在/过期/已用/失效/核对后变化（仅上传接口） | `重新核对` |
+| `no_upload_record` | 没有任何上传记录（日志已归档/全新安装） | 先完成一次上传 |
+| `bad_sheets` / `empty_sheets` | 选表非法或为空 | 重新选择 |
+| `local_state_blocked` / `local_ledger_lost` | 账本/日志不可用或丢过锚点 | 修本地日志/账本 |
+| `unauthenticated` | 未授权 WPS | 去授权 |
+| `cloud_error` / `unexpected` | 读云端/内部异常 | 查看日志后重试 |
+| `operation_conflict` | 其它任务占用互斥槽位 | 等待后重试 |
+
+### 13.2 `wps_reupload_upload(check_id)` —— 只补缺失部分
+
+请求：`["rw-…"]` 或 `{"check_id": "rw-…"}`；可选第二个参数 `sheets`
+（`["rw-…", ["东湖中餐"]]` / `{"check_id": "rw-…", "sheets": [...]}`）
+只补核对结果里勾选的子表，省略 = 核对时覆盖的全部子表；传入不在核对结果里的
+子表返回 `bad_sheets`，空数组返回 `empty_sheets`（均零写入）。
+
+执行前会**重新只读核对**并比较 `context_fingerprint`/`plan_fingerprint`/日志记录身份；
+任何变化都**零写入**并返回 `check_changed`（必须重新核对）。通过后只把核对出的缺失
+格子交给执行器（`apply_plan`），已完整的行、无法判定的订单、协作者写的 `0` 一律不动。
+
+成功（`ok=true`，`status` 沿用执行器口径）：
+
+```jsonc
+{"ok": true, "status": "ok",          // ok / noop / partial / failed / uncertain / blocked
+ "reason": "", "code": "",
+ "next_action": "none",
+ "operation_id": "op-…", "executor_operation_id": "wps-…",
+ "check_id": "rw-…", "target_date": "2026-11-11", "test_mode": false,
+ "planned_summary": {"kind": "plan", "rows": {"to_update": 3, "to_append": 0, …}},
+ "execution_summary": {"kind": "execution", "sheets": {…}, "rows": {…}},
+ "tables": [{ …13.1 的逐表结构…,
+              "write": {"status": "ok", "reason": "", "uncertain": false,
+                        "next_action": "none", "people": 3, "cells": 5,
+                        "problems": []}}],
+ "written": 1, "failed": 0, "uncertain": false, "failed_sheets": [],
+ "warnings": [], "result": {"written": 1, "failed": 0, "status": "ok",
+                            "sheets": [{"sheet": "东湖中餐", "status": "ok", …}]}}
+```
+
+铁律：
+
+- 写入必须走现有执行器：意图日志先落盘、写前只读复核、逐格回读校验、账本锚点提交；
+- 不允许整表覆盖/强制重传；**无法判定的订单不写**；不得降低云端数值；
+- 补传成功后账本锚点仍等于「本批本地餐次」，之后普通预览是 no-op；
+- 与普通上传共用互斥槽位；令牌一次性、10 分钟有效。

@@ -41,6 +41,7 @@ app/integrations/  外部 HTTP 客户端（requests）
 | `app/ordering/sss.py` | 闪时送登录、任务构建、提交、对账（至少一次 + 对账确认） |
 | `app/ordering/cloud_import.py` | 从 WPS 云端读当天名单、地址过滤、日期闸门、留档 |
 | `app/wps/sync.py` | kdocs-cli 封装、增量计划、原地排序、格式复制、执行校验与账本 |
+| `app/wps/reupload.py` | 上传后「核对并补传」：按意图日志逐单核对云端缺失、只补缺失（写入仍走 `executor`） |
 | `app/api/bridge.py` | 前端唯一 API 表面：事件、任务、交互、WPS、配置、更新检查 |
 | `app/web/server.py` | ThreadingHTTPServer、令牌鉴权、网关拒绝、路由、静态资源、文件浏览器 |
 

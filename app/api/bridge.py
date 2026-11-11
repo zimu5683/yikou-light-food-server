@@ -41,7 +41,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path as _Path
-from typing import Any
+from typing import Any, Mapping
 
 from app import __version__
 from app.order.runner import parse_target_date, run_job
@@ -85,6 +85,14 @@ from app.wps.sync import (REBUILD_CONFIRM_WORD, REBUILD_MIN_NOTE, AtomicWriteErr
                         recovery_status as _wps_recovery_status_contract,
                         resolve_pending_operation as _wps_resolve_pending_operation)
 from app.wps import android_runtime
+from app.wps.executor import refresh_plan_ledger_entries
+from app.wps.reupload import (
+    build_check_payload as _reupload_build_payload,
+    check_fingerprint as _reupload_check_fingerprint,
+    check_sheets as _reupload_check_sheets,
+    context_fingerprint as _reupload_context_fingerprint,
+    latest_sheet_records as _reupload_latest_records,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +144,8 @@ _MODE_LABELS = {
     "sss_day_orders": "云端当天名单读取",
     "wps_recovery_resolve": "旧任务恢复/退场",
     "wps_ledger_rebuild": "账本锚点重建",
+    "wps_reupload_check": "核对并补传（只读核对）",
+    "wps_reupload_upload": "云文档补传",
 }
 
 
@@ -193,6 +203,9 @@ class Bridge:
         self._operations = OperationCoordinator()
         #: 一次性 WPS 上传预览令牌（只读哈希与指纹）。
         self._previews = PreviewStore(ttl_seconds=PREVIEW_TTL_SECONDS)
+        #: 「核对并补传」只读核对令牌（一次性，和预览令牌同一套两段式语义）。
+        self._reupload_checks = PreviewStore(ttl_seconds=PREVIEW_TTL_SECONDS,
+                                             prefix="rw")
         #: 各后台 worker 对应的 operation_id；finally 据此释放互斥槽位。
         self._task_operation_id = ""
         #: 任务完成事件幂等：同一 worker 生命周期只接受第一次 _finish_task/_task_error。
@@ -1872,6 +1885,7 @@ class Bridge:
                 # 才懒作废 —— 否则客户端在关闭窗口内不调用上传，重新开启后旧
                 # preview_id 仍能真的写云端。
                 self._previews.invalidate_all("preview_invalidated")
+                self._reupload_checks.invalidate_all("check_invalidated")
         if "test_mode" in payload:
             cfg.wps_test_mode = bool(payload.get("test_mode"))
         if "cli_path" in payload:
@@ -1903,6 +1917,10 @@ class Bridge:
             cfg.save()
         except OSError:
             return {"ok": False, "reason": "write_failed"}
+        # 补传令牌绑定写入目标/测试模式/排序/地址顺序等配置：任何一项变化都让
+        # 已签发的核对令牌立刻失效，避免用旧核对结果去写新目标。
+        if any(key in payload for key in self._REUPLOAD_MUTABLE_CONFIG_KEYS):
+            self._reupload_checks.invalidate_all("check_invalidated")
         return {"ok": True}
 
     def restore_wps_production_tables(self) -> dict[str, Any]:
@@ -4519,6 +4537,597 @@ class Bridge:
             self.log(f"[云同步] 建议重新同步副本：{'、'.join(drifted)}", "WARN")
         return {"ok": True, "drifted": drifted, "tables": results,
                 "all_aligned": not drifted}
+
+    # ------------------------------------------------------------------
+    # 「核对并补传」：上传后选表只读核对云端缺失订单，确认后只补缺失部分
+    #
+    # 两段式：wps_reupload_check(sheets) 只读核对并发一次性令牌；
+    # wps_reupload_upload(check_id) 重新核对指纹，通过后只写缺失的格子。
+    # 云端写入仍走 executor.apply_plan（意图日志、写前复核、回读校验、账本）。
+    # ------------------------------------------------------------------
+    #: 这些配置变化会让已签发的补传核对令牌全部失效（令牌绑定写入目标）。
+    _REUPLOAD_MUTABLE_CONFIG_KEYS = frozenset({
+        "enabled", "test_mode", "cli_path", "drive_id", "test_file_id",
+        "test_drive_id", "test_tables", "marker_enabled", "sort_enabled",
+        "address_order", "tables",
+    })
+
+    @staticmethod
+    def _reupload_sheets_arg(sheets: Any) -> tuple[list[str] | None, str]:
+        """规整前端传来的子表选择；``None`` = 全部有上传记录的表。"""
+        if sheets is None:
+            return None, ""
+        if isinstance(sheets, str):
+            sheets = [sheets]
+        if not isinstance(sheets, (list, tuple)):
+            return None, "bad_sheets"
+        selected: list[str] = []
+        for item in sheets:
+            text = str(item or "").strip()
+            if not text or len(text) > 64:
+                if not text:
+                    continue
+                return None, "bad_sheets"
+            if text not in selected:
+                selected.append(text)
+            if len(selected) > 32:
+                return None, "bad_sheets"
+        if not selected:
+            return None, "empty_sheets"
+        return selected, ""
+
+    def _reupload_public(self, record: Any) -> dict[str, Any]:
+        public = self._reupload_checks.public(record)
+        return {
+            "check_id": public["preview_id"],
+            "created_at": public["created_at"],
+            "expires_at": public["expires_at"],
+            "expires_in": public["expires_in"],
+            "ttl_seconds": public["ttl_seconds"],
+            "state": public["state"],
+            "target_tables": public.get("target_tables") or {},
+        }
+
+    def _wps_reupload_rejection(self, check_id: str, code: str) -> dict[str, Any]:
+        """把核对令牌的失效原因转成统一拒绝结果（全部可证明零写入）。"""
+        mapped = {
+            "missing_preview": "missing_check",
+            "preview_not_found": "check_not_found",
+            "preview_consumed": "check_consumed",
+            "preview_expired": "check_expired",
+        }.get(code, "")
+        if not mapped:
+            mapped = ("check_changed"
+                      if (code in ("check_changed", "preview_changed")
+                          or "changed" in code)
+                      else "check_invalidated")
+        reason = {
+            "missing_check": "缺少核对令牌：请先点「只读核对」，再补传",
+            "check_not_found": "核对结果不存在（可能已被清理）：请重新核对",
+            "check_consumed": "这次核对结果已经用于补传，不能重复提交；请重新核对",
+            "check_expired": "核对结果已过期（有效期 10 分钟）：请重新核对",
+            "check_changed": "只读核对之后云端或上传记录已变化，本次零写入；请重新核对",
+            "check_invalidated": "核对结果已失效（配置/写入目标变化）：请重新核对",
+        }.get(mapped, "核对结果不可用：请重新核对")
+        return self._wps_reject(mapped, reason, "重新核对后再补传",
+                                proven_no_write=True, check_id=check_id)
+
+    def _wps_reupload_analyze_impl(self, sheets: Any
+                                   ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """只读核对实现：返回 ``(payload, internal)``；拒绝时 internal 为空。"""
+        cfg = self._config
+        if not cfg.wps_enabled:
+            return self._wps_reject(
+                "wps_disabled",
+                "云文档同步已关闭（wps_enabled=False），服务端已拒绝核对，"
+                "未读取也未写入任何云端内容",
+                "在「云文档同步」中开启后再试", proven_no_write=True), {}
+        selected_arg, arg_error = self._reupload_sheets_arg(sheets)
+        if arg_error:
+            reason = ("没有选择要核对的子表" if arg_error == "empty_sheets"
+                      else "子表选择非法")
+            return self._wps_reject(arg_error, reason, "重新选择子表",
+                                    proven_no_write=True), {}
+        ledger_view = self._wps_ledger_view()
+        ledger = ledger_view.get("ledger")
+        loss = ledger_view.get("loss") or {}
+        if ledger is None:
+            return self._wps_reject(
+                "local_state_blocked",
+                f"本地账本/意图日志不可用：{ledger_view.get('error') or '账本不可用'}",
+                "只读核对；先修复本地日志/账本后重新核对",
+                status="blocked", proven_no_write=True), {}
+        if loss.get("lost"):
+            return self._wps_reject(
+                "local_ledger_lost",
+                "本地账本丢过锚点（意图日志里记着已同步的批次，账本里查不到），"
+                "无法安全补传，已拒绝",
+                "先联系管理员核对账本锚点", status="blocked",
+                summary={"code": "local_ledger_lost",
+                         "records": int(loss.get("records") or 0)},
+                proven_no_write=True), {}
+        try:
+            tables = self._wps_effective_tables()
+        except WpsCloudError as exc:
+            return self._wps_reject(
+                "effective_tables_error", str(exc),
+                "检查测试模式/目标表配置后重试", proven_no_write=True), {}
+        try:
+            cli = self._wps_cli()
+            if not cli.authenticated():
+                return self._wps_reject(
+                    "unauthenticated", "尚未授权云文档，请先点击「去授权」",
+                    "点击「去授权」后重新核对", proven_no_write=True), {}
+            try:
+                journal = SyncJournal(journal_path_for(ledger.path))
+            except Exception as exc:  # noqa: BLE001
+                return self._wps_reject(
+                    "local_state_blocked", f"意图日志不可用：{exc}",
+                    "先修复本地日志后重新核对", status="blocked",
+                    proven_no_write=True), {}
+            try:
+                terminal, pending, archive_warnings = _reupload_latest_records(
+                    journal)
+            except RuntimeError as exc:
+                return self._wps_reject(
+                    "local_state_blocked", f"意图日志不可用：{exc}",
+                    "先修复本地日志后重新核对", status="blocked",
+                    proven_no_write=True), {}
+            if selected_arg is None:
+                selected = [name for name in tables
+                            if name in terminal or name in pending]
+            else:
+                unknown = [name for name in selected_arg if name not in tables]
+                if unknown:
+                    return self._wps_reject(
+                        "bad_sheets",
+                        f"以下子表不在当前写入目标里：{'、'.join(unknown[:5])}",
+                        "重新选择子表", proven_no_write=True), {}
+                selected = list(selected_arg)
+            if not selected:
+                return self._wps_reject(
+                    "no_upload_record",
+                    "没有找到可核对的上传记录（还没上传过，或意图日志已归档到找不到）",
+                    "先完成一次云文档上传；需要重传请用普通预览",
+                    proven_no_write=True), {}
+            checks, context = _reupload_check_sheets(
+                cli, records=terminal, pending_records=pending,
+                sheets=selected, effective_tables=tables, config=cfg,
+                ledger=ledger, log=self.log)
+            context = {**dict(context), "sheets": list(selected)}
+            fingerprint = _reupload_check_fingerprint(checks, context)
+        except WpsCloudError as exc:
+            return self._wps_reject(
+                "cloud_error", str(exc), "检查授权/云端状态后重新核对",
+                status="failed", proven_no_write=True), {}
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("wps_reupload_check failed")
+            return self._wps_reject(
+                "unexpected", f"{type(exc).__name__}: {exc}",
+                "查看日志后重试", status="failed",
+                proven_no_write=True), {}
+        payload = _reupload_build_payload(checks)
+        context_fp = _reupload_context_fingerprint(context)
+        payload.update({
+            "ok": True,
+            "reason": "",
+            "code": "",
+            "test_mode": bool(cfg.wps_test_mode),
+            "context_fingerprint": context_fp,
+            "plan_fingerprint": fingerprint,
+            "fingerprint": {"context": context_fp, "plan": fingerprint},
+            "archive_warnings": list(archive_warnings or []),
+        })
+        public_sheets = [check.public() for check in checks]
+        payload["tables"] = public_sheets
+        if archive_warnings:
+            payload["warnings"] = (list(payload.get("warnings") or [])
+                                   + list(archive_warnings))
+        internal = {
+            "checks": checks, "cli": cli, "ledger": ledger, "journal": journal,
+            "tables": tables, "context": context, "fingerprint": fingerprint,
+            "public_sheets": public_sheets,
+        }
+        return payload, internal
+
+    def wps_reupload_check(self, sheets: Any = None) -> dict[str, Any]:
+        """只读核对「最近一次上传」在云端缺哪些订单，并发放一次性补传令牌。
+
+        不写云端、不写账本/日志；``sheets`` 省略 = 全部有上传记录的子表。
+        """
+        if not self._config.wps_enabled:
+            return self._wps_reject(
+                "wps_disabled",
+                "云文档同步已关闭（wps_enabled=False），服务端已拒绝核对，"
+                "未读取也未写入任何云端内容",
+                "在「云文档同步」中开启后再试", proven_no_write=True)
+        operation, conflict = self._begin_cloud_read(
+            "wps_reupload_check", "云文档核对补传", "核对云文档缺失订单")
+        if conflict is not None:
+            return self._cloud_read_conflict(conflict)
+        try:
+            result, internal = self._wps_reupload_analyze_impl(sheets)
+            if result.get("ok"):
+                context = internal["context"]
+                fingerprint = internal["fingerprint"]
+                checks = internal["checks"]
+                public_sheets = internal["public_sheets"]
+                try:
+                    record = self._reupload_checks.create(
+                        local_sha256="",
+                        context=dict(context),
+                        context_fingerprint=_reupload_context_fingerprint(context),
+                        plan=public_sheets,
+                        plan_fingerprint=fingerprint,
+                        summary=dict(result.get("summary") or {}),
+                        text="",
+                        tables=public_sheets,
+                        blocked=[{"sheet": check.sheet, "reason": check.reason}
+                                 for check in checks
+                                 if check.status in ("blocked", "manual")
+                                 and check.reason],
+                        warnings=list(result.get("warnings") or []),
+                        target_date=str(result.get("target_date") or ""),
+                        target_tables={check.sheet: {
+                            "file_id": check.file_id,
+                            "target_date": (check.target_date.isoformat()
+                                            if check.target_date else ""),
+                        } for check in checks},
+                    )
+                except Exception as exc:  # noqa: BLE001 - 发令牌失败不能算核对成功
+                    logger.exception("wps_reupload_check token failed")
+                    result = self._wps_reject(
+                        "unexpected", f"核对已完成但令牌生成失败：{exc}",
+                        "查看日志后重试", status="failed",
+                        proven_no_write=True)
+                else:
+                    result.update(self._reupload_public(record))
+                    if result.get("status") == "check_ready":
+                        result["next_action"] = (
+                            f"wps_reupload_upload({record.preview_id})")
+                    else:
+                        result["next_action"] = ""
+        except BaseException:
+            self._finish_cloud_read(
+                operation, {"ok": False, "status": "error", "code": "unexpected"},
+                title="核对并补传")
+            raise
+        self._finish_cloud_read(operation, result, title="核对并补传")
+        return result
+
+    def wps_reupload_upload(self, check_id: str = "",
+                            sheets: Any = None) -> dict[str, Any]:
+        """按只读核对结果补传：重新核对指纹，通过后只写缺失的格子。
+
+        ``sheets`` 可选：只补核对结果里选中的子表（前端勾选）；省略 = 核对时覆盖的
+        全部子表。无论选哪些，补的都只是核对出的缺失部分。
+        """
+        cid = str(check_id or "").strip()
+        if not cid:
+            return self._wps_reject(
+                "missing_check", "缺少核对令牌：请先点「只读核对」，再补传",
+                "重新核对后再补传", proven_no_write=True)
+        if not self._config.wps_enabled:
+            self._reupload_checks.invalidate(cid, "check_invalidated")
+            return self._wps_reject(
+                "wps_disabled",
+                "云文档同步已关闭（wps_enabled=False），服务端已拒绝补传，"
+                "未写入任何云端内容",
+                "在「云文档同步」中开启后重新核对",
+                proven_no_write=True, check_id=cid)
+        if self.worker_alive():
+            return self._busy_result_from_worker(
+                "订单/闪时送任务正在运行，请先停止后再补传云文档")
+        reservation = self._operations.try_reserve(
+            "wps_reupload_upload", summary={"check_id": cid, "title": "云文档补传"},
+            next_action="等待云文档补传结束或查询 operation_status")
+        if not reservation.granted:
+            return self._operation_conflict_payload(reservation.conflict,
+                                                    action="补传云文档")
+        operation = reservation.operation
+        assert operation is not None
+        return self._wps_reupload_upload_with_reservation(cid, operation,
+                                                          sheets=sheets)
+
+    def _wps_reupload_upload_with_reservation(self, check_id: str,
+                                              operation: Any, *,
+                                              sheets: Any = None
+                                              ) -> dict[str, Any]:
+        """包住补传占位生命周期：无论怎么返回/异常都释放互斥槽位。"""
+        result: dict[str, Any] | None = None
+        self._set_status("updating")
+        try:
+            result = self._wps_reupload_upload_impl(check_id, operation,
+                                                    sheets=sheets)
+            return result
+        except Exception as exc:  # noqa: BLE001 - 对外必须是 JSON
+            logger.exception("wps_reupload_upload failed")
+            self.log(f"[云同步补传] 异常：{type(exc).__name__}: {exc}", "ERROR")
+            result = self._wps_reject(
+                "unexpected", f"{type(exc).__name__}: {exc}",
+                "查看日志后重新核对", status="failed",
+                operation_id=operation.operation_id, check_id=check_id,
+                counts_source="unknown_after_exception")
+            return result
+        finally:
+            if self._operations.is_active(operation):
+                if result is None:
+                    operation_status = "error"
+                    reason = "reupload_aborted_unexpectedly"
+                    next_action = "重新核对"
+                    summary = {"check_id": check_id}
+                else:
+                    raw_status = str(result.get("status") or "")
+                    if raw_status == "ok":
+                        operation_status = "success"
+                    elif raw_status in {"success", "noop", "partial", "failed",
+                                        "error", "rejected", "uncertain",
+                                        "blocked", "recovered", "not_started"}:
+                        operation_status = raw_status
+                    elif result.get("ok"):
+                        operation_status = "success"
+                    else:
+                        operation_status = "error"
+                    reason = str(result.get("code") or result.get("reason") or "")
+                    next_action = str(result.get("next_action") or "")
+                    summary = {"check_id": check_id,
+                               "status": result.get("status")}
+                    if isinstance(result.get("summary"), dict):
+                        summary.update(result["summary"])
+                    for key in ("executor_operation_id", "journal_path",
+                                "written", "failed"):
+                        if key in result and result.get(key) is not None:
+                            summary[key] = result[key]
+                self._operations.finish(
+                    operation, status=operation_status, reason=reason,
+                    summary=summary, next_action=next_action)
+            if self._status == "updating":
+                self._set_status("ready")
+
+    def _wps_reupload_upload_impl(self, check_id: str, operation: Any, *,
+                                  sheets: Any = None) -> dict[str, Any]:
+        """补传实现（调用方已取占位）。"""
+        record, code = self._reupload_checks.get(check_id)
+        if code:
+            return self._wps_reupload_rejection(check_id, code)
+        assert record is not None
+        saved_context = dict(record.context or {})
+        saved = [str(sheet) for sheet in (saved_context.get("sheets") or [])]
+        if not saved:
+            self._reupload_checks.invalidate(check_id, "check_invalidated")
+            return self._wps_reupload_rejection(check_id, "check_invalidated")
+        requested_arg, arg_error = self._reupload_sheets_arg(sheets)
+        if arg_error:
+            return self._wps_reject(
+                arg_error,
+                "子表选择非法" if arg_error == "bad_sheets"
+                else "没有选择要补传的子表",
+                "重新选择子表", proven_no_write=True, check_id=check_id)
+        if requested_arg is None:
+            requested = list(saved)
+        else:
+            unknown = [sheet for sheet in requested_arg if sheet not in saved]
+            if unknown:
+                return self._wps_reject(
+                    "bad_sheets",
+                    f"以下子表不在这次核对结果里：{'、'.join(unknown[:5])}",
+                    "重新核对后再补传", proven_no_write=True,
+                    check_id=check_id)
+            requested = list(requested_arg)
+        result, internal = self._wps_reupload_analyze_impl(saved)
+        if not result.get("ok"):
+            self._reupload_checks.invalidate(check_id, "check_invalidated")
+            result["check_id"] = check_id
+            return result
+        fresh_fp = internal["fingerprint"]
+        context = internal["context"]
+        if (fresh_fp != record.plan_fingerprint
+                or _reupload_context_fingerprint(context)
+                != record.context_fingerprint):
+            self._reupload_checks.invalidate(check_id, "check_changed")
+            return self._wps_reupload_rejection(check_id, "check_changed")
+        checks = internal["checks"]
+        selected_checks = [check for check in checks
+                           if check.sheet in set(requested)]
+        writeable = [check for check in selected_checks if check.writeable]
+        plans = [check.plan for check in writeable if check.plan is not None]
+        if not plans:
+            selected_payload = _reupload_build_payload(selected_checks)
+            self._reupload_checks.invalidate(check_id, "check_noop")
+            if selected_payload.get("status") == "noop":
+                return self._wps_reupload_noop_payload(
+                    check_id, operation, selected_payload,
+                    reason="所选子表云端都已与上次上传的期望一致，无需补传")
+            return self._wps_reject(
+                "check_not_ready",
+                "所选子表没有可以安全补传的订单（可能都是「无法判定」或整表被阻断）",
+                "重新核对并查看无法判定的原因；必要时用普通预览",
+                proven_no_write=True, check_id=check_id,
+                tables=selected_payload.get("tables") or [],
+                warnings=selected_payload.get("warnings") or [],
+                summary=selected_payload.get("summary") or {})
+        consumed, consume_code = self._reupload_checks.consume(check_id)
+        if consume_code:
+            return self._wps_reupload_rejection(check_id, consume_code)
+        cli = internal["cli"]
+        ledger = internal["ledger"]
+        marker_enabled = all(bool(check.marker_enabled) for check in writeable)
+        planned_summary = self._wps_planned_summary(plans)
+        self._operations.update(
+            operation, phase="applying",
+            summary={"check_id": check_id, "planned_summary": planned_summary},
+            next_action="等待云端写入与回读校验完成")
+        try:
+            raw = apply_plan(cli, plans, ledger=ledger,
+                             marker_enabled=marker_enabled, log=self.log)
+        except WpsCloudError as exc:
+            self.log(f"[云同步补传] 失败：{exc}", "ERROR")
+            return self._wps_reject(
+                "cloud_error", str(exc), "检查授权/云端状态后重新核对",
+                status="failed", planned_summary=planned_summary,
+                check_id=check_id, operation_id=operation.operation_id,
+                counts_source="unknown_after_exception",
+                execution_summary=self._wps_execution_summary(
+                    status="failed", sheets=[], sheet_statuses=[],
+                    written=0, failed=0, uncertain=None, malformed=False,
+                    next_action="manual_reconcile",
+                    planned_summary=planned_summary, executed=False))
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"[云同步补传] 异常：{type(exc).__name__}: {exc}", "ERROR")
+            return self._wps_reject(
+                "unexpected", f"{type(exc).__name__}: {exc}",
+                "查看日志后重新核对", status="failed",
+                planned_summary=planned_summary, check_id=check_id,
+                operation_id=operation.operation_id,
+                counts_source="unknown_after_exception",
+                execution_summary=self._wps_execution_summary(
+                    status="failed", sheets=[], sheet_statuses=[],
+                    written=0, failed=0, uncertain=None, malformed=False,
+                    next_action="manual_reconcile",
+                    planned_summary=planned_summary, executed=False))
+        # 补传计划只含缺失的人：把本次计划里所有人的槽位位置/身份重新记回账本
+        # （排序可能改变其他人行序）。幂等、失败只警告，不影响本次云端结论。
+        for plan in plans:
+            try:
+                refreshed, reason = refresh_plan_ledger_entries(ledger, plan)
+            except Exception as exc:  # noqa: BLE001
+                refreshed, reason = False, f"unexpected:{type(exc).__name__}"
+            if not refreshed:
+                self.log(f"[云同步补传] {plan.sheet}：账本位置补记失败"
+                         f"（不影响本次结果）：{reason}", "WARN")
+        return self._wps_reupload_result_payload(
+            selected_checks, raw, planned_summary, check_id, operation)
+
+    def _wps_reupload_noop_payload(self, check_id: str, operation: Any,
+                                   selected_payload: Mapping[str, Any], *,
+                                   reason: str) -> dict[str, Any]:
+        """所选子表无需补传时的结果（不发写请求，但结构仍满足前端契约）。"""
+        planned_summary = self._wps_planned_summary([])
+        execution_summary = self._wps_execution_summary(
+            status="noop", sheets=[], sheet_statuses=[], written=0, failed=0,
+            uncertain=False, malformed=False, next_action="",
+            planned_summary=planned_summary, proven_no_write=True,
+            executed=False)
+        return {
+            "ok": True,
+            "status": "noop",
+            "code": "",
+            "reason": reason,
+            "next_action": "",
+            "operation_id": operation.operation_id,
+            "executor_operation_id": "",
+            "check_id": check_id,
+            "target_date": str(selected_payload.get("target_date") or ""),
+            "test_mode": bool(self._config.wps_test_mode),
+            "planned_summary": planned_summary,
+            "execution_summary": execution_summary,
+            "summary": execution_summary,
+            "tables": selected_payload.get("tables") or [],
+            "written": 0,
+            "failed": 0,
+            "uncertain": False,
+            "failed_sheets": [],
+            "warnings": selected_payload.get("warnings") or [],
+            "result": {"written": 0, "failed": 0, "status": "noop",
+                       "sheets": []},
+        }
+
+    def _wps_reupload_result_payload(self, checks: list[Any], raw: Any,
+                                     planned_summary: dict[str, Any],
+                                     check_id: str, operation: Any
+                                     ) -> dict[str, Any]:
+        """把 executor 结果整理成补传结果卡需要的结构。"""
+        raw = raw if isinstance(raw, dict) else {}
+        status = str(raw.get("status") or "failed").strip().lower()
+        if status == "ok":
+            status = "ok"
+        if status not in ("ok", "noop", "partial", "failed", "uncertain",
+                          "blocked", "error"):
+            status = "failed"
+        ok = status in ("ok", "noop")
+        sheets = [item for item in (raw.get("sheets") or [])
+                  if isinstance(item, dict)]
+        sheet_statuses = [str(item.get("status") or "").strip().lower()
+                          for item in sheets]
+        written = self._as_int(raw.get("written"))
+        failed = self._as_int(raw.get("failed"))
+        uncertain = (bool(raw.get("uncertain")) or status == "uncertain")
+        next_action = str(raw.get("next_action") or "")
+        sheet_uncertain: bool | None = False if status == "noop" else bool(uncertain)
+        execution_summary = self._wps_execution_summary(
+            status=status, sheets=sheets, sheet_statuses=sheet_statuses,
+            written=written, failed=failed, uncertain=sheet_uncertain,
+            malformed=False, next_action=next_action,
+            planned_summary=planned_summary)
+        by_name = {str(item.get("sheet") or ""): item for item in sheets}
+        tables: list[dict[str, Any]] = []
+        failed_sheets: list[str] = []
+        for check in checks:
+            item = by_name.get(check.sheet) or {}
+            write_status = str(item.get("status") or "").strip().lower()
+            entry = check.public()
+            entry["write"] = {
+                "status": write_status,
+                "reason": str(item.get("reason") or ""),
+                "uncertain": bool(item.get("uncertain")),
+                "next_action": str(item.get("next_action") or ""),
+                "people": item.get("people"),
+                "cells": item.get("cells"),
+                "problems": list(item.get("problems") or [])[:10],
+            }
+            tables.append(entry)
+            if write_status in ("failed", "uncertain", "stale_batch",
+                                "blocked"):
+                failed_sheets.append(check.sheet)
+        reason = str(raw.get("reason") or "")
+        if status == "noop" and not reason:
+            reason = "没有需要补传的格子"
+        if not ok and not reason:
+            reason = (f"以下表补传未完成：{'、'.join(failed_sheets)}"
+                      if failed_sheets else "补传未全部成功")
+        payload_code = ""
+        if not ok:
+            payload_code = str(raw.get("code") or "").strip()
+            if not payload_code:
+                payload_code = {
+                    "uncertain": "uncertain",
+                    "blocked": "blocked",
+                    "partial": "partial",
+                    "failed": "reupload_failed",
+                    "error": "reupload_error",
+                }.get(status, "reupload_failed")
+        dates = {check.target_date for check in checks if check.target_date}
+        target_date = (next(iter(dates)).isoformat() if len(dates) == 1 else "")
+        return {
+            "ok": ok,
+            "status": status,
+            "code": payload_code,
+            "reason": reason,
+            "next_action": (next_action or ("none" if ok else "重新核对")),
+            "operation_id": operation.operation_id,
+            "executor_operation_id": str(raw.get("operation_id") or ""),
+            "check_id": check_id,
+            "target_date": target_date,
+            "test_mode": bool(self._config.wps_test_mode),
+            "planned_summary": planned_summary,
+            "execution_summary": execution_summary,
+            "summary": execution_summary,
+            "tables": tables,
+            "written": written,
+            "failed": failed,
+            "uncertain": uncertain,
+            "failed_sheets": failed_sheets,
+            "warnings": [warning for table in tables
+                         for warning in (table.get("warnings") or [])],
+            "result": {
+                "written": written, "failed": failed, "status": status,
+                "sheets": [{"sheet": item.get("sheet"),
+                            "status": item.get("status"),
+                            "reason": item.get("reason", ""),
+                            "uncertain": bool(item.get("uncertain"))}
+                           for item in sheets],
+            },
+        }
 
     def wps_authorize(self) -> dict[str, Any]:
         """启动 kdocs-cli 授权流程（在后台等用户在浏览器里确认）。"""

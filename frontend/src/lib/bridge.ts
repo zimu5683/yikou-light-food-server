@@ -435,6 +435,141 @@ export interface WpsUploadResult {
   }
 }
 
+/**
+ * 「核对并补传」：上传后按意图日志只读核对云端缺哪些订单，确认后只补缺失部分。
+ * 订单状态与「缺什么」都来自后端结构化字段，前端不解析文本。
+ */
+export type WpsReuploadOrderStatus =
+  | 'present'
+  | 'missing_row'
+  | 'missing_meals'
+  | 'missing_mark'
+  | 'missing_fields'
+  | 'manual'
+
+export interface WpsReuploadOrder {
+  order_no: string
+  name: string
+  phone: string
+  slot: number
+  kind: string
+  local_meals: number
+  status: WpsReuploadOrderStatus
+  /** 缺什么：row / meals / mark / fields。 */
+  missing: string[]
+  /** 缺几餐（只对 missing_meals 有意义）。 */
+  missing_meals: number
+  expected_total: number
+  before_total: number
+  actual_total: number | null
+  expected_mark: string
+  actual_mark: string
+  actual_row: number
+  reason: string
+}
+
+export interface WpsReuploadCounts {
+  total: number
+  to_resend: number
+  present: number
+  manual: number
+}
+
+export interface WpsReuploadSummary {
+  sheets: number
+  writeable_sheets: number
+  to_resend: number
+  present: number
+  manual: number
+  complete_sheets: number
+  blocked_sheets: number
+}
+
+export type WpsReuploadSheetStatus =
+  | 'ready'
+  | 'partial'
+  | 'complete'
+  | 'manual'
+  | 'blocked'
+
+/** 补传结果里逐表「这次实际写入/校验」的状态。 */
+export interface WpsReuploadWriteStatus {
+  status: string
+  reason: string
+  uncertain: boolean
+  next_action: string
+  people: number | null
+  cells: number | null
+  problems: string[]
+}
+
+export interface WpsReuploadTable {
+  sheet: string
+  file_id: string
+  target_date: string
+  status: WpsReuploadSheetStatus
+  reason: string
+  pending: boolean
+  counts: WpsReuploadCounts
+  orders: WpsReuploadOrder[]
+  warnings: string[]
+  target_col: number
+  target_header: string
+  last_upload: Record<string, unknown>
+  plan_fingerprint: string
+  /** 仅补传结果里有：这次实际写入/逐格回读校验的状态。 */
+  write?: WpsReuploadWriteStatus
+}
+
+/** wps_reupload_check()：只读核对结果 + 一次性补传令牌 check_id。 */
+export interface WpsReuploadCheckResult {
+  ok: boolean
+  status: string
+  reason: string
+  code?: string
+  next_action: string
+  check_id?: string
+  created_at?: string
+  expires_at?: string
+  expires_in?: number
+  ttl_seconds?: number
+  state?: string
+  summary: WpsReuploadSummary
+  tables: WpsReuploadTable[]
+  warnings: string[]
+  target_date: string
+  test_mode: boolean
+  context_fingerprint?: string
+  plan_fingerprint?: string
+  fingerprint?: WpsFingerprint
+  target_tables?: Record<string, { file_id?: string; target_date?: string }>
+  archive_warnings?: string[]
+}
+
+/** wps_reupload_upload(check_id)：补传结果（成功/部分/不确定/拒绝统一结构）。 */
+export interface WpsReuploadUploadResult {
+  ok: boolean
+  status: string
+  reason: string
+  code?: string
+  next_action: string
+  operation_id: string
+  executor_operation_id?: string
+  check_id: string
+  target_date: string
+  test_mode: boolean
+  planned_summary?: WpsPlannedSummary | null
+  execution_summary?: WpsExecutionSummary | null
+  summary?: Record<string, unknown>
+  tables: WpsReuploadTable[]
+  written?: number
+  failed?: number
+  uncertain?: boolean
+  failed_sheets?: string[]
+  warnings: string[]
+  result?: Record<string, unknown>
+}
+
 export type WpsResult = WpsPreviewResult | WpsUploadResult
 
 export interface PendingInteractionItem {
@@ -775,6 +910,10 @@ interface BackendApi {
   wps_authorize(): Promise<{ ok: boolean; reason?: string; hint?: string }>
   wps_logout(): Promise<{ ok: boolean; reason?: string }>
   wps_check_copies(): Promise<WpsCopyCheck>
+  /** 只读核对「最近一次上传」缺哪些订单；sheets 省略 = 全部有记录的子表。 */
+  wps_reupload_check(sheets?: string[]): Promise<WpsReuploadCheckResult>
+  /** 按核对结果只补缺失的格子（checkId 来自 wps_reupload_check）。 */
+  wps_reupload_upload(checkId: string, sheets?: string[]): Promise<WpsReuploadUploadResult>
   save_wps_config(payload: WpsConfigPayload): Promise<{ ok: boolean; reason?: string }>
   clear_password(mode: 'order' | 'sss'): Promise<ClearPasswordResult>
   check_updates(manual: boolean): Promise<{ ok: boolean; reason?: string; message?: string }>
@@ -859,6 +998,8 @@ const REQUEST_TIMEOUT_MS: Record<string, number> = {
   // 长操作：后端同步执行，超时只代表前端等待窗口结束，不代表服务端未执行。
   wps_upload: 240_000,
   wps_preview: 120_000,
+  wps_reupload_check: 120_000,
+  wps_reupload_upload: 240_000,
   sss_day_orders: 120_000,
   wps_check_copies: 120_000,
   // 诊断日志都是本地读盘：列表很快；读取最多 1 MiB，30s 足够。
